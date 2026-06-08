@@ -1,5 +1,6 @@
 # outscript
 
+[![CI](https://github.com/KarpelesLab/outscript-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/outscript-rs/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/outscript.svg)](https://crates.io/crates/outscript)
 [![docs.rs](https://img.shields.io/docsrs/outscript)](https://docs.rs/outscript)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
