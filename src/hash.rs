@@ -15,8 +15,11 @@ pub enum HashFn {
     Ripemd160,
     /// Keccak-256 (Ethereum legacy keccak, not SHA3-256).
     Keccak256,
-    /// BLAKE3 with 32-byte output.
+    /// BLAKE3 with 32-byte output (used for Massa).
     Blake3,
+    /// Ethereum public-key hash (keccak-256 over the body with the SEC1 prefix
+    /// byte stripped, returning the last 20 bytes). Terminal in a chain.
+    EtherHash,
 }
 
 impl HashFn {
@@ -26,6 +29,7 @@ impl HashFn {
             HashFn::Ripemd160 => ripemd160(data).to_vec(),
             HashFn::Keccak256 => keccak256(data).to_vec(),
             HashFn::Blake3 => Blake3::hash(data).to_vec(),
+            HashFn::EtherHash => ether_hash(data).to_vec(),
         }
     }
 }
