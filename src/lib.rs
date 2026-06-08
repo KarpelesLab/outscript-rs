@@ -26,6 +26,7 @@ pub mod massa;
 pub mod out;
 pub mod pubkey;
 pub mod script;
+pub mod solana;
 pub mod solana_addr;
 
 mod btcamount;
@@ -51,3 +52,5 @@ pub use solana_addr::parse_solana_address;
 mod address_tests;
 #[cfg(test)]
 mod btctx_tests;
+#[cfg(test)]
+mod solana_tests;
