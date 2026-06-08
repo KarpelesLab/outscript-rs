@@ -19,6 +19,8 @@ pub mod address;
 pub mod btcguess;
 pub mod btctx;
 pub mod btctxparse;
+pub mod evmabi;
+pub mod evmtx;
 pub mod insertable;
 pub mod massa;
 pub mod out;
@@ -33,6 +35,8 @@ pub use address::{eip55, encode_base58_addr, parse_bitcoin_based_address, parse_
 pub use btcamount::BtcAmount;
 pub use btctx::{BtcTx, BtcTxInput, BtcTxOutput, BtcTxSign, Signer};
 pub use btctxparse::{BtcInputSig, extract_btc_input_sig};
+pub use evmabi::{AbiBuffer, AbiValue, evm_call};
+pub use evmtx::{EvmTx, EvmTxType};
 pub use btcguess::{GuessResult, guess_by_in_script, guess_by_out_script};
 pub use btcvarint::BtcVarInt;
 pub use insertable::{Format, Insertable};
