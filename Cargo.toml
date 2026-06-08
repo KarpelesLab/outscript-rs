@@ -1,0 +1,24 @@
+[package]
+name = "outscript"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Generate output scripts, parse/encode addresses, and build/sign transactions across multiple cryptocurrency networks (Bitcoin, EVM, Solana, Massa, ...)."
+repository = "https://github.com/KarpelesLab/outscript-rs"
+license = "MIT"
+keywords = ["bitcoin", "ethereum", "solana", "cryptocurrency", "transaction"]
+categories = ["cryptography::cryptocurrencies"]
+
+[lib]
+name = "outscript"
+
+[dependencies]
+purecrypto = { version = "0.6.6", features = ["hazmat-secp256k1", "hazmat-edwards25519"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+hex = "0.4"
+
+[dev-dependencies]
