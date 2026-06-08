@@ -10,6 +10,7 @@
 
 pub mod base58;
 pub mod bech32;
+pub mod crypto;
 pub mod hash;
 pub mod pushbytes;
 pub mod rlp;
