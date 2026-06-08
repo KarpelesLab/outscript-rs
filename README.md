@@ -1,5 +1,9 @@
 # outscript
 
+[![crates.io](https://img.shields.io/crates/v/outscript.svg)](https://crates.io/crates/outscript)
+[![docs.rs](https://img.shields.io/docsrs/outscript)](https://docs.rs/outscript)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A Rust crate for generating output scripts, parsing/encoding addresses, and
 building/signing transactions across multiple cryptocurrency networks.
 
