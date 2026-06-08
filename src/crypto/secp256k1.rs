@@ -500,6 +500,45 @@ pub fn bip340_sign(secret: &[u8; 32], msg: &[u8; 32], aux: &[u8; 32]) -> Result<
     bip340_sign_scalar(&d0, msg, aux)
 }
 
+/// Verifies a 64-byte BIP-340 Schnorr signature over `msg` against a 32-byte
+/// x-only public key.
+pub fn bip340_verify(xonly_pub: &[u8; 32], msg: &[u8; 32], sig: &[u8; 64]) -> bool {
+    // P = lift_x(xonly_pub) (even Y).
+    let mut compressed = [0u8; 33];
+    compressed[0] = 0x02;
+    compressed[1..].copy_from_slice(xonly_pub);
+    let p_point = match AffinePoint::from_sec1(&compressed) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    let mut rx = [0u8; 32];
+    rx.copy_from_slice(&sig[..32]);
+    let mut s_bytes = [0u8; 32];
+    s_bytes.copy_from_slice(&sig[32..]);
+    let s = match Scalar::from_bytes_be(&s_bytes) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    // e = tagged_hash("BIP0340/challenge", rx || P.x || msg) mod n
+    let e_bytes = tagged_hash("BIP0340/challenge", &[&rx, xonly_pub, msg]);
+    let e = Scalar::from_bytes_be_reduce(&e_bytes);
+
+    // R = s*G - e*P
+    let r_point = ProjectivePoint::mul_generator(&s)
+        .add(&p_point.to_projective().mul(&e.negate()));
+    let r_affine = match r_point.to_affine() {
+        Some(p) => p,
+        None => return false,
+    };
+    // R.y must be even and R.x == rx.
+    if r_affine.y_bytes()[31] & 1 != 0 {
+        return false;
+    }
+    r_affine.x_bytes() == rx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
