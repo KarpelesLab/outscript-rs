@@ -23,9 +23,9 @@ impl PubKey {
             ("pubkey:ed25519", PubKey::Ed25519(k)) => Ok(k.to_vec()),
             ("pubkey:comp", PubKey::Secp256k1(k)) => Ok(k.serialize_compressed().to_vec()),
             ("pubkey:uncomp", PubKey::Secp256k1(k)) => Ok(k.serialize_uncompressed().to_vec()),
-            ("pubkey:ed25519" | "pubkey:comp" | "pubkey:uncomp", _) => Err(format!(
-                "public key does not support {typ} export"
-            )),
+            ("pubkey:ed25519" | "pubkey:comp" | "pubkey:uncomp", _) => {
+                Err(format!("public key does not support {typ} export"))
+            }
             _ => Err(format!("unknown public key format {typ}")),
         }
     }

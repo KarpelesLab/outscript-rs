@@ -27,7 +27,11 @@ fn addresses_generate_and_roundtrip() {
     let s = secp_script();
     // (format, network, expected address)
     let cases: &[(&str, &str, &str)] = &[
-        ("eth", "ethereum", "0x2AeB8ADD8337360E088B7D9ce4e857b9BE60f3a7"),
+        (
+            "eth",
+            "ethereum",
+            "0x2AeB8ADD8337360E088B7D9ce4e857b9BE60f3a7",
+        ),
         ("p2pkh", "bitcoin", "1C2yfT2NNAPPHBqXQxxBPvguht2whJWRSi"),
         (
             "p2pkh",
@@ -35,11 +39,31 @@ fn addresses_generate_and_roundtrip() {
             "bitcoincash:qpusjxtjrpkyf843mmfzk78yp5qfhhcq3yv38ma5lm",
         ),
         ("p2pkh", "litecoin", "LWFvvfLCSpdSXzXgb6wUfwkfv6QDipAzJc"),
-        ("p2pkh", "electraproto", "PKd9pRRDR5saG2WHm3Gi4pfBKdCpm1YfY3"),
-        ("p2sh:p2pkh", "litecoin", "MNBNbudWqRT5MhorGVnpk7DDuMX5XCxKnR"),
-        ("p2wpkh", "bitcoin", "bc1q0yy3juscd3zfavw76g4h3eqdqzda7qyf58rj4m"),
-        ("p2wpkh", "litecoin", "ltc1q0yy3juscd3zfavw76g4h3eqdqzda7qyfsmekdt"),
-        ("p2wpkh", "electraproto", "ep1q0yy3juscd3zfavw76g4h3eqdqzda7qyf4r3klt"),
+        (
+            "p2pkh",
+            "electraproto",
+            "PKd9pRRDR5saG2WHm3Gi4pfBKdCpm1YfY3",
+        ),
+        (
+            "p2sh:p2pkh",
+            "litecoin",
+            "MNBNbudWqRT5MhorGVnpk7DDuMX5XCxKnR",
+        ),
+        (
+            "p2wpkh",
+            "bitcoin",
+            "bc1q0yy3juscd3zfavw76g4h3eqdqzda7qyf58rj4m",
+        ),
+        (
+            "p2wpkh",
+            "litecoin",
+            "ltc1q0yy3juscd3zfavw76g4h3eqdqzda7qyfsmekdt",
+        ),
+        (
+            "p2wpkh",
+            "electraproto",
+            "ep1q0yy3juscd3zfavw76g4h3eqdqzda7qyf4r3klt",
+        ),
         (
             "p2wsh:p2wpkh",
             "bitcoin",
@@ -49,7 +73,9 @@ fn addresses_generate_and_roundtrip() {
 
     for (fmt, net, want) in cases {
         let sout = s.out(fmt).unwrap_or_else(|e| panic!("generate {fmt}: {e}"));
-        let addr = sout.address(&[net]).unwrap_or_else(|e| panic!("addr {fmt}: {e}"));
+        let addr = sout
+            .address(&[net])
+            .unwrap_or_else(|e| panic!("addr {fmt}: {e}"));
         assert_eq!(&addr, want, "format {fmt} net {net}");
 
         // re-parse and compare scripts

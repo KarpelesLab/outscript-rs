@@ -29,7 +29,8 @@ impl BtcVarInt {
         }
     }
 
-    /// Returns the number of bytes needed to encode this value.
+    /// Returns the number of bytes needed to encode this value (always >= 1).
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(self) -> usize {
         let v = self.0;
         if v <= 0xfc {

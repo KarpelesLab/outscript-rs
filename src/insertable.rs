@@ -48,8 +48,8 @@ impl Insertable {
                 }
                 let mut x_only = [0u8; 32];
                 x_only.copy_from_slice(&v[1..]);
-                let (tweaked, _) = crate::crypto::secp256k1::taproot_tweak(&x_only)
-                    .map_err(|e| e.to_string())?;
+                let (tweaked, _) =
+                    crate::crypto::secp256k1::taproot_tweak(&x_only).map_err(|e| e.to_string())?;
                 Ok(tweaked.to_vec())
             }
         }

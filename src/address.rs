@@ -17,7 +17,11 @@ pub fn eip55(addr: &[u8]) -> String {
     out.push('x');
     for (i, &c) in a.iter().enumerate() {
         let hash_byte = hash[i / 2];
-        let nibble = if i % 2 == 0 { hash_byte >> 4 } else { hash_byte & 0xf };
+        let nibble = if i % 2 == 0 {
+            hash_byte >> 4
+        } else {
+            hash_byte & 0xf
+        };
         if c > b'9' && nibble > 7 {
             out.push((c - 32) as char);
         } else {
@@ -46,7 +50,8 @@ pub fn parse_evm_address(address: &str) -> Result<Out, String> {
     if address.len() != 42 || !address.starts_with("0x") {
         return Err("EVM addresses must be 42 characters long and start with 0x".into());
     }
-    let data = hex::decode(&address[2..]).map_err(|e| format!("failed to parse ethereum address: {e}"))?;
+    let data =
+        hex::decode(&address[2..]).map_err(|e| format!("failed to parse ethereum address: {e}"))?;
     if address != address.to_lowercase() && address != eip55(&data) {
         return Err("bad checksum on ethereum address".into());
     }
@@ -73,7 +78,9 @@ pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, 
     // case 1: explicit bitcoincash: prefix
     if address.starts_with("bitcoincash:") {
         if network != "bitcoin-cash" && network != "auto" {
-            return Err(format!("bitcoincash address provided while expecting a {network} address"));
+            return Err(format!(
+                "bitcoincash address provided while expecting a {network} address"
+            ));
         }
         let (typ, buf) = bech32::cashaddr_decode("bitcoincash:", address)
             .map_err(|e| format!("failed to parse bitcoin cash address: {e}"))?;
@@ -81,61 +88,62 @@ pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, 
     }
 
     // attempt segwit bech32 decode
-    if let Some(pos) = address.rfind('1') {
-        if pos > 0 {
-            let hrp = &address[..pos];
-            if let Ok((typ, buf)) = bech32::segwit_addr_decode(hrp, address) {
-                let net = match hrp {
-                    "ltc" => "litecoin",
-                    "nc" => "namecoin",
-                    "bc" => "bitcoin",
-                    "tb" => "bitcoin-testnet",
-                    "mona" => "monacoin",
-                    "ep" => "electraproto",
-                    _ => return Err(format!("unsupported hrp value {hrp}")),
-                };
-                if net != network && network != "auto" {
-                    return Err(format!("got a {net} address where we expected a {network} address"));
-                }
-                if typ == 1 && (net == "bitcoin" || net == "bitcoin-testnet") && buf.len() == 32 {
-                    let mut script = vec![0x51];
-                    script.extend_from_slice(&push_bytes(&buf));
-                    return Ok(make_out_net("p2tr", script, &[net]));
-                }
-                if typ != 0 {
-                    return Err(format!("unsupported segwit type {typ}"));
-                }
-                let mut script = vec![0x00];
-                script.extend_from_slice(&push_bytes(&buf));
-                return match buf.len() {
-                    20 => Ok(make_out_net("p2wpkh", script, &[net])),
-                    32 => Ok(make_out_net("p2wsh", script, &[net])),
-                    n => Err(format!("invalid segwit address length {n}")),
-                };
+    if let Some(pos) = address.rfind('1')
+        && pos > 0
+    {
+        let hrp = &address[..pos];
+        if let Ok((typ, buf)) = bech32::segwit_addr_decode(hrp, address) {
+            let net = match hrp {
+                "ltc" => "litecoin",
+                "nc" => "namecoin",
+                "bc" => "bitcoin",
+                "tb" => "bitcoin-testnet",
+                "mona" => "monacoin",
+                "ep" => "electraproto",
+                _ => return Err(format!("unsupported hrp value {hrp}")),
+            };
+            if net != network && network != "auto" {
+                return Err(format!(
+                    "got a {net} address where we expected a {network} address"
+                ));
             }
+            if typ == 1 && (net == "bitcoin" || net == "bitcoin-testnet") && buf.len() == 32 {
+                let mut script = vec![0x51];
+                script.extend_from_slice(&push_bytes(&buf));
+                return Ok(make_out_net("p2tr", script, &[net]));
+            }
+            if typ != 0 {
+                return Err(format!("unsupported segwit type {typ}"));
+            }
+            let mut script = vec![0x00];
+            script.extend_from_slice(&push_bytes(&buf));
+            return match buf.len() {
+                20 => Ok(make_out_net("p2wpkh", script, &[net])),
+                32 => Ok(make_out_net("p2wsh", script, &[net])),
+                n => Err(format!("invalid segwit address length {n}")),
+            };
         }
     }
 
     // base58check
-    if let Ok(mut buf) = base58::decode(address) {
-        if buf.len() >= 5 {
-            let chk_start = buf.len() - 4;
-            let chk = buf[chk_start..].to_vec();
-            buf.truncate(chk_start);
-            let h = dsha256(&buf);
-            if h[..4] == chk[..] {
-                return parse_base58_versioned(network, &buf);
-            }
+    if let Ok(mut buf) = base58::decode(address)
+        && buf.len() >= 5
+    {
+        let chk_start = buf.len() - 4;
+        let chk = buf[chk_start..].to_vec();
+        buf.truncate(chk_start);
+        let h = dsha256(&buf);
+        if h[..4] == chk[..] {
+            return parse_base58_versioned(network, &buf);
         }
     }
 
     // bitcoincash: addr missing its prefix
-    if network == "auto" || network == "bitcoin-cash" {
-        if let Ok((typ, buf)) =
+    if (network == "auto" || network == "bitcoin-cash")
+        && let Ok((typ, buf)) =
             bech32::cashaddr_decode("bitcoincash:", &format!("bitcoincash:{address}"))
-        {
-            return cashaddr_out(typ, &buf);
-        }
+    {
+        return cashaddr_out(typ, &buf);
     }
 
     Err(format!("unsupported address {address}"))
@@ -179,42 +187,58 @@ fn parse_base58_versioned(network: &str, buf: &[u8]) -> Result<Out, String> {
         "bitcoin" | "bitcoin-cash" => match version {
             0x00 => Ok(pkh(network)),
             0x05 => Ok(psh(network)),
-            v => Err(format!("unsupported {network} base58 address version={v:x}")),
+            v => Err(format!(
+                "unsupported {network} base58 address version={v:x}"
+            )),
         },
         "bitcoin-testnet" => match version {
             0x6f => Ok(pkh(network)),
             0xc4 => Ok(psh(network)),
-            v => Err(format!("unsupported {network} base58 address version={v:x}")),
+            v => Err(format!(
+                "unsupported {network} base58 address version={v:x}"
+            )),
         },
         "litecoin" => match version {
             0x30 => Ok(pkh("litecoin")),
             0x32 => Ok(psh("litecoin")),
-            v => Err(format!("unsupported {network} base58 address version={v:x}")),
+            v => Err(format!(
+                "unsupported {network} base58 address version={v:x}"
+            )),
         },
         "namecoin" => match version {
             0x34 => Ok(pkh("namecoin")),
             0x0d => Ok(psh("namecoin")),
-            v => Err(format!("unsupported {network} base58 address version={v:x}")),
+            v => Err(format!(
+                "unsupported {network} base58 address version={v:x}"
+            )),
         },
         "dogecoin" => match version {
             0x16 => Ok(psh("dogecoin")),
             0x1e => Ok(pkh("dogecoin")),
-            v => Err(format!("unsupported {network} base58 address version={v:x}")),
+            v => Err(format!(
+                "unsupported {network} base58 address version={v:x}"
+            )),
         },
         "monacoin" => match version {
             0x32 => Ok(pkh("monacoin")),
             0x37 => Ok(psh("monacoin")),
-            v => Err(format!("unsupported {network} base58 address version={v:x}")),
+            v => Err(format!(
+                "unsupported {network} base58 address version={v:x}"
+            )),
         },
         "electraproto" => match version {
             0x37 => Ok(pkh("electraproto")),
             0x89 => Ok(psh("electraproto")),
-            v => Err(format!("unsupported {network} base58 address version={v:x}")),
+            v => Err(format!(
+                "unsupported {network} base58 address version={v:x}"
+            )),
         },
         "dash" => match version {
             0x4c => Ok(pkh("dash")),
             0x10 => Ok(psh("dash")),
-            v => Err(format!("unsupported {network} base58 address version={v:x}")),
+            v => Err(format!(
+                "unsupported {network} base58 address version={v:x}"
+            )),
         },
         _ => Err(format!("unsupported {network} network for address parsing")),
     }
@@ -284,8 +308,8 @@ impl Out {
                 }
             }
             "p2wpkh" | "p2wsh" => {
-                let (buf, _) = parse_push_bytes(&self.raw[1..])
-                    .ok_or("invalid script for address type")?;
+                let (buf, _) =
+                    parse_push_bytes(&self.raw[1..]).ok_or("invalid script for address type")?;
                 let hrp = match net {
                     "litecoin" => "ltc",
                     "namecoin" => "nc",
@@ -303,8 +327,8 @@ impl Out {
                 bech32::segwit_addr_encode(hrp, 0, buf).map_err(|e| e.to_string())
             }
             "p2tr" => {
-                let (buf, _) = parse_push_bytes(&self.raw[1..])
-                    .ok_or("invalid script for address type")?;
+                let (buf, _) =
+                    parse_push_bytes(&self.raw[1..]).ok_or("invalid script for address type")?;
                 let hrp = match net {
                     "bitcoin" => "bc",
                     "bitcoin-testnet" => "tb",
@@ -317,7 +341,10 @@ impl Out {
                 };
                 bech32::segwit_addr_encode(hrp, 1, buf).map_err(|e| e.to_string())
             }
-            _ => Err(format!("could not transform outscript of format {}", self.name)),
+            _ => Err(format!(
+                "could not transform outscript of format {}",
+                self.name
+            )),
         }
     }
 }

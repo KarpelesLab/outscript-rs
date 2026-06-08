@@ -16,7 +16,10 @@ impl SolanaKey {
     pub fn parse(s: &str) -> Result<SolanaKey, String> {
         let buf = base58::decode(s).map_err(|e| format!("failed to decode solana key: {e}"))?;
         if buf.len() != 32 {
-            return Err(format!("invalid solana key: expected 32 bytes, got {}", buf.len()));
+            return Err(format!(
+                "invalid solana key: expected 32 bytes, got {}",
+                buf.len()
+            ));
         }
         let mut k = [0u8; 32];
         k.copy_from_slice(&buf);
@@ -93,8 +96,16 @@ pub fn transfer_instruction(from: SolanaKey, to: SolanaKey, lamports: u64) -> So
     SolanaInstruction {
         program_id: system_program(),
         accounts: vec![
-            SolanaAccountMeta { pubkey: from, is_signer: true, is_writable: true },
-            SolanaAccountMeta { pubkey: to, is_signer: false, is_writable: true },
+            SolanaAccountMeta {
+                pubkey: from,
+                is_signer: true,
+                is_writable: true,
+            },
+            SolanaAccountMeta {
+                pubkey: to,
+                is_signer: false,
+                is_writable: true,
+            },
         ],
         data,
     }
@@ -105,7 +116,11 @@ pub fn set_compute_unit_limit(units: u32) -> SolanaInstruction {
     let mut data = vec![0u8; 5];
     data[0] = 2;
     data[1..5].copy_from_slice(&units.to_le_bytes());
-    SolanaInstruction { program_id: compute_budget_program(), accounts: vec![], data }
+    SolanaInstruction {
+        program_id: compute_budget_program(),
+        accounts: vec![],
+        data,
+    }
 }
 
 /// Builds a Compute Budget SetComputeUnitPrice instruction.
@@ -113,7 +128,11 @@ pub fn set_compute_unit_price(micro_lamports: u64) -> SolanaInstruction {
     let mut data = vec![0u8; 9];
     data[0] = 3;
     data[1..9].copy_from_slice(&micro_lamports.to_le_bytes());
-    SolanaInstruction { program_id: compute_budget_program(), accounts: vec![], data }
+    SolanaInstruction {
+        program_id: compute_budget_program(),
+        accounts: vec![],
+        data,
+    }
 }
 
 /// Builds an SPL Token transfer instruction.
@@ -129,18 +148,37 @@ pub fn spl_transfer_instruction(
     SolanaInstruction {
         program_id: token_program(),
         accounts: vec![
-            SolanaAccountMeta { pubkey: source, is_signer: false, is_writable: true },
-            SolanaAccountMeta { pubkey: destination, is_signer: false, is_writable: true },
-            SolanaAccountMeta { pubkey: owner, is_signer: true, is_writable: false },
+            SolanaAccountMeta {
+                pubkey: source,
+                is_signer: false,
+                is_writable: true,
+            },
+            SolanaAccountMeta {
+                pubkey: destination,
+                is_signer: false,
+                is_writable: true,
+            },
+            SolanaAccountMeta {
+                pubkey: owner,
+                is_signer: true,
+                is_writable: false,
+            },
         ],
         data,
     }
 }
 
 /// Derives the Associated Token Account address for a wallet and mint.
-pub fn get_associated_token_address(wallet: SolanaKey, mint: SolanaKey) -> Result<SolanaKey, String> {
+pub fn get_associated_token_address(
+    wallet: SolanaKey,
+    mint: SolanaKey,
+) -> Result<SolanaKey, String> {
     let (addr, _) = find_program_address(
-        &[wallet.0.to_vec(), token_program().0.to_vec(), mint.0.to_vec()],
+        &[
+            wallet.0.to_vec(),
+            token_program().0.to_vec(),
+            mint.0.to_vec(),
+        ],
         ata_program(),
     )?;
     Ok(addr)
@@ -156,12 +194,36 @@ pub fn create_ata_instruction(
     Ok(SolanaInstruction {
         program_id: ata_program(),
         accounts: vec![
-            SolanaAccountMeta { pubkey: payer, is_signer: true, is_writable: true },
-            SolanaAccountMeta { pubkey: ata, is_signer: false, is_writable: true },
-            SolanaAccountMeta { pubkey: wallet, is_signer: false, is_writable: false },
-            SolanaAccountMeta { pubkey: mint, is_signer: false, is_writable: false },
-            SolanaAccountMeta { pubkey: system_program(), is_signer: false, is_writable: false },
-            SolanaAccountMeta { pubkey: token_program(), is_signer: false, is_writable: false },
+            SolanaAccountMeta {
+                pubkey: payer,
+                is_signer: true,
+                is_writable: true,
+            },
+            SolanaAccountMeta {
+                pubkey: ata,
+                is_signer: false,
+                is_writable: true,
+            },
+            SolanaAccountMeta {
+                pubkey: wallet,
+                is_signer: false,
+                is_writable: false,
+            },
+            SolanaAccountMeta {
+                pubkey: mint,
+                is_signer: false,
+                is_writable: false,
+            },
+            SolanaAccountMeta {
+                pubkey: system_program(),
+                is_signer: false,
+                is_writable: false,
+            },
+            SolanaAccountMeta {
+                pubkey: token_program(),
+                is_signer: false,
+                is_writable: false,
+            },
         ],
         data: vec![],
     })
@@ -177,9 +239,21 @@ pub fn advance_nonce_instruction(
     SolanaInstruction {
         program_id: system_program(),
         accounts: vec![
-            SolanaAccountMeta { pubkey: nonce_account, is_signer: false, is_writable: true },
-            SolanaAccountMeta { pubkey: recent_blockhashes_sysvar(), is_signer: false, is_writable: false },
-            SolanaAccountMeta { pubkey: nonce_authority, is_signer: true, is_writable: false },
+            SolanaAccountMeta {
+                pubkey: nonce_account,
+                is_signer: false,
+                is_writable: true,
+            },
+            SolanaAccountMeta {
+                pubkey: recent_blockhashes_sysvar(),
+                is_signer: false,
+                is_writable: false,
+            },
+            SolanaAccountMeta {
+                pubkey: nonce_authority,
+                is_signer: true,
+                is_writable: false,
+            },
         ],
         data,
     }
@@ -263,14 +337,21 @@ struct AccountInfo {
     is_writable: bool,
 }
 
+/// Result of account compilation: ordered keys, key->index map, message header.
+type CompiledAccounts = (Vec<SolanaKey>, HashMap<SolanaKey, u8>, SolanaMessageHeader);
+
 fn compile_accounts(
     fee_payer: SolanaKey,
     instructions: &[SolanaInstruction],
-) -> Result<(Vec<SolanaKey>, HashMap<SolanaKey, u8>, SolanaMessageHeader), String> {
+) -> Result<CompiledAccounts, String> {
     let mut seen: HashMap<SolanaKey, AccountInfo> = HashMap::new();
     seen.insert(
         fee_payer,
-        AccountInfo { key: fee_payer, is_signer: true, is_writable: true },
+        AccountInfo {
+            key: fee_payer,
+            is_signer: true,
+            is_writable: true,
+        },
     );
     for ix in instructions {
         for acc in &ix.accounts {
@@ -307,7 +388,7 @@ fn compile_accounts(
             (false, false) => nr.push(info.key),
         }
     }
-    let by_key = |v: &mut Vec<SolanaKey>| v.sort_by(|a, b| a.0.cmp(&b.0));
+    let by_key = |v: &mut Vec<SolanaKey>| v.sort_by_key(|a| a.0);
     by_key(&mut sw);
     by_key(&mut sr);
     by_key(&mut nw);
@@ -320,7 +401,10 @@ fn compile_accounts(
     all.extend_from_slice(&nw);
     all.extend_from_slice(&nr);
     if all.len() > 256 {
-        return Err(format!("transaction has {} accounts, maximum is 256", all.len()));
+        return Err(format!(
+            "transaction has {} accounts, maximum is 256",
+            all.len()
+        ));
     }
 
     let mut index = HashMap::with_capacity(all.len());
@@ -421,7 +505,9 @@ impl SolanaTx {
         let account_keys: Vec<SolanaKey> = self.account_keys().to_vec();
         for seed in seeds {
             let pubkey = SolanaKey(ed25519::public_from_seed(seed));
-            let idx = account_keys[..num_signers].iter().position(|k| *k == pubkey);
+            let idx = account_keys[..num_signers]
+                .iter()
+                .position(|k| *k == pubkey);
             let idx = idx.ok_or_else(|| format!("key {pubkey} is not a required signer"))?;
             self.signatures[idx] = ed25519::sign(seed, &msg).to_vec();
         }
@@ -442,13 +528,18 @@ impl SolanaTx {
         for i in 0..num_signers {
             let sig = &self.signatures[i];
             if sig.len() != 64 {
-                return Err(format!("signature {i} is missing or has invalid length {}", sig.len()));
+                return Err(format!(
+                    "signature {i} is missing or has invalid length {}",
+                    sig.len()
+                ));
             }
             let pubkey = self.account_keys()[i];
             let mut s = [0u8; 64];
             s.copy_from_slice(sig);
             if !ed25519::verify(&pubkey.0, &msg, &s) {
-                return Err(format!("signature {i} (signer {pubkey}) verification failed"));
+                return Err(format!(
+                    "signature {i} (signer {pubkey}) verification failed"
+                ));
             }
         }
         Ok(())
@@ -484,7 +575,9 @@ impl SolanaTx {
         let mut pos = 0;
         let sig_count = decode_compact_u16(data, &mut pos)?;
         if sig_count > 256 {
-            return Err(format!("signature count {sig_count} exceeds maximum of 256"));
+            return Err(format!(
+                "signature count {sig_count} exceeds maximum of 256"
+            ));
         }
         let mut signatures = Vec::with_capacity(sig_count);
         for _ in 0..sig_count {
@@ -540,8 +633,15 @@ fn write_message_common(
 fn read_message_common(
     data: &[u8],
     pos: &mut usize,
-) -> Result<(SolanaMessageHeader, Vec<SolanaKey>, SolanaKey, Vec<SolanaCompiledInstruction>), String>
-{
+) -> Result<
+    (
+        SolanaMessageHeader,
+        Vec<SolanaKey>,
+        SolanaKey,
+        Vec<SolanaCompiledInstruction>,
+    ),
+    String,
+> {
     if data.len() < *pos + 3 {
         return Err("unexpected EOF".into());
     }
@@ -553,7 +653,9 @@ fn read_message_common(
     *pos += 3;
     let key_count = decode_compact_u16(data, pos)?;
     if key_count > 256 {
-        return Err(format!("account key count {key_count} exceeds maximum of 256"));
+        return Err(format!(
+            "account key count {key_count} exceeds maximum of 256"
+        ));
     }
     let mut account_keys = Vec::with_capacity(key_count);
     for _ in 0..key_count {
@@ -749,7 +851,10 @@ pub fn decode_compact_u16(data: &[u8], pos: &mut usize) -> Result<usize, String>
 
 /// Derives a program address from seeds and a program id; errors if the result
 /// lies on the Ed25519 curve.
-pub fn create_program_address(seeds: &[Vec<u8>], program_id: SolanaKey) -> Result<SolanaKey, String> {
+pub fn create_program_address(
+    seeds: &[Vec<u8>],
+    program_id: SolanaKey,
+) -> Result<SolanaKey, String> {
     if seeds.len() > 16 {
         return Err("too many seeds: maximum 16".into());
     }

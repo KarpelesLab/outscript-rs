@@ -20,7 +20,11 @@ struct ChainRewardInfo {
 
 fn chain_config(network: &str) -> Option<ChainRewardInfo> {
     let cfg = |model, initial_reward, halving_interval| {
-        Some(ChainRewardInfo { model, initial_reward, halving_interval })
+        Some(ChainRewardInfo {
+            model,
+            initial_reward,
+            halving_interval,
+        })
     };
     match network {
         "bitcoin" => cfg(RewardModel::Halving, 50_0000_0000, 210_000),
@@ -176,11 +180,23 @@ mod tests {
     #[test]
     fn block_rewards() {
         assert_eq!(block_reward("bitcoin", 0).unwrap(), bi(50 * 100_000_000));
-        assert_eq!(block_reward("bitcoin", 209_999).unwrap(), bi(50 * 100_000_000));
-        assert_eq!(block_reward("bitcoin", 210_000).unwrap(), bi(25 * 100_000_000));
+        assert_eq!(
+            block_reward("bitcoin", 209_999).unwrap(),
+            bi(50 * 100_000_000)
+        );
+        assert_eq!(
+            block_reward("bitcoin", 210_000).unwrap(),
+            bi(25 * 100_000_000)
+        );
         assert_eq!(block_reward("litecoin", 0).unwrap(), bi(50 * 100_000_000));
-        assert_eq!(block_reward("dogecoin", 0).unwrap(), bi(1_000_000 * 100_000_000));
-        assert_eq!(block_reward("dogecoin", 600_000).unwrap(), bi(10_000 * 100_000_000));
+        assert_eq!(
+            block_reward("dogecoin", 0).unwrap(),
+            bi(1_000_000 * 100_000_000)
+        );
+        assert_eq!(
+            block_reward("dogecoin", 600_000).unwrap(),
+            bi(10_000 * 100_000_000)
+        );
         assert_eq!(block_reward("dash", 0).unwrap(), bi(5 * 100_000_000));
         assert_eq!(block_reward("dash", 210_240).unwrap(), bi(464_285_714));
         assert_eq!(block_reward("electraproto", 100).unwrap(), bi(0));
@@ -190,8 +206,14 @@ mod tests {
 
     #[test]
     fn cumulative_rewards() {
-        assert_eq!(cumulative_reward("bitcoin", 0).unwrap(), bi(50 * 100_000_000));
-        assert_eq!(cumulative_reward("bitcoin", 1).unwrap(), bi(100 * 100_000_000));
+        assert_eq!(
+            cumulative_reward("bitcoin", 0).unwrap(),
+            bi(50 * 100_000_000)
+        );
+        assert_eq!(
+            cumulative_reward("bitcoin", 1).unwrap(),
+            bi(100 * 100_000_000)
+        );
         assert_eq!(
             cumulative_reward("bitcoin", 209_999).unwrap(),
             bi(10_500_000) * bi(100_000_000)

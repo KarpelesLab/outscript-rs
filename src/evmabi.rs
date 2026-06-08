@@ -44,7 +44,10 @@ pub struct AbiBuffer {
 impl AbiBuffer {
     /// Creates a new buffer seeded with `buf`.
     pub fn new(buf: Vec<u8>) -> AbiBuffer {
-        AbiBuffer { buf, str: Vec::new() }
+        AbiBuffer {
+            buf,
+            str: Vec::new(),
+        }
     }
 
     /// Encodes values by inferring their natural ABI representation.
@@ -110,7 +113,9 @@ impl AbiBuffer {
             AbiValue::Int(o) => self.append_big_int(&BigInt::from(*o)),
             AbiValue::Uint64(o) => self.append_big_int(&BigInt::from(*o)),
             AbiValue::Uint(o) => self.append_big_int(o),
-            other => Err(format!("unsupported type {other:?} for evm abi uint256-style type")),
+            other => Err(format!(
+                "unsupported type {other:?} for evm abi uint256-style type"
+            )),
         }
     }
 
@@ -128,7 +133,9 @@ impl AbiBuffer {
                 self.append_bytes(s.as_bytes());
                 Ok(())
             }
-            other => Err(format!("unsupported type {other:?} for evm abi buffer type")),
+            other => Err(format!(
+                "unsupported type {other:?} for evm abi buffer type"
+            )),
         }
     }
 

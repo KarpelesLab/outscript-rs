@@ -168,9 +168,14 @@ pub fn segwit_addr_encode(hrp: &str, version: u8, program: &[u8]) -> Result<Stri
         return err("invalid witness program length for v0");
     }
     let mut data = vec![version];
-    let conv = convert_bits(program, 8, 5, true).ok_or_else(|| Error("convert_bits failed".into()))?;
+    let conv =
+        convert_bits(program, 8, 5, true).ok_or_else(|| Error("convert_bits failed".into()))?;
     data.extend_from_slice(&conv);
-    let spec = if version == 0 { BECH32_CONST } else { BECH32M_CONST };
+    let spec = if version == 0 {
+        BECH32_CONST
+    } else {
+        BECH32M_CONST
+    };
     Ok(bech32_encode(hrp, &data, spec))
 }
 
@@ -188,15 +193,19 @@ pub fn segwit_addr_decode(hrp: &str, addr: &str) -> Result<(u8, Vec<u8>), Error>
     if version > 16 {
         return err("invalid witness version");
     }
-    let program = convert_bits(&data[1..], 5, 8, false)
-        .ok_or_else(|| Error("convert_bits failed".into()))?;
+    let program =
+        convert_bits(&data[1..], 5, 8, false).ok_or_else(|| Error("convert_bits failed".into()))?;
     if program.len() < 2 || program.len() > 40 {
         return err("invalid witness program length");
     }
     if version == 0 && program.len() != 20 && program.len() != 32 {
         return err("invalid witness program length for v0");
     }
-    let expected = if version == 0 { BECH32_CONST } else { BECH32M_CONST };
+    let expected = if version == 0 {
+        BECH32_CONST
+    } else {
+        BECH32M_CONST
+    };
     if spec != expected {
         return err("wrong bech32 variant for witness version");
     }
@@ -205,6 +214,9 @@ pub fn segwit_addr_decode(hrp: &str, addr: &str) -> Result<(u8, Vec<u8>), Error>
 
 // ----- CashAddr (Bitcoin Cash) -----
 
+// The CashAddr polymod generator constants are 40-bit values defined by the
+// Bitcoin Cash spec; their natural grouping is not byte-aligned.
+#[allow(clippy::unusual_byte_groupings)]
 fn cashaddr_polymod(values: &[u8]) -> u64 {
     let mut c: u64 = 1;
     for &d in values {
@@ -276,8 +288,8 @@ pub fn cashaddr_encode(prefix: &str, version_type: u8, hash: &[u8]) -> Result<St
     let mut payload = Vec::with_capacity(1 + hash.len());
     payload.push(version_byte);
     payload.extend_from_slice(hash);
-    let payload5 = convert_bits(&payload, 8, 5, true)
-        .ok_or_else(|| Error("convert_bits failed".into()))?;
+    let payload5 =
+        convert_bits(&payload, 8, 5, true).ok_or_else(|| Error("convert_bits failed".into()))?;
 
     let mut checksum_input = cashaddr_expand_prefix(p);
     checksum_input.extend_from_slice(&payload5);
@@ -326,8 +338,8 @@ pub fn cashaddr_decode(prefix: &str, addr: &str) -> Result<(u8, Vec<u8>), Error>
     }
 
     let payload5 = &data[..data.len() - 8];
-    let payload = convert_bits(payload5, 5, 8, false)
-        .ok_or_else(|| Error("convert_bits failed".into()))?;
+    let payload =
+        convert_bits(payload5, 5, 8, false).ok_or_else(|| Error("convert_bits failed".into()))?;
     if payload.is_empty() {
         return err("empty cashaddr payload");
     }

@@ -84,15 +84,15 @@ pub fn guess_by_out_script(script: &[u8]) -> GuessResult {
 /// Attempts to guess the pubkey hash (and pubkey) from an input script.
 pub fn guess_by_in_script(script: &[u8]) -> GuessResult {
     let push1 = parse_push_bytes(script);
-    if let Some((_, pos1)) = push1 {
-        if let Some((push2, _)) = parse_push_bytes(&script[pos1..]) {
-            let pubkey = push2.to_vec();
-            let h = hash160(&pubkey).to_vec();
-            return GuessResult {
-                pubkey: Some(pubkey),
-                pubkey_hash: Some(h),
-            };
-        }
+    if let Some((_, pos1)) = push1
+        && let Some((push2, _)) = parse_push_bytes(&script[pos1..])
+    {
+        let pubkey = push2.to_vec();
+        let h = hash160(&pubkey).to_vec();
+        return GuessResult {
+            pubkey: Some(pubkey),
+            pubkey_hash: Some(h),
+        };
     }
     GuessResult::default()
 }

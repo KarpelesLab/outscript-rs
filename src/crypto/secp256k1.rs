@@ -94,12 +94,12 @@ fn generate_k(priv_be: &[u8; 32], hash: &[u8; 32], extra_iterations: u32) -> Sca
     let mut generated: u32 = 0;
     loop {
         v = hmac(&k, &[&v]);
-        if let Ok(cand) = Scalar::from_bytes_be(&v) {
-            if !bool::from(cand.is_zero()) {
-                generated += 1;
-                if generated > extra_iterations {
-                    return cand;
-                }
+        if let Ok(cand) = Scalar::from_bytes_be(&v)
+            && !bool::from(cand.is_zero())
+        {
+            generated += 1;
+            if generated > extra_iterations {
+                return cand;
             }
         }
         k = hmac(&k, &[&v, &[0x00]]);
@@ -428,7 +428,9 @@ fn taproot_tweak_full(internal_xonly: &[u8; 32]) -> Result<([u8; 32], u8, [u8; 3
     let t_bytes = tagged_hash("TapTweak", &[internal_xonly]);
     let t = Scalar::from_bytes_be(&t_bytes).map_err(|_| Error::InvalidKey)?;
 
-    let q = p_point.to_projective().add(&ProjectivePoint::mul_generator(&t));
+    let q = p_point
+        .to_projective()
+        .add(&ProjectivePoint::mul_generator(&t));
     let qa = q.to_affine().ok_or(Error::Malformed)?;
     let tweaked = qa.x_bytes();
     let parity = qa.y_bytes()[31] & 1;
@@ -526,8 +528,7 @@ pub fn bip340_verify(xonly_pub: &[u8; 32], msg: &[u8; 32], sig: &[u8; 64]) -> bo
     let e = Scalar::from_bytes_be_reduce(&e_bytes);
 
     // R = s*G - e*P
-    let r_point = ProjectivePoint::mul_generator(&s)
-        .add(&p_point.to_projective().mul(&e.negate()));
+    let r_point = ProjectivePoint::mul_generator(&s).add(&p_point.to_projective().mul(&e.negate()));
     let r_affine = match r_point.to_affine() {
         Some(p) => p,
         None => return false,

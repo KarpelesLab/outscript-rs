@@ -52,9 +52,7 @@ impl Out {
         match self.name.as_str() {
             "p2wpkh" | "p2tr" => parse_push_bytes(&self.raw[1..]).map(|(d, _)| d.to_vec()),
             "p2pkh" | "p2pukh" => parse_push_bytes(&self.raw[2..]).map(|(d, _)| d.to_vec()),
-            "p2pk" | "p2puk" => {
-                parse_push_bytes(&self.raw).map(|(pub_, _)| hash160(pub_).to_vec())
-            }
+            "p2pk" | "p2puk" => parse_push_bytes(&self.raw).map(|(pub_, _)| hash160(pub_).to_vec()),
             "p2sh" => parse_push_bytes(&self.raw[1..]).map(|(d, _)| d.to_vec()),
             "eth" | "massa" | "solana" => Some(self.raw.clone()),
             _ => None,
@@ -107,10 +105,10 @@ pub fn guess_out(script: &[u8], pubkey_hint: Option<&PubKey>) -> Out {
             if let Some(hint) = pubkey_hint {
                 let s = Script::new(hint.clone());
                 for e in ["p2pkh", "p2pukh"] {
-                    if let Ok(buf) = s.generate(e) {
-                        if buf == script {
-                            return Out::make(e, script.to_vec(), &[]);
-                        }
+                    if let Ok(buf) = s.generate(e)
+                        && buf == script
+                    {
+                        return Out::make(e, script.to_vec(), &[]);
                     }
                 }
             }
@@ -143,10 +141,10 @@ pub fn guess_out(script: &[u8], pubkey_hint: Option<&PubKey>) -> Out {
                         "p2sh:p2pukh",
                         "p2sh:p2wpkh",
                     ] {
-                        if let Ok(buf) = s.generate(e) {
-                            if buf == script {
-                                return Out::make(e, script.to_vec(), &[]);
-                            }
+                        if let Ok(buf) = s.generate(e)
+                            && buf == script
+                        {
+                            return Out::make(e, script.to_vec(), &[]);
                         }
                     }
                 }

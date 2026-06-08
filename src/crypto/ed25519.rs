@@ -11,7 +11,9 @@ pub fn public_from_seed(seed: &[u8; 32]) -> [u8; 32] {
 
 /// Signs a message with a 32-byte seed, returning a 64-byte signature.
 pub fn sign(seed: &[u8; 32], message: &[u8]) -> [u8; 64] {
-    Ed25519PrivateKey::from_bytes(*seed).sign(message).to_bytes()
+    Ed25519PrivateKey::from_bytes(*seed)
+        .sign(message)
+        .to_bytes()
 }
 
 /// Verifies a 64-byte Ed25519 signature over `message` for the given 32-byte

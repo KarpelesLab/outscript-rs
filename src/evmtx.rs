@@ -2,7 +2,8 @@
 //! serialize, parse and recover sender. Port of `evmtx.go`.
 
 use num_bigint::{BigInt, Sign};
-use num_traits::ToPrimitive;
+use num_traits::{Num, ToPrimitive};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::address::eip55;
 use crate::crypto::secp256k1::{SecpPrivateKey, recover_public_key};
@@ -183,7 +184,9 @@ impl EvmTx {
             let list = dec[0].as_list().ok_or("expected list")?;
             let ln = list.len();
             if ln != 6 && ln != 9 {
-                return Err(format!("legacy transaction must have 6 or 9 fields, got {ln}"));
+                return Err(format!(
+                    "legacy transaction must have 6 or 9 fields, got {ln}"
+                ));
             }
             let b = |i: usize| -> &[u8] { list[i].as_bytes().unwrap_or(&[]) };
             tx.tx_type = EvmTxType::Legacy;
@@ -200,11 +203,11 @@ impl EvmTx {
                 tx.s = BigInt::from_bytes_be(Sign::Plus, b(8));
                 // Derive chain id from v (EIP-155) so SignBytes reconstructs
                 // the same preimage during sender recovery.
-                if let Some(v) = tx.y.to_u64() {
-                    if v >= 35 {
-                        let bit = 1 - (v & 1);
-                        tx.chain_id = (v - 35 - bit) / 2;
-                    }
+                if let Some(v) = tx.y.to_u64()
+                    && v >= 35
+                {
+                    let bit = 1 - (v & 1);
+                    tx.chain_id = (v - 35 - bit) / 2;
                 }
             }
             return Ok(tx);
@@ -392,6 +395,25 @@ mod tests {
     }
 
     #[test]
+    fn json_roundtrip() {
+        let mut tx = EvmTx {
+            chain_id: 1,
+            nonce: 42,
+            gas_fee_cap: BigInt::from(30_000_000_000u64),
+            gas: 21000,
+            to: "0x2aeb8add8337360e088b7d9ce4e857b9be60f3a7".into(),
+            value: BigInt::from(10u64).pow(18),
+            ..Default::default()
+        };
+        tx.sign(&key()).unwrap();
+        let j = serde_json::to_string(&tx).unwrap();
+        assert!(j.contains("\"from\":\"0x2AeB8ADD8337360E088B7D9ce4e857b9BE60f3a7\""));
+        let parsed: EvmTx = serde_json::from_str(&j).unwrap();
+        assert_eq!(parsed.nonce, 42);
+        assert_eq!(parsed.value, BigInt::from(10u64).pow(18));
+    }
+
+    #[test]
     fn sign_and_recover_sender() {
         let mut tx = EvmTx {
             chain_id: 1,
@@ -407,5 +429,143 @@ mod tests {
             tx.sender_address().unwrap(),
             "0x2AeB8ADD8337360E088B7D9ce4e857b9BE60f3a7"
         );
+    }
+}
+
+// --- JSON (serde), matching the Go evmTxJson format ---
+
+fn hex0x_u64(v: u64) -> String {
+    format!("0x{v:x}")
+}
+fn hex0x_big(v: &BigInt) -> String {
+    format!("0x{v:x}")
+}
+
+fn parse_u64_auto(s: &str) -> Result<u64, String> {
+    if let Some(h) = s.strip_prefix("0x") {
+        u64::from_str_radix(h, 16).map_err(|e| e.to_string())
+    } else {
+        s.parse::<u64>().map_err(|e| e.to_string())
+    }
+}
+fn parse_big_auto(s: &str) -> Result<BigInt, String> {
+    if let Some(h) = s.strip_prefix("0x") {
+        BigInt::from_str_radix(h, 16).map_err(|e| e.to_string())
+    } else {
+        BigInt::from_str_radix(s, 10).map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct EvmTxJson {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    from: String,
+    #[serde(default)]
+    gas: String,
+    #[serde(rename = "gasPrice", default, skip_serializing_if = "String::is_empty")]
+    gas_price: String,
+    #[serde(
+        rename = "maxPriorityFeePerGas",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    gas_tip_cap: String,
+    #[serde(
+        rename = "maxFeePerGas",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    gas_fee_cap: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    hash: String,
+    #[serde(default)]
+    input: String,
+    #[serde(default)]
+    nonce: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    to: String,
+    #[serde(default)]
+    value: String,
+    #[serde(rename = "chainId", default)]
+    chain_id: String,
+    #[serde(default)]
+    v: String,
+    #[serde(default)]
+    r: String,
+    #[serde(default)]
+    s: String,
+}
+
+impl Serialize for EvmTx {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut obj = EvmTxJson {
+            gas: hex0x_u64(self.gas),
+            input: format!("0x{}", hex::encode(&self.data)),
+            nonce: hex0x_u64(self.nonce),
+            to: self.to.clone(),
+            value: hex0x_big(&self.value),
+            chain_id: hex0x_u64(self.chain_id),
+            ..Default::default()
+        };
+        if self.tx_type == EvmTxType::Legacy {
+            obj.gas_price = hex0x_big(&self.gas_fee_cap);
+        } else {
+            obj.gas_fee_cap = hex0x_big(&self.gas_fee_cap);
+            obj.gas_tip_cap = hex0x_big(&self.gas_tip_cap);
+        }
+        if self.signed {
+            obj.from = self.sender_address().unwrap_or_default();
+            obj.v = hex0x_big(&self.y);
+            obj.r = hex0x_big(&self.r);
+            obj.s = hex0x_big(&self.s);
+        }
+        obj.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EvmTx {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let o = EvmTxJson::deserialize(deserializer)?;
+        let mut tx = EvmTx::default();
+        if !o.gas.is_empty() {
+            tx.gas = parse_u64_auto(&o.gas).map_err(D::Error::custom)?;
+        }
+        if !o.gas_fee_cap.is_empty() && !o.gas_tip_cap.is_empty() {
+            tx.gas_fee_cap = parse_big_auto(&o.gas_fee_cap).map_err(D::Error::custom)?;
+            tx.gas_tip_cap = parse_big_auto(&o.gas_tip_cap).map_err(D::Error::custom)?;
+            tx.tx_type = EvmTxType::Eip1559;
+        } else if !o.gas_price.is_empty() {
+            tx.gas_fee_cap = parse_big_auto(&o.gas_price).map_err(D::Error::custom)?;
+        }
+        if !o.input.is_empty() {
+            let h = o
+                .input
+                .strip_prefix("0x")
+                .ok_or_else(|| D::Error::custom("input must start with 0x"))?;
+            tx.data = hex::decode(h).map_err(D::Error::custom)?;
+        }
+        if !o.nonce.is_empty() {
+            tx.nonce = parse_u64_auto(&o.nonce).map_err(D::Error::custom)?;
+        }
+        if !o.to.is_empty() {
+            tx.to = o.to;
+        }
+        if !o.value.is_empty() {
+            tx.value = parse_big_auto(&o.value).map_err(D::Error::custom)?;
+        }
+        if !o.chain_id.is_empty() {
+            tx.chain_id = parse_u64_auto(&o.chain_id).map_err(D::Error::custom)?;
+        }
+        if !o.v.is_empty() {
+            tx.y = parse_big_auto(&o.v).map_err(D::Error::custom)?;
+        }
+        if !o.r.is_empty() {
+            tx.r = parse_big_auto(&o.r).map_err(D::Error::custom)?;
+        }
+        if !o.s.is_empty() {
+            tx.s = parse_big_auto(&o.s).map_err(D::Error::custom)?;
+        }
+        Ok(tx)
     }
 }

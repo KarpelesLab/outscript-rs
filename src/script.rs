@@ -12,7 +12,11 @@ use crate::pubkey::PubKey;
 /// Returns the format definition for a name, mirroring the Go `Formats` table.
 pub fn format_def(name: &str) -> Option<Format> {
     let f = match name {
-        "p2pkh" => vec![b(&[0x76, 0xa9]), push(ihash160(lookup("pubkey:comp"))), b(&[0x88, 0xac])],
+        "p2pkh" => vec![
+            b(&[0x76, 0xa9]),
+            push(ihash160(lookup("pubkey:comp"))),
+            b(&[0x88, 0xac]),
+        ],
         "p2pukh" => vec![
             b(&[0x76, 0xa9]),
             push(ihash160(lookup("pubkey:uncomp"))),
@@ -34,7 +38,10 @@ pub fn format_def(name: &str) -> Option<Format> {
         "p2wsh:p2wpkh" => vec![b(&[0x00]), push(ihash(lookup("p2wpkh"), &[HashFn::Sha256]))],
         "eth" => vec![ihash(lookup("pubkey:uncomp"), &[HashFn::EtherHash])],
         "massa_pubkey" => vec![b(&[0x00]), lookup("pubkey:ed25519")],
-        "massa" => vec![b(&[0x00, 0x00]), ihash(lookup("massa_pubkey"), &[HashFn::Blake3])],
+        "massa" => vec![
+            b(&[0x00, 0x00]),
+            ihash(lookup("massa_pubkey"), &[HashFn::Blake3]),
+        ],
         "solana" => vec![lookup("pubkey:ed25519")],
         _ => return None,
     };
@@ -68,7 +75,15 @@ pub const ALL_FORMATS: &[&str] = &[
 /// Typical formats available for each network (port of `FormatsPerNetwork`).
 pub fn formats_per_network(network: &str) -> Option<&'static [&'static str]> {
     Some(match network {
-        "bitcoin" => &["p2tr", "p2wpkh", "p2sh:p2wpkh", "p2puk", "p2pk", "p2pukh", "p2pkh"],
+        "bitcoin" => &[
+            "p2tr",
+            "p2wpkh",
+            "p2sh:p2wpkh",
+            "p2puk",
+            "p2pk",
+            "p2pukh",
+            "p2pkh",
+        ],
         "bitcoin-cash" => &["p2puk", "p2pk", "p2pukh", "p2pkh"],
         "litecoin" => &["p2wpkh", "p2sh:p2wpkh", "p2puk", "p2pk", "p2pukh", "p2pkh"],
         "dogecoin" => &["p2puk", "p2pk", "p2pukh", "p2pkh"],
@@ -112,7 +127,9 @@ impl Script {
             "pubkey:pkix" | "pubkey:ed25519" | "pubkey:comp" | "pubkey:uncomp"
         ) {
             let res = self.pubkey.bytes_for(name)?;
-            self.cache.borrow_mut().insert(name.to_string(), res.clone());
+            self.cache
+                .borrow_mut()
+                .insert(name.to_string(), res.clone());
             return Ok(res);
         }
 
@@ -121,7 +138,9 @@ impl Script {
         for piece in &format {
             out.extend_from_slice(&piece.bytes(self)?);
         }
-        self.cache.borrow_mut().insert(name.to_string(), out.clone());
+        self.cache
+            .borrow_mut()
+            .insert(name.to_string(), out.clone());
         Ok(out)
     }
 
@@ -177,6 +196,9 @@ mod tests {
     #[test]
     fn caching_is_consistent() {
         let s = Script::new(key().public_key());
-        assert_eq!(s.generate("p2sh:p2wpkh").unwrap(), s.generate("p2sh:p2wpkh").unwrap());
+        assert_eq!(
+            s.generate("p2sh:p2wpkh").unwrap(),
+            s.generate("p2sh:p2wpkh").unwrap()
+        );
     }
 }

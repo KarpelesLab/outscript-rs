@@ -1,13 +1,14 @@
 //! Ported tests from `solana_test.go` and `solana_pda_test.go`.
 
 use crate::crypto::ed25519::public_from_seed;
+use crate::parse_solana_address;
 use crate::pubkey::PubKey;
 use crate::script::Script;
 use crate::solana::*;
-use crate::{parse_solana_address};
 
 fn seed() -> [u8; 32] {
-    let v = hex::decode("20a1c9d559159085c82ae54e35f332a2d54aab952dd5832c42d06fb0548d5f88").unwrap();
+    let v =
+        hex::decode("20a1c9d559159085c82ae54e35f332a2d54aab952dd5832c42d06fb0548d5f88").unwrap();
     let mut s = [0u8; 32];
     s.copy_from_slice(&v);
     s
@@ -40,7 +41,10 @@ fn compact_u16_via_tx_roundtrip() {
     let tx = new_solana_tx(fee_payer, blockhash, &[]).unwrap();
     let data = tx.marshal_binary().unwrap();
     let tx2 = SolanaTx::unmarshal_binary(&data).unwrap();
-    assert_eq!(tx2.message.account_keys.len(), tx.message.account_keys.len());
+    assert_eq!(
+        tx2.message.account_keys.len(),
+        tx.message.account_keys.len()
+    );
 }
 
 #[test]
@@ -119,8 +123,10 @@ fn pda_multiple_seeds() {
     let wallet = SolanaKey::parse("83astBRguLMdt2h5U1Tpdq5tjFoJ6noeGwaY3mDLVcri").unwrap();
     let (addr, bump) =
         find_program_address(&[wallet.0.to_vec(), b"seed2".to_vec()], program_id).unwrap();
-    let addr2 =
-        create_program_address(&[wallet.0.to_vec(), b"seed2".to_vec(), vec![bump]], program_id)
-            .unwrap();
+    let addr2 = create_program_address(
+        &[wallet.0.to_vec(), b"seed2".to_vec(), vec![bump]],
+        program_id,
+    )
+    .unwrap();
     assert_eq!(addr, addr2);
 }

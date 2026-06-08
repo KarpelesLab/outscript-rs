@@ -4,6 +4,10 @@
 
 use std::io::{self, Cursor, Read};
 
+use serde::de;
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 use crate::address::parse_bitcoin_based_address;
 use crate::btcamount::BtcAmount;
 use crate::btcvarint::BtcVarInt;
@@ -400,7 +404,12 @@ impl BtcTx {
     }
 
     /// Adds an output for the given address parsed for `network`.
-    pub fn add_net_output(&mut self, network: &str, address: &str, amount: u64) -> Result<(), String> {
+    pub fn add_net_output(
+        &mut self,
+        network: &str,
+        address: &str,
+        amount: u64,
+    ) -> Result<(), String> {
         let addr = parse_bitcoin_based_address(network, address)?;
         let n = self.out.len();
         self.out.push(BtcTxOutput {
@@ -447,10 +456,8 @@ impl BtcTx {
 
     /// Estimates the (virtual) transaction size, accounting for segwit.
     pub fn compute_size(&self) -> usize {
-        let mut ln = 4
-            + BtcVarInt(self.in_.len() as u64).len()
-            + BtcVarInt(self.out.len() as u64).len()
-            + 4;
+        let mut ln =
+            4 + BtcVarInt(self.in_.len() as u64).len() + BtcVarInt(self.out.len() as u64).len() + 4;
         let mut witln = 0;
         for inp in &self.in_ {
             ln += inp.compute_size();
@@ -842,9 +849,176 @@ fn read_var_buf<R: Read>(r: &mut R, n: &mut u64) -> io::Result<Vec<u8>> {
         return Ok(Vec::new());
     }
     if ln.0 > 100000 {
-        return Err(io::Error::other("buffer larger than maximum allowed length"));
+        return Err(io::Error::other(
+            "buffer larger than maximum allowed length",
+        ));
     }
     let mut buf = vec![0u8; ln.0 as usize];
     read_full(r, &mut buf, n)?;
     Ok(buf)
+}
+
+// --- JSON (serde), matching the Go wire format ---
+
+#[derive(Serialize)]
+struct ScriptPubKeyJson {
+    hex: String,
+    #[serde(rename = "type")]
+    typ: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    addresses: Vec<String>,
+}
+
+impl Serialize for BtcTxOutput {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut st = serializer.serialize_struct("BtcTxOutput", 3)?;
+        st.serialize_field("value", &self.amount)?;
+        st.serialize_field("n", &self.n)?;
+        st.serialize_field(
+            "scriptPubKey",
+            &ScriptPubKeyJson {
+                hex: hex::encode(&self.script),
+                typ: String::new(),
+                addresses: Vec::new(),
+            },
+        )?;
+        st.end()
+    }
+}
+
+#[derive(Deserialize)]
+struct ScriptHexJson {
+    #[serde(default)]
+    hex: String,
+}
+
+#[derive(Deserialize)]
+struct BtcTxOutputDe {
+    #[serde(default)]
+    value: BtcAmount,
+    #[serde(default)]
+    n: usize,
+    #[serde(rename = "scriptPubKey", default)]
+    script_pub_key: Option<ScriptHexJson>,
+}
+
+impl<'de> Deserialize<'de> for BtcTxOutput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let de = BtcTxOutputDe::deserialize(deserializer)?;
+        let script = match de.script_pub_key {
+            Some(s) if !s.hex.is_empty() => hex::decode(&s.hex).map_err(de::Error::custom)?,
+            _ => Vec::new(),
+        };
+        Ok(BtcTxOutput {
+            amount: de.value,
+            n: de.n,
+            script,
+        })
+    }
+}
+
+impl Serialize for BtcTxInput {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut st = serializer.serialize_struct("BtcTxInput", 5)?;
+        st.serialize_field("txid", &hex::encode(self.txid))?;
+        st.serialize_field("vout", &self.vout)?;
+        st.serialize_field(
+            "scriptSig",
+            &ScriptHexOut {
+                hex: hex::encode(&self.script),
+            },
+        )?;
+        st.serialize_field("sequence", &self.sequence)?;
+        let witnesses: Vec<String> = self.witnesses.iter().map(hex::encode).collect();
+        if witnesses.is_empty() {
+            st.skip_field("witnesses")?;
+        } else {
+            st.serialize_field("witnesses", &witnesses)?;
+        }
+        st.end()
+    }
+}
+
+#[derive(Serialize)]
+struct ScriptHexOut {
+    hex: String,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct BtcTxInputDe {
+    #[serde(default)]
+    txid: String,
+    #[serde(default)]
+    vout: u32,
+    #[serde(rename = "scriptSig", default)]
+    script_sig: Option<ScriptHexJson>,
+    #[serde(default)]
+    sequence: u32,
+    #[serde(default)]
+    witnesses: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for BtcTxInput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let de = BtcTxInputDe::deserialize(deserializer)?;
+        let mut txid = [0u8; 32];
+        if !de.txid.is_empty() {
+            let raw = hex::decode(&de.txid).map_err(de::Error::custom)?;
+            if raw.len() != 32 {
+                return Err(de::Error::custom("txid must be 32 bytes"));
+            }
+            txid.copy_from_slice(&raw);
+        }
+        let script = match de.script_sig {
+            Some(s) if !s.hex.is_empty() => hex::decode(&s.hex).map_err(de::Error::custom)?,
+            _ => Vec::new(),
+        };
+        let mut witnesses = Vec::with_capacity(de.witnesses.len());
+        for w in de.witnesses {
+            witnesses.push(hex::decode(&w).map_err(de::Error::custom)?);
+        }
+        Ok(BtcTxInput {
+            txid,
+            vout: de.vout,
+            script,
+            sequence: de.sequence,
+            witnesses,
+        })
+    }
+}
+
+impl Serialize for BtcTx {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut st = serializer.serialize_struct("BtcTx", 4)?;
+        st.serialize_field("version", &self.version)?;
+        st.serialize_field("vin", &self.in_)?;
+        st.serialize_field("vout", &self.out)?;
+        st.serialize_field("locktime", &self.locktime)?;
+        st.end()
+    }
+}
+
+#[derive(Deserialize)]
+struct BtcTxDe {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    vin: Vec<BtcTxInput>,
+    #[serde(default)]
+    vout: Vec<BtcTxOutput>,
+    #[serde(default)]
+    locktime: u32,
+}
+
+impl<'de> Deserialize<'de> for BtcTx {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let de = BtcTxDe::deserialize(deserializer)?;
+        Ok(BtcTx {
+            version: de.version,
+            in_: de.vin,
+            out: de.vout,
+            locktime: de.locktime,
+        })
+    }
 }

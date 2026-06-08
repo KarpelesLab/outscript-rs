@@ -76,7 +76,7 @@ pub fn blake3_256(data: &[u8]) -> [u8; 32] {
 /// last 20 bytes of the digest.
 pub fn ether_hash(uncompressed_pubkey: &[u8]) -> [u8; 20] {
     let body = if uncompressed_pubkey.is_empty() {
-        &uncompressed_pubkey[..]
+        uncompressed_pubkey
     } else {
         &uncompressed_pubkey[1..]
     };

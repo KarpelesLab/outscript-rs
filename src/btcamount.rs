@@ -35,7 +35,9 @@ impl BtcAmount {
         }
         match s.find('.') {
             None => {
-                let v: u64 = s.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+                let v: u64 = s
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| e.to_string())?;
                 Ok(BtcAmount(v * 100_000_000))
             }
             Some(pos) => {
@@ -133,7 +135,11 @@ mod tests {
             ("100", 10_000_000_000),
         ];
         for (input, want) in cases {
-            assert_eq!(BtcAmount::from_text(input).unwrap().0, want, "input {input}");
+            assert_eq!(
+                BtcAmount::from_text(input).unwrap().0,
+                want,
+                "input {input}"
+            );
         }
     }
 

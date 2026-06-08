@@ -67,9 +67,7 @@ fn extract_witness_only(witness: &[Vec<u8>]) -> Result<Vec<BtcInputSig>, String>
             }
             if witness.len() == 2 {
                 let pubb = &witness[1];
-                if !pubb.is_empty()
-                    && matches!(pubb[0], 0x02 | 0x03 | 0x04 | 0x06 | 0x07)
-                {
+                if !pubb.is_empty() && matches!(pubb[0], 0x02 | 0x03 | 0x04 | 0x06 | 0x07) {
                     let s = parse_ecdsa_sig(&witness[0], Some(pubb.clone()), "p2wpkh")?;
                     return Ok(vec![s]);
                 }
@@ -80,10 +78,10 @@ fn extract_witness_only(witness: &[Vec<u8>]) -> Result<Vec<BtcInputSig>, String>
 }
 
 fn extract_scriptsig_only(script_sig: &[u8]) -> Result<Vec<BtcInputSig>, String> {
-    if script_sig[0] == 0x00 {
-        if let Some(out) = parse_p2sh_multisig(script_sig) {
-            return Ok(out);
-        }
+    if script_sig[0] == 0x00
+        && let Some(out) = parse_p2sh_multisig(script_sig)
+    {
+        return Ok(out);
     }
     let (sig_b, n) = match parse_push_bytes(script_sig) {
         Some(v) => v,
@@ -101,7 +99,7 @@ fn extract_scriptsig_only(script_sig: &[u8]) -> Result<Vec<BtcInputSig>, String>
 }
 
 fn is_control_block(b: &[u8]) -> bool {
-    if b.len() < 33 || (b.len() - 33) % 32 != 0 {
+    if b.len() < 33 || !(b.len() - 33).is_multiple_of(32) {
         return false;
     }
     (b[0] & 0xfe) == 0xc0
@@ -221,7 +219,10 @@ fn parse_ecdsa_sig(
     scheme: &str,
 ) -> Result<BtcInputSig, String> {
     if sig_with_flag.len() < 9 {
-        return Err(format!("signature too short: {} bytes", sig_with_flag.len()));
+        return Err(format!(
+            "signature too short: {} bytes",
+            sig_with_flag.len()
+        ));
     }
     let flag = sig_with_flag[sig_with_flag.len() - 1] as u32;
     let der = &sig_with_flag[..sig_with_flag.len() - 1];
@@ -286,11 +287,11 @@ impl BtcInputSig {
         let r: [u8; 32] = self.r.clone().try_into().ok()?;
         let s: [u8; 32] = self.s.clone().try_into().ok()?;
         for pk in &self.pubkeys {
-            if let Ok(pub_) = SecpPublicKey::from_sec1(pk) {
-                if pub_.verify(digest, &r, &s) {
-                    self.pubkey = pk.clone();
-                    return Some(pk.clone());
-                }
+            if let Ok(pub_) = SecpPublicKey::from_sec1(pk)
+                && pub_.verify(digest, &r, &s)
+            {
+                self.pubkey = pk.clone();
+                return Some(pk.clone());
             }
         }
         None
