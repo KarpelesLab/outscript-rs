@@ -42,6 +42,23 @@ jobs:
       - name: Test
         run: cargo test
 
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Build
+        run: cargo build --all-targets
+
   docs:
     name: Docs build (warnings denied)
     runs-on: ubuntu-latest
