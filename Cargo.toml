@@ -13,7 +13,7 @@ categories = ["cryptography::cryptocurrencies"]
 name = "outscript"
 
 [dependencies]
-purecrypto = { version = "0.6.6", features = ["hazmat-secp256k1", "hazmat-edwards25519"] }
+purecrypto = { version = "0.6.14", features = ["hazmat-secp256k1", "hazmat-edwards25519"] }
 num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
