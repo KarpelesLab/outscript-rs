@@ -6,35 +6,38 @@
 
 use purecrypto::hash::{Blake2bMac, Blake3, blake2b256, keccak256, ripemd160, sha256};
 
-/// A single hash function usable in a [`hash_chain`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HashFn {
-    /// SHA-256.
-    Sha256,
-    /// RIPEMD-160.
-    Ripemd160,
-    /// Keccak-256 (Ethereum legacy keccak, not SHA3-256).
-    Keccak256,
-    /// BLAKE3 with 32-byte output (used for Massa).
-    Blake3,
-    /// BLAKE2b with 28-byte (224-bit) output (used for Cardano key credentials).
-    Blake2b224,
-    /// Ethereum public-key hash (keccak-256 over the body with the SEC1 prefix
-    /// byte stripped, returning the last 20 bytes). Terminal in a chain.
-    EtherHash,
-}
+/// A single hash step usable in a [`hash_chain`]: maps input bytes to output
+/// bytes.
+///
+/// This is a plain function pointer, not an enum, so adding a hash needs no
+/// change here — any `fn(&[u8]) -> Vec<u8>` works, whether one of the chainable
+/// helpers below ([`sha256_vec`], [`ripemd160_vec`], …) or a user-defined one.
+pub type HashFn = fn(&[u8]) -> Vec<u8>;
 
-impl HashFn {
-    fn apply(self, data: &[u8]) -> Vec<u8> {
-        match self {
-            HashFn::Sha256 => sha256(data).to_vec(),
-            HashFn::Ripemd160 => ripemd160(data).to_vec(),
-            HashFn::Keccak256 => keccak256(data).to_vec(),
-            HashFn::Blake3 => Blake3::hash(data).to_vec(),
-            HashFn::Blake2b224 => blake2b224(data).to_vec(),
-            HashFn::EtherHash => ether_hash(data).to_vec(),
-        }
-    }
+/// SHA-256, as a chainable [`HashFn`].
+pub fn sha256_vec(data: &[u8]) -> Vec<u8> {
+    sha256(data).to_vec()
+}
+/// RIPEMD-160, as a chainable [`HashFn`].
+pub fn ripemd160_vec(data: &[u8]) -> Vec<u8> {
+    ripemd160(data).to_vec()
+}
+/// Keccak-256 (Ethereum legacy keccak, not SHA3-256), as a chainable [`HashFn`].
+pub fn keccak256_vec(data: &[u8]) -> Vec<u8> {
+    keccak256(data).to_vec()
+}
+/// BLAKE3 with 32-byte output (used for Massa), as a chainable [`HashFn`].
+pub fn blake3_vec(data: &[u8]) -> Vec<u8> {
+    Blake3::hash(data).to_vec()
+}
+/// BLAKE2b-224 (used for Cardano key credentials), as a chainable [`HashFn`].
+pub fn blake2b224_vec(data: &[u8]) -> Vec<u8> {
+    blake2b224(data).to_vec()
+}
+/// The Ethereum public-key hash (keccak-256 over the body with the SEC1 prefix
+/// byte stripped, last 20 bytes), as a chainable [`HashFn`]. Terminal in a chain.
+pub fn ether_hash_vec(data: &[u8]) -> Vec<u8> {
+    ether_hash(data).to_vec()
 }
 
 /// Applies a sequence of hash functions, chaining the output of one into the
@@ -42,7 +45,7 @@ impl HashFn {
 pub fn hash_chain(data: &[u8], fns: &[HashFn]) -> Vec<u8> {
     let mut cur = data.to_vec();
     for f in fns {
-        cur = f.apply(&cur);
+        cur = f(&cur);
     }
     cur
 }
@@ -129,11 +132,11 @@ mod tests {
     fn test_hash_chain_matches_helpers() {
         let data = b"the quick brown fox";
         assert_eq!(
-            hash_chain(data, &[HashFn::Sha256, HashFn::Sha256]),
+            hash_chain(data, &[sha256_vec, sha256_vec]),
             dsha256(data).to_vec()
         );
         assert_eq!(
-            hash_chain(data, &[HashFn::Sha256, HashFn::Ripemd160]),
+            hash_chain(data, &[sha256_vec, ripemd160_vec]),
             hash160(data).to_vec()
         );
     }

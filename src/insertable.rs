@@ -1,7 +1,7 @@
 //! Composable `Insertable` operations that define how an output script is
 //! derived from a public key (port of the Go `Insertable`/`Format` types).
 
-use crate::hash::{HashFn, hash_chain};
+use crate::hash::{HashFn, hash_chain, ripemd160_vec, sha256_vec};
 use crate::pushbytes::push_bytes;
 use crate::script::Script;
 
@@ -71,7 +71,7 @@ pub(crate) fn ihash(inner: Insertable, fns: &[HashFn]) -> Insertable {
     Insertable::Hash(Box::new(inner), fns.to_vec())
 }
 pub(crate) fn ihash160(inner: Insertable) -> Insertable {
-    ihash(inner, &[HashFn::Sha256, HashFn::Ripemd160])
+    ihash(inner, &[sha256_vec, ripemd160_vec])
 }
 pub(crate) fn ttweak(inner: Insertable) -> Insertable {
     Insertable::TaprootTweak(Box::new(inner))

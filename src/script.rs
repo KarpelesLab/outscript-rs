@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use crate::hash::HashFn;
+use crate::hash::{blake2b224_vec, blake3_vec, ether_hash_vec, sha256_vec};
 use crate::insertable::{Format, b, ihash, ihash160, lookup, push, ttweak};
 use crate::out::Out;
 use crate::pubkey::PubKey;
@@ -31,23 +31,23 @@ pub fn format_def(name: &str) -> Option<Format> {
         "p2sh:p2pk" => vec![b(&[0xa9]), push(ihash160(lookup("p2pk"))), b(&[0x87])],
         "p2sh:p2puk" => vec![b(&[0xa9]), push(ihash160(lookup("p2puk"))), b(&[0x87])],
         "p2sh:p2wpkh" => vec![b(&[0xa9]), push(ihash160(lookup("p2wpkh"))), b(&[0x87])],
-        "p2wsh:p2pkh" => vec![b(&[0x00]), push(ihash(lookup("p2pkh"), &[HashFn::Sha256]))],
-        "p2wsh:p2pukh" => vec![b(&[0x00]), push(ihash(lookup("p2pukh"), &[HashFn::Sha256]))],
-        "p2wsh:p2pk" => vec![b(&[0x00]), push(ihash(lookup("p2pk"), &[HashFn::Sha256]))],
-        "p2wsh:p2puk" => vec![b(&[0x00]), push(ihash(lookup("p2puk"), &[HashFn::Sha256]))],
-        "p2wsh:p2wpkh" => vec![b(&[0x00]), push(ihash(lookup("p2wpkh"), &[HashFn::Sha256]))],
-        "eth" => vec![ihash(lookup("pubkey:uncomp"), &[HashFn::EtherHash])],
+        "p2wsh:p2pkh" => vec![b(&[0x00]), push(ihash(lookup("p2pkh"), &[sha256_vec]))],
+        "p2wsh:p2pukh" => vec![b(&[0x00]), push(ihash(lookup("p2pukh"), &[sha256_vec]))],
+        "p2wsh:p2pk" => vec![b(&[0x00]), push(ihash(lookup("p2pk"), &[sha256_vec]))],
+        "p2wsh:p2puk" => vec![b(&[0x00]), push(ihash(lookup("p2puk"), &[sha256_vec]))],
+        "p2wsh:p2wpkh" => vec![b(&[0x00]), push(ihash(lookup("p2wpkh"), &[sha256_vec]))],
+        "eth" => vec![ihash(lookup("pubkey:uncomp"), &[ether_hash_vec])],
         "massa_pubkey" => vec![b(&[0x00]), lookup("pubkey:ed25519")],
         "massa" => vec![
             b(&[0x00, 0x00]),
-            ihash(lookup("massa_pubkey"), &[HashFn::Blake3]),
+            ihash(lookup("massa_pubkey"), &[blake3_vec]),
         ],
         "solana" => vec![lookup("pubkey:ed25519")],
         // cardano: type-6 enterprise address payload (mainnet header 0x61) followed
         // by the blake2b-224 payment key hash. Out::address adjusts the network nibble.
         "cardano" => vec![
             b(&[0x61]),
-            ihash(lookup("pubkey:ed25519"), &[HashFn::Blake2b224]),
+            ihash(lookup("pubkey:ed25519"), &[blake2b224_vec]),
         ],
         _ => return None,
     };
