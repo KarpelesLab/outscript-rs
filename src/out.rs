@@ -50,10 +50,22 @@ impl Out {
     /// Extracts the hash part of the output, or `None` if there is no known hash.
     pub fn hash(&self) -> Option<Vec<u8>> {
         match self.name.as_str() {
-            "p2wpkh" | "p2tr" => parse_push_bytes(&self.raw[1..]).map(|(d, _)| d.to_vec()),
-            "p2pkh" | "p2pukh" => parse_push_bytes(&self.raw[2..]).map(|(d, _)| d.to_vec()),
+            "p2wpkh" | "p2tr" => self
+                .raw
+                .get(1..)
+                .and_then(parse_push_bytes)
+                .map(|(d, _)| d.to_vec()),
+            "p2pkh" | "p2pukh" => self
+                .raw
+                .get(2..)
+                .and_then(parse_push_bytes)
+                .map(|(d, _)| d.to_vec()),
             "p2pk" | "p2puk" => parse_push_bytes(&self.raw).map(|(pub_, _)| hash160(pub_).to_vec()),
-            "p2sh" => parse_push_bytes(&self.raw[1..]).map(|(d, _)| d.to_vec()),
+            "p2sh" => self
+                .raw
+                .get(1..)
+                .and_then(parse_push_bytes)
+                .map(|(d, _)| d.to_vec()),
             "eth" | "massa" | "solana" => Some(self.raw.clone()),
             // raw is "header byte + credential(s)"; return the payment/stake credential
             "cardano" if self.raw.len() >= 29 => Some(self.raw[1..29].to_vec()),
@@ -168,4 +180,18 @@ pub fn get_outs(pubkey: impl Into<PubKey>) -> Vec<Out> {
         }
     }
     outs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_returns_none_on_short_raw() {
+        // raw shorter than the format's fixed prefix must yield None, not panic.
+        assert_eq!(Out::make("p2wpkh", vec![], &[]).hash(), None);
+        assert_eq!(Out::make("p2pkh", vec![0x76], &[]).hash(), None);
+        assert_eq!(Out::make("p2sh", vec![], &[]).hash(), None);
+        assert_eq!(Out::make("cardano", vec![0x01], &[]).hash(), None);
+    }
 }
