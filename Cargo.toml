@@ -1,6 +1,6 @@
 [package]
 name = "outscript"
-version = "0.2.0"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Generate output scripts, parse/encode addresses, and build/sign transactions across multiple cryptocurrency networks (Bitcoin, EVM, Solana, Massa, ...)."
