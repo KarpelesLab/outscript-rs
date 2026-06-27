@@ -54,11 +54,27 @@ fn trim_left_zeros(mut b: &[u8]) -> &[u8] {
 }
 
 /// Decodes a trimmed big-endian byte slice (max 8 bytes) into a u64.
+///
+/// # Panics
+/// Panics if `buf` is longer than 8 bytes. Use [`decode_uint64_checked`] for
+/// attacker-controlled input.
 pub fn decode_uint64(buf: &[u8]) -> u64 {
     assert!(buf.len() <= 8, "decode_uint64 input longer than 8 bytes");
     let mut tmp = [0u8; 8];
     tmp[8 - buf.len()..].copy_from_slice(buf);
     u64::from_be_bytes(tmp)
+}
+
+/// Like [`decode_uint64`] but returns an error instead of panicking when `buf`
+/// exceeds 8 bytes. Use this when decoding fields from untrusted transactions.
+pub fn decode_uint64_checked(buf: &[u8]) -> Result<u64, Error> {
+    if buf.len() > 8 {
+        return Err(Error::Other(format!(
+            "invalid uint64 field: length {} exceeds 8 bytes",
+            buf.len()
+        )));
+    }
+    Ok(decode_uint64(buf))
 }
 
 fn encode_len(ln: usize, is_array: bool) -> Vec<u8> {

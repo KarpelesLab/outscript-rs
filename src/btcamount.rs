@@ -38,7 +38,9 @@ impl BtcAmount {
                 let v: u64 = s
                     .parse()
                     .map_err(|e: std::num::ParseIntError| e.to_string())?;
-                Ok(BtcAmount(v * 100_000_000))
+                Ok(BtcAmount(
+                    v.checked_mul(100_000_000).ok_or("amount overflows u64")?,
+                ))
             }
             Some(pos) => {
                 let ln = s.len();
@@ -51,7 +53,7 @@ impl BtcAmount {
                     .parse()
                     .map_err(|e: std::num::ParseIntError| e.to_string())?;
                 for _ in dec_count..8 {
-                    v *= 10;
+                    v = v.checked_mul(10).ok_or("amount overflows u64")?;
                 }
                 Ok(BtcAmount(v))
             }
@@ -156,6 +158,14 @@ mod tests {
     #[test]
     fn too_many_decimals() {
         assert!(BtcAmount::from_text("1.123456789").is_err());
+    }
+
+    #[test]
+    fn overflow_is_rejected() {
+        // integer path: v * 1e8 wraps u64
+        assert!(BtcAmount::from_text("1000000000000").is_err());
+        // decimal-scaling path: v *= 10 wraps u64
+        assert!(BtcAmount::from_text("1844674407370955161.5").is_err());
     }
 
     #[test]

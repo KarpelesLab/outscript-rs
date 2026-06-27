@@ -503,6 +503,12 @@ impl SolanaTx {
         let msg = self.message_bytes();
         let num_signers = self.header().num_required_signatures as usize;
         let account_keys: Vec<SolanaKey> = self.account_keys().to_vec();
+        if num_signers > account_keys.len() {
+            return Err(format!(
+                "invalid header: {num_signers} required signers but only {} account keys",
+                account_keys.len()
+            ));
+        }
         for seed in seeds {
             let pubkey = SolanaKey(ed25519::public_from_seed(seed));
             let idx = account_keys[..num_signers]
@@ -518,6 +524,12 @@ impl SolanaTx {
     pub fn verify(&self) -> Result<(), String> {
         let msg = self.message_bytes();
         let num_signers = self.header().num_required_signatures as usize;
+        if num_signers > self.account_keys().len() {
+            return Err(format!(
+                "invalid header: {num_signers} required signers but only {} account keys",
+                self.account_keys().len()
+            ));
+        }
         if self.signatures.len() < num_signers {
             return Err(format!(
                 "expected {} signatures, got {}",
@@ -630,6 +642,55 @@ fn write_message_common(
     }
 }
 
+/// Checks that the message header account counts are internally consistent with
+/// the number of account keys. Prevents out-of-bounds indexing in sign/verify
+/// when handling a crafted message.
+fn validate_solana_header(h: &SolanaMessageHeader, num_keys: usize) -> Result<(), String> {
+    if h.num_required_signatures as usize > num_keys {
+        return Err(format!(
+            "num_required_signatures {} exceeds account key count {num_keys}",
+            h.num_required_signatures
+        ));
+    }
+    if h.num_readonly_signed > h.num_required_signatures {
+        return Err(format!(
+            "num_readonly_signed {} exceeds num_required_signatures {}",
+            h.num_readonly_signed, h.num_required_signatures
+        ));
+    }
+    if h.num_required_signatures as usize + h.num_readonly_unsigned as usize > num_keys {
+        return Err(format!(
+            "num_required_signatures + num_readonly_unsigned ({}) exceeds account key count {num_keys}",
+            h.num_required_signatures as usize + h.num_readonly_unsigned as usize
+        ));
+    }
+    Ok(())
+}
+
+/// Validates that every instruction's program id index and account indices
+/// reference an addressable account (`< addressable`).
+fn validate_instruction_indexes(
+    instructions: &[SolanaCompiledInstruction],
+    addressable: usize,
+) -> Result<(), String> {
+    for (i, ix) in instructions.iter().enumerate() {
+        if ix.program_id_index as usize >= addressable {
+            return Err(format!(
+                "instruction {i} program id index {} out of range ({addressable} addressable accounts)",
+                ix.program_id_index
+            ));
+        }
+        for &ai in &ix.account_indices {
+            if ai as usize >= addressable {
+                return Err(format!(
+                    "instruction {i} account index {ai} out of range ({addressable} addressable accounts)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn read_message_common(
     data: &[u8],
     pos: &mut usize,
@@ -667,6 +728,7 @@ fn read_message_common(
         account_keys.push(SolanaKey(k));
         *pos += 32;
     }
+    validate_solana_header(&header, account_keys.len())?;
     if data.len() < *pos + 32 {
         return Err("unexpected EOF".into());
     }
@@ -674,6 +736,14 @@ fn read_message_common(
     bh.copy_from_slice(&data[*pos..*pos + 32]);
     *pos += 32;
     let ix_count = decode_compact_u16(data, pos)?;
+    // Sanity cap: every instruction needs at least one byte (the program id
+    // index), so the count cannot exceed the remaining bytes.
+    if ix_count > data.len() - *pos {
+        return Err(format!(
+            "instruction count {ix_count} exceeds remaining bytes {}",
+            data.len() - *pos
+        ));
+    }
     let mut instructions = Vec::with_capacity(ix_count);
     for _ in 0..ix_count {
         if data.len() < *pos + 1 {
@@ -720,6 +790,9 @@ impl SolanaMessage {
         let mut pos = 0;
         let (header, account_keys, recent_blockhash, instructions) =
             read_message_common(data, &mut pos)?;
+        // For the legacy format the addressable set is exactly the static
+        // account key list.
+        validate_instruction_indexes(&instructions, account_keys.len())?;
         Ok(SolanaMessage {
             header,
             account_keys,
@@ -766,6 +839,14 @@ impl SolanaMessageV0 {
         let (header, account_keys, recent_blockhash, instructions) =
             read_message_common(data, &mut pos)?;
         let lookup_count = decode_compact_u16(data, &mut pos)?;
+        // Sanity cap: every lookup needs at least one byte, so the count cannot
+        // exceed the remaining bytes.
+        if lookup_count > data.len() - pos {
+            return Err(format!(
+                "address table lookup count {lookup_count} exceeds remaining bytes {}",
+                data.len() - pos
+            ));
+        }
         let mut lookups = Vec::with_capacity(lookup_count);
         for _ in 0..lookup_count {
             if data.len() < pos + 32 {
@@ -792,6 +873,16 @@ impl SolanaMessageV0 {
                 readonly_indexes,
             });
         }
+        // For v0 the addressable account set is the static account keys followed
+        // by accounts loaded from address lookup tables (all writable indexes,
+        // then all readonly indexes). The lookup counts are only known after the
+        // lookups are parsed, which is why this validation happens here.
+        let addressable = account_keys.len()
+            + lookups
+                .iter()
+                .map(|l| l.writable_indexes.len() + l.readonly_indexes.len())
+                .sum::<usize>();
+        validate_instruction_indexes(&instructions, addressable)?;
         Ok(SolanaMessageV0 {
             header,
             account_keys,
@@ -833,6 +924,11 @@ pub fn decode_compact_u16(data: &[u8], pos: &mut usize) -> Result<usize, String>
     }
     let b1 = data[*pos + 1];
     if b1 < 0x80 {
+        // Reject non-canonical encodings: a 2-byte form whose high group is zero
+        // should have been encoded in a single byte.
+        if b1 == 0 {
+            return Err("non-canonical compact-u16".into());
+        }
         *pos += 2;
         return Ok((b0 & 0x7f) as usize | (b1 as usize) << 7);
     }
@@ -842,6 +938,11 @@ pub fn decode_compact_u16(data: &[u8], pos: &mut usize) -> Result<usize, String>
     let b2 = data[*pos + 2];
     if b2 > 3 {
         return Err("compact-u16 overflow".into());
+    }
+    // Reject non-canonical encodings: a 3-byte form whose high group is zero
+    // should have been encoded in two bytes.
+    if b2 == 0 {
+        return Err("non-canonical compact-u16".into());
     }
     *pos += 3;
     Ok((b0 & 0x7f) as usize | ((b1 & 0x7f) as usize) << 7 | (b2 as usize) << 14)

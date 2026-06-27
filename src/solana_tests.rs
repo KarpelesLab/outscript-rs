@@ -130,3 +130,62 @@ fn pda_multiple_seeds() {
     .unwrap();
     assert_eq!(addr, addr2);
 }
+
+// --- Security regression tests (port of solanatx_extra_test.go) ---
+
+/// Assembles a legacy SolanaMessage wire-format body for tests.
+fn build_legacy_message(header: &[u8], key_count: &[u8], num_keys: usize, ix: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(header);
+    buf.extend_from_slice(key_count);
+    buf.extend(std::iter::repeat_n(0u8, num_keys * 32)); // account keys
+    buf.extend(std::iter::repeat_n(0u8, 32)); // recent blockhash
+    buf.extend_from_slice(ix);
+    buf
+}
+
+#[test]
+fn message_header_count_too_large() {
+    // header: num_required_signatures=2, others=0; key_count=1
+    let data = build_legacy_message(&[0x02, 0x00, 0x00], &[0x01], 1, &[0x00]);
+    assert!(SolanaMessage::unmarshal_binary(&data).is_err());
+}
+
+#[test]
+fn verify_sign_no_panic_on_bad_header() {
+    // header references more signers than keys; must error, not panic.
+    let mut tx = SolanaTx {
+        signatures: vec![Vec::new(); 3],
+        message: SolanaMessage {
+            header: SolanaMessageHeader {
+                num_required_signatures: 3,
+                ..Default::default()
+            },
+            account_keys: Vec::new(),
+            ..Default::default()
+        },
+        message_v0: None,
+    };
+    assert!(tx.verify().is_err());
+    assert!(tx.sign(&[seed()]).is_err());
+}
+
+#[test]
+fn non_canonical_compact_u16_rejected() {
+    // header valid, then non-canonical compact-u16 ([0x80,0x00]) for key count.
+    let data = vec![0x01, 0x00, 0x00, 0x80, 0x00];
+    assert!(SolanaMessage::unmarshal_binary(&data).is_err());
+}
+
+#[test]
+fn instruction_index_out_of_range() {
+    // one instruction with program_id_index=5 but only 1 account key
+    let ix = [0x01, 0x05, 0x00, 0x00];
+    let data = build_legacy_message(&[0x01, 0x00, 0x00], &[0x01], 1, &ix);
+    assert!(SolanaMessage::unmarshal_binary(&data).is_err());
+
+    // out-of-range account index
+    let ix2 = [0x01, 0x00, 0x01, 0x09, 0x00];
+    let data2 = build_legacy_message(&[0x01, 0x00, 0x00], &[0x01], 1, &ix2);
+    assert!(SolanaMessage::unmarshal_binary(&data2).is_err());
+}

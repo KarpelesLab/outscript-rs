@@ -134,6 +134,14 @@ pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, 
         buf.truncate(chk_start);
         let h = dsha256(&buf);
         if h[..4] == chk[..] {
+            // a standard P2PKH/P2SH payload is exactly 1 version byte + a 20-byte
+            // hash; reject anything else rather than emit a non-standard script.
+            if buf.len() != 21 {
+                return Err(format!(
+                    "invalid base58 address payload length {}",
+                    buf.len()
+                ));
+            }
             return parse_base58_versioned(network, &buf);
         }
     }
@@ -288,7 +296,8 @@ impl Out {
                     "electraproto" => Ok(encode_base58_addr(0x37, buf)),
                     "dash" => Ok(encode_base58_addr(0x4c, buf)),
                     "bitcoin-testnet" => Ok(encode_base58_addr(0x6f, buf)),
-                    _ => Ok(encode_base58_addr(0x00, buf)),
+                    "bitcoin" => Ok(encode_base58_addr(0x00, buf)),
+                    other => Err(format!("unsupported network {other:?} for p2pkh address")),
                 }
             }
             "p2sh" => {
@@ -305,7 +314,8 @@ impl Out {
                     "electraproto" => Ok(encode_base58_addr(0x89, buf)),
                     "dash" => Ok(encode_base58_addr(0x10, buf)),
                     "bitcoin-testnet" => Ok(encode_base58_addr(0xc4, buf)),
-                    _ => Ok(encode_base58_addr(0x05, buf)),
+                    "bitcoin" => Ok(encode_base58_addr(0x05, buf)),
+                    other => Err(format!("unsupported network {other:?} for p2sh address")),
                 }
             }
             "p2wpkh" | "p2wsh" => {

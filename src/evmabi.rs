@@ -119,8 +119,36 @@ impl AbiBuffer {
         }
     }
 
+    /// Validates that `addr` is exactly 20 bytes and appends it as a uint256-style
+    /// ABI word (left-padded to 32 bytes).
+    fn append_address_bytes(&mut self, addr: &[u8]) -> Result<(), String> {
+        if addr.len() != 20 {
+            return Err(format!("evm address must be 20 bytes, got {}", addr.len()));
+        }
+        self.append_big_int(&BigInt::from_bytes_be(Sign::Plus, addr))
+    }
+
     fn append_address_any(&mut self, v: &AbiValue) -> Result<(), String> {
-        Err(format!("unsupported type {v:?} for evm abi type address"))
+        match v {
+            AbiValue::Out(o) => {
+                if o.name != "evm" && o.name != "eth" {
+                    return Err(format!(
+                        "unsupported output type {} for evm abi type address",
+                        o.name
+                    ));
+                }
+                self.append_address_bytes(o.bytes())
+            }
+            AbiValue::Bytes(b) => self.append_address_bytes(b),
+            AbiValue::Str(s) => {
+                let s = s.strip_prefix("0x").unwrap_or(s);
+                let addr = hex::decode(s).map_err(|e| format!("invalid hex address: {e}"))?;
+                self.append_address_bytes(&addr)
+            }
+            other => Err(format!(
+                "unsupported type {other:?} for evm abi type address"
+            )),
+        }
     }
 
     fn append_buffer_any(&mut self, v: &AbiValue) -> Result<(), String> {
@@ -143,7 +171,9 @@ impl AbiBuffer {
     pub fn append_big_int(&mut self, v: &BigInt) -> Result<(), String> {
         let mut val = v.clone();
         if val.sign() == Sign::Minus {
-            val = two_pow_256() - val;
+            // two's complement: 2^256 + v (v is negative). For v == -1 this yields
+            // an all-ones 32-byte word.
+            val = two_pow_256() + val;
             if val.sign() != Sign::Plus {
                 return Err("big.Int value exceeds negative 256 bits".into());
             }
@@ -229,6 +259,52 @@ mod tests {
             hex::encode(call),
             "a9059cbb0000000000000000000000005fb84129ad9e7818f099966de975ff41213f028d00000000000000000000000000000000000000000000000001b69b4bacd05f15"
         );
+    }
+
+    #[test]
+    fn address_abi_type_encodes() {
+        // The "address" ABI type must be usable via encode_abi (the evm_call path),
+        // not only encode_auto.
+        let addr = parse_evm_address("0x5Fb84129AD9E7818F099966de975ff41213F028d").unwrap();
+        let mut buf = AbiBuffer::default();
+        buf.encode_abi(
+            "transfer(address,uint256)",
+            &[
+                AbiValue::Out(addr),
+                AbiValue::Uint(BigInt::from(123456789123456789u64)),
+            ],
+        )
+        .unwrap();
+        let call = buf.call("transfer(address,uint256)");
+        assert_eq!(
+            hex::encode(call),
+            "a9059cbb0000000000000000000000005fb84129ad9e7818f099966de975ff41213f028d00000000000000000000000000000000000000000000000001b69b4bacd05f15"
+        );
+
+        // a "0x..." string address also works
+        let mut buf2 = AbiBuffer::default();
+        buf2.encode_types(
+            &["address"],
+            &[AbiValue::Str(
+                "0x5Fb84129AD9E7818F099966de975ff41213F028d".into(),
+            )],
+        )
+        .unwrap();
+
+        // an address that is not 20 bytes is rejected
+        let mut buf3 = AbiBuffer::default();
+        assert!(
+            buf3.encode_types(&["address"], &[AbiValue::Bytes(vec![0u8; 19])])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn negative_two_complement() {
+        // -1 must encode as the all-ones 32-byte word, not be rejected.
+        let mut buf = AbiBuffer::default();
+        buf.append_big_int(&BigInt::from(-1)).unwrap();
+        assert_eq!(hex::encode(buf.bytes()), "f".repeat(64));
     }
 
     #[test]

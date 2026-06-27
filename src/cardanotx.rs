@@ -109,7 +109,9 @@ pub struct CardanoTx {
 
 /// Groups assets by policy id then asset name, summing amounts of duplicates,
 /// and builds the CBOR multiasset map `{policy_id => {asset_name => amount}}`.
-fn multiasset_map(assets: &[CardanoAsset]) -> Cbor {
+/// Returns an error if aggregating duplicate `(policy, asset name)` entries
+/// overflows `u64`, rather than silently wrapping.
+fn multiasset_map(assets: &[CardanoAsset]) -> Result<Cbor, String> {
     // (policy_id, [(asset_name, amount)]) grouping, built in insertion order;
     // the CBOR encoder applies the canonical key ordering at encode time.
     type Policy = (Vec<u8>, Vec<(Vec<u8>, u64)>);
@@ -124,7 +126,15 @@ fn multiasset_map(assets: &[CardanoAsset]) -> Cbor {
             }
         };
         match names.iter_mut().find(|(n, _)| *n == a.asset_name) {
-            Some((_, amount)) => *amount += a.amount,
+            Some((_, amount)) => {
+                *amount = amount.checked_add(a.amount).ok_or_else(|| {
+                    format!(
+                        "cardano asset amount overflow for policy {} asset {}",
+                        hex::encode(&a.policy_id),
+                        hex::encode(&a.asset_name)
+                    )
+                })?;
+            }
             None => names.push((a.asset_name.clone(), a.amount)),
         }
     }
@@ -138,16 +148,19 @@ fn multiasset_map(assets: &[CardanoAsset]) -> Cbor {
             (Cbor::Bytes(policy), Cbor::Map(inner))
         })
         .collect();
-    Cbor::Map(entries)
+    Ok(Cbor::Map(entries))
 }
 
 /// Returns the CBOR value for an output's amount: a bare coin for ADA-only
 /// outputs, or `[coin, multiasset]` when native tokens are present.
-fn output_value(out: &CardanoOutput) -> Cbor {
+fn output_value(out: &CardanoOutput) -> Result<Cbor, String> {
     if out.assets.is_empty() {
-        Cbor::Uint(out.amount)
+        Ok(Cbor::Uint(out.amount))
     } else {
-        Cbor::Array(vec![Cbor::Uint(out.amount), multiasset_map(&out.assets)])
+        Ok(Cbor::Array(vec![
+            Cbor::Uint(out.amount),
+            multiasset_map(&out.assets)?,
+        ]))
     }
 }
 
@@ -182,7 +195,7 @@ impl CardanoTx {
             }
             outputs.push(Cbor::Array(vec![
                 Cbor::Bytes(out.address.clone()),
-                output_value(out),
+                output_value(out)?,
             ]));
         }
 

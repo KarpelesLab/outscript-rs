@@ -217,6 +217,70 @@ fn cardano_tx_multiasset() {
     assert_eq!(decoded.outputs[0].amount, 2_000_000);
 }
 
+#[test]
+fn cardano_asset_amount_overflow() {
+    // Aggregating two duplicate (policy, asset name) entries whose amounts
+    // overflow u64 must error rather than silently wrapping.
+    let txid =
+        hex::decode("5c32d3c670337ad0ef69e5bf8cbd26cee7a736ee0fba41e63ec071671c1a6376").unwrap();
+    let policy = hex::decode("00000000000000000000000000000000000000000000000000000000").unwrap();
+    let tx = CardanoTx {
+        inputs: vec![CardanoInput { txid, index: 1 }],
+        outputs: vec![CardanoOutput {
+            address: addr_bytes("addr1vx2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzers66hrl8"),
+            amount: 2_000_000,
+            assets: vec![
+                CardanoAsset {
+                    policy_id: policy.clone(),
+                    asset_name: b"TOKEN".to_vec(),
+                    amount: u64::MAX,
+                },
+                CardanoAsset {
+                    policy_id: policy,
+                    asset_name: b"TOKEN".to_vec(),
+                    amount: 1,
+                },
+            ],
+        }],
+        fee: 180_000,
+        ttl: 0,
+        witnesses: vec![],
+    };
+    assert!(tx.marshal_binary().is_err());
+    assert!(tx.body_bytes().is_err());
+}
+
+#[test]
+fn cardano_parse_hrp_mismatch() {
+    // checksum-valid addresses whose HRP disagrees with the header byte must be
+    // rejected (network confusion).
+    let bad = [
+        // "stake" HRP wrapping an enterprise (payment) header (0x61)
+        "stake1vx2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzersuzp9l4",
+        // "addr" (mainnet) HRP with a testnet enterprise header (0x60)
+        "addr1vz2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzers6g8jlq",
+        // "addr" (mainnet) HRP with a testnet base header (0x00)
+        "addr1qz2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzer3n9a3vl7ljgpcrf6e0p5lrzxyq034l8e5d3gemafc3ey5q9syj92",
+    ];
+    for a in bad {
+        assert!(
+            parse_cardano_address(a).is_err(),
+            "expected {a} to be rejected"
+        );
+    }
+
+    // all four legitimate prefixes must still parse
+    let good = [
+        "addr1vx2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzers66hrl8",
+        "addr_test1qz2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzer3n0d3vllmyqwsx5wktcd8cc3sq835lu7drv2xwl2wywfgs68faae",
+        "stake1uyehkck0lajq8gr28t9uxnuvgcqrc6070x3k9r8048z8y5gh6ffgw",
+        "stake_test1uqehkck0lajq8gr28t9uxnuvgcqrc6070x3k9r8048z8y5gssrtvn",
+    ];
+    for a in good {
+        assert!(parse_cardano_address(a).is_ok(), "expected {a} to parse");
+    }
+}
+
 // --- BIP32-Ed25519 / CIP-1852 HD derivation ---
 
 /// Mimics standard Ed25519 secret-key expansion (RFC 8032): SHA-512 of the seed,

@@ -113,6 +113,24 @@ fn massa_address() {
 }
 
 #[test]
+fn short_base58_address_is_rejected() {
+    // OOB / malformed-payload guards: short or wrong-length base58 must not panic
+    // and must not parse to a non-standard script.
+    for a in ["1", "111", "1111111111"] {
+        assert!(parse_bitcoin_based_address("auto", a).is_err());
+    }
+}
+
+#[test]
+fn unknown_network_p2pkh_errors() {
+    // Out::address must reject an unrecognized network rather than silently
+    // emitting a Bitcoin-mainnet address.
+    let out = parse_bitcoin_based_address("bitcoin", "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa").unwrap();
+    assert!(out.address(&["bitcoin"]).is_ok());
+    assert!(out.address(&["nonsense-network"]).is_err());
+}
+
+#[test]
 fn evm_lowercase_and_checksum() {
     let checksummed = "0x2AeB8ADD8337360E088B7D9ce4e857b9BE60f3a7";
     assert!(parse_evm_address(checksummed).is_ok());

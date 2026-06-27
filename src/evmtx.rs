@@ -190,9 +190,9 @@ impl EvmTx {
             }
             let b = |i: usize| -> &[u8] { list[i].as_bytes().unwrap_or(&[]) };
             tx.tx_type = EvmTxType::Legacy;
-            tx.nonce = rlp::decode_uint64(b(0));
+            tx.nonce = rlp::decode_uint64_checked(b(0)).map_err(|e| e.to_string())?;
             tx.gas_fee_cap = BigInt::from_bytes_be(Sign::Plus, b(1));
-            tx.gas = rlp::decode_uint64(b(2));
+            tx.gas = rlp::decode_uint64_checked(b(2)).map_err(|e| e.to_string())?;
             tx.to = format!("0x{}", hex::encode(b(3)));
             tx.value = BigInt::from_bytes_be(Sign::Plus, b(4));
             tx.data = b(5).to_vec();
@@ -227,10 +227,10 @@ impl EvmTx {
                         return Err(format!("EIP-2930 must have 8 or 11 fields, got {ln}"));
                     }
                     tx.tx_type = EvmTxType::Eip2930;
-                    tx.chain_id = rlp::decode_uint64(b(0));
-                    tx.nonce = rlp::decode_uint64(b(1));
+                    tx.chain_id = rlp::decode_uint64_checked(b(0)).map_err(|e| e.to_string())?;
+                    tx.nonce = rlp::decode_uint64_checked(b(1)).map_err(|e| e.to_string())?;
                     tx.gas_fee_cap = BigInt::from_bytes_be(Sign::Plus, b(2));
-                    tx.gas = rlp::decode_uint64(b(3));
+                    tx.gas = rlp::decode_uint64_checked(b(3)).map_err(|e| e.to_string())?;
                     tx.to = format!("0x{}", hex::encode(b(4)));
                     tx.value = BigInt::from_bytes_be(Sign::Plus, b(5));
                     tx.data = b(6).to_vec();
@@ -246,11 +246,11 @@ impl EvmTx {
                         return Err(format!("EIP-1559 must have 9 or 12 fields, got {ln}"));
                     }
                     tx.tx_type = EvmTxType::Eip1559;
-                    tx.chain_id = rlp::decode_uint64(b(0));
-                    tx.nonce = rlp::decode_uint64(b(1));
+                    tx.chain_id = rlp::decode_uint64_checked(b(0)).map_err(|e| e.to_string())?;
+                    tx.nonce = rlp::decode_uint64_checked(b(1)).map_err(|e| e.to_string())?;
                     tx.gas_tip_cap = BigInt::from_bytes_be(Sign::Plus, b(2));
                     tx.gas_fee_cap = BigInt::from_bytes_be(Sign::Plus, b(3));
-                    tx.gas = rlp::decode_uint64(b(4));
+                    tx.gas = rlp::decode_uint64_checked(b(4)).map_err(|e| e.to_string())?;
                     tx.to = format!("0x{}", hex::encode(b(5)));
                     tx.value = BigInt::from_bytes_be(Sign::Plus, b(6));
                     tx.data = b(7).to_vec();
@@ -281,9 +281,20 @@ impl EvmTx {
         let r = bigint_to_32(&self.r)?;
         let s = bigint_to_32(&self.s)?;
         let mut v = self.y.to_u64().ok_or("invalid v")?;
-        if self.tx_type == EvmTxType::Legacy && v >= 35 {
-            // EIP-155: v = chainId*2 + 35 + recid; recid = 1 - (v & 1).
-            v = 1 - (v & 1);
+        if self.tx_type == EvmTxType::Legacy {
+            if v >= 35 {
+                // EIP-155: v = chainId*2 + 35 + recid; recid = 1 - (v & 1).
+                v = 1 - (v & 1);
+            } else {
+                // Pre-EIP-155 legacy: v is the standard 27/28 (map to recovery
+                // 0/1), or already a raw 0/1 recovery id. Anything else is invalid
+                // and would otherwise be rejected below or panic in recovery.
+                v = match v {
+                    27 | 28 => v - 27,
+                    0 | 1 => v,
+                    _ => return Err("invalid pre-EIP-155 signature v value".into()),
+                };
+            }
         }
         if v > 3 {
             return Err("invalid recovery id".into());
@@ -429,6 +440,46 @@ mod tests {
             tx.sender_address().unwrap(),
             "0x2AeB8ADD8337360E088B7D9ce4e857b9BE60f3a7"
         );
+    }
+
+    #[test]
+    fn pre_eip155_sign_and_recover() {
+        // chain_id == 0 produces a pre-EIP-155 legacy signature (v = 27/28).
+        // Recovery must not panic and must return the signer.
+        let mut tx = EvmTx {
+            chain_id: 0,
+            nonce: 7,
+            gas_fee_cap: BigInt::from(20_000_000_000u64),
+            gas: 21000,
+            to: "0x2aeb8add8337360e088b7d9ce4e857b9be60f3a7".into(),
+            value: BigInt::from(1u64),
+            ..Default::default()
+        };
+        tx.sign(&key()).unwrap();
+        // v must be the legacy 27/28 form
+        let v = tx.y.to_u64().unwrap();
+        assert!(v == 27 || v == 28, "expected legacy v 27/28, got {v}");
+        assert_eq!(
+            tx.sender_address().unwrap(),
+            "0x2AeB8ADD8337360E088B7D9ce4e857b9BE60f3a7"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_oversized_uint_field() {
+        // A legacy tx whose nonce field is 9 bytes is valid RLP but must error
+        // (not panic) when decoded as a u64.
+        let nine = vec![0x88u8; 9]; // RLP byte string of 9 bytes -> 0x88 prefix
+        let fields: Vec<crate::rlp::RlpItem> = vec![
+            crate::rlp::RlpItem::Bytes(nine),             // nonce (9 bytes)
+            crate::rlp::RlpItem::Bytes(vec![0x01]),       // gas price
+            crate::rlp::RlpItem::Bytes(vec![0x52, 0x08]), // gas
+            crate::rlp::RlpItem::Bytes(vec![0u8; 20]),    // to
+            crate::rlp::RlpItem::Bytes(vec![]),           // value
+            crate::rlp::RlpItem::Bytes(vec![]),           // data
+        ];
+        let encoded = crate::rlp::RlpItem::List(fields).encode();
+        assert!(EvmTx::parse_transaction(&encoded).is_err());
     }
 }
 

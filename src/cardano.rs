@@ -160,6 +160,28 @@ pub fn parse_cardano_address(address: &str) -> Result<Out, String> {
         ));
     }
 
+    // Cross-check that the human-readable prefix agrees with the header byte, so a
+    // checksum-valid address can't claim a different network/kind than its HRP.
+    // "stake"/"stake_test" must wrap a reward address; "addr"/"addr_test" must
+    // wrap a payment (base/enterprise) address. The "_test" suffix must match the
+    // testnet network id and its absence the mainnet id.
+    let hrp_is_stake = hrp == "stake" || hrp == "stake_test";
+    if hrp_is_stake != (typ == TYPE_REWARD) {
+        return Err(format!(
+            "cardano address prefix {hrp:?} does not match header type {typ}"
+        ));
+    }
+    let want_net = if hrp.ends_with("_test") {
+        NET_TESTNET
+    } else {
+        NET_MAINNET
+    };
+    if net != want_net {
+        return Err(format!(
+            "cardano address prefix {hrp:?} does not match header network id {net}"
+        ));
+    }
+
     let flag = if net == NET_TESTNET {
         "cardano-testnet"
     } else {
