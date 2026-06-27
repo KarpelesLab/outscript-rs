@@ -11,7 +11,7 @@ fn key(hex_s: &str) -> SecpPrivateKey {
 }
 
 fn parse(hex_s: &str) -> BtcTx {
-    BtcTx::unmarshal_binary(&hex::decode(hex_s).unwrap()).unwrap()
+    BtcTx::from_bytes(&hex::decode(hex_s).unwrap()).unwrap()
 }
 
 #[test]
@@ -63,11 +63,11 @@ fn p2pk_and_p2wpkh_bip143() {
     .unwrap();
 
     assert_eq!(
-        hex::encode(&tx.in_[0].script),
+        hex::encode(&tx.inputs[0].script),
         "4830450221008b9d1dc26ba6a9cb62127b02742fa9d754cd3bebf337f7a55d114c8e5cdd30be022040529b194ba3f9281a99f2b1c0a19c0489bc22ede944ccf4ecbab4cc618ef3ed01"
     );
     assert_eq!(
-        hex::encode(&tx.in_[1].witnesses[0]),
+        hex::encode(&tx.inputs[1].witnesses[0]),
         "304402203609e17b84f6a7d30c80bfa610b5b4542f32a8a0d5447a12fb1366d7f01cc44a0220573a954c4518331561406f90300e8f3358f51928d43c212a8caed02de67eebee01"
     );
 
@@ -100,19 +100,19 @@ fn p2wsh_p2pkh_matches_p2wpkh_sig() {
     ])
     .unwrap();
     assert_eq!(
-        hex::encode(&tx.in_[1].witnesses[0]),
+        hex::encode(&tx.inputs[1].witnesses[0]),
         "304402203609e17b84f6a7d30c80bfa610b5b4542f32a8a0d5447a12fb1366d7f01cc44a0220573a954c4518331561406f90300e8f3358f51928d43c212a8caed02de67eebee01"
     );
-    assert_eq!(tx.in_[1].witnesses.len(), 3);
+    assert_eq!(tx.inputs[1].witnesses.len(), 3);
     assert_eq!(
-        hex::encode(&tx.in_[1].witnesses[1]),
+        hex::encode(&tx.inputs[1].witnesses[1]),
         "025476c2e83188368da1ff3e292e7acafcdb3566bb0ad253f62fc70f07aeee6357"
     );
     assert_eq!(
-        hex::encode(&tx.in_[1].witnesses[2]),
+        hex::encode(&tx.inputs[1].witnesses[2]),
         "76a9141d0f172a0ecb48aee1be1f2687d2963ae33f71a188ac"
     );
-    assert!(tx.in_[1].script.is_empty());
+    assert!(tx.inputs[1].script.is_empty());
 }
 
 #[test]
@@ -125,9 +125,9 @@ fn p2wsh_p2pk() {
         BtcTxSign::new(&key1, "p2wsh:p2pk").amount(600000000),
     ])
     .unwrap();
-    assert_eq!(tx.in_[1].witnesses.len(), 2);
+    assert_eq!(tx.inputs[1].witnesses.len(), 2);
     let expected_ws = Script::new(key1.public_key()).generate("p2pk").unwrap();
-    assert_eq!(tx.in_[1].witnesses[1], expected_ws);
+    assert_eq!(tx.inputs[1].witnesses[1], expected_ws);
 }
 
 #[test]
@@ -135,7 +135,7 @@ fn p2wsh_autodetect() {
     let key0 = key("bbc27228ddcb9209d7fd6f36b02f7dfa6252af40bb2f1cbc7a557da8027ff866");
     let key1 = key("619c335025c7f4012e556c2a58b2506e30b8511b53ade95ea316fd8c3286feb9");
     let mut tx = parse(BIP143_TX);
-    tx.in_[1].script = Script::new(key1.public_key())
+    tx.inputs[1].script = Script::new(key1.public_key())
         .generate("p2wsh:p2pkh")
         .unwrap();
     tx.sign(&[
@@ -144,11 +144,11 @@ fn p2wsh_autodetect() {
     ])
     .unwrap();
     assert_eq!(
-        hex::encode(&tx.in_[1].witnesses[0]),
+        hex::encode(&tx.inputs[1].witnesses[0]),
         "304402203609e17b84f6a7d30c80bfa610b5b4542f32a8a0d5447a12fb1366d7f01cc44a0220573a954c4518331561406f90300e8f3358f51928d43c212a8caed02de67eebee01"
     );
-    assert_eq!(tx.in_[1].witnesses.len(), 3);
-    assert!(tx.in_[1].script.is_empty());
+    assert_eq!(tx.inputs[1].witnesses.len(), 3);
+    assert!(tx.inputs[1].script.is_empty());
 }
 
 #[test]
@@ -163,8 +163,8 @@ fn compute_size_prefill_ge_signed() {
         "p2wsh:p2pukh",
     ] {
         let mut est = parse(BIP143_TX);
-        est.in_[0].prefill("p2pk").unwrap();
-        est.in_[1].prefill(scheme).unwrap();
+        est.inputs[0].prefill("p2pk").unwrap();
+        est.inputs[1].prefill(scheme).unwrap();
         let estimated = est.compute_size();
 
         let mut sig_tx = parse(BIP143_TX);
@@ -245,11 +245,11 @@ fn p2tr_sign_produces_valid_sig() {
 
     let mut tx = BtcTx {
         version: 2,
-        in_: vec![BtcTxInput {
+        inputs: vec![BtcTxInput {
             sequence: 0xffffffff,
             ..Default::default()
         }],
-        out: vec![BtcTxOutput {
+        outputs: vec![BtcTxOutput {
             amount: crate::BtcAmount(90000),
             n: 0,
             script: script_pubkey.clone(),
@@ -261,8 +261,8 @@ fn p2tr_sign_produces_valid_sig() {
         .prev_script(script_pubkey.clone())])
         .unwrap();
 
-    assert_eq!(tx.in_[0].witnesses.len(), 1);
-    assert_eq!(tx.in_[0].witnesses[0].len(), 64);
+    assert_eq!(tx.inputs[0].witnesses.len(), 1);
+    assert_eq!(tx.inputs[0].witnesses[0].len(), 64);
 
     let keys = [BtcTxSign {
         key: None,
@@ -275,7 +275,7 @@ fn p2tr_sign_produces_valid_sig() {
     let mut xonly = [0u8; 32];
     xonly.copy_from_slice(&script_pubkey[2..]);
     let mut sig = [0u8; 64];
-    sig.copy_from_slice(&tx.in_[0].witnesses[0]);
+    sig.copy_from_slice(&tx.inputs[0].witnesses[0]);
     assert!(bip340_verify(&xonly, &digest, &sig));
 }
 
@@ -313,11 +313,11 @@ fn p2tr_external_signer() {
 
     let mut tx = BtcTx {
         version: 2,
-        in_: vec![BtcTxInput {
+        inputs: vec![BtcTxInput {
             sequence: 0xffffffff,
             ..Default::default()
         }],
-        out: vec![BtcTxOutput {
+        outputs: vec![BtcTxOutput {
             amount: crate::BtcAmount(90000),
             n: 0,
             script: script_pubkey.clone(),
@@ -338,7 +338,7 @@ fn p2tr_external_signer() {
     }];
     let digest = tx.taproot_sighash(&keys, 0).unwrap();
     let mut sig = [0u8; 64];
-    sig.copy_from_slice(&tx.in_[0].witnesses[0]);
+    sig.copy_from_slice(&tx.inputs[0].witnesses[0]);
     assert!(bip340_verify(&tweaked_x, &digest, &sig));
 }
 
@@ -356,7 +356,7 @@ fn extract_and_verify_p2wpkh() {
     ])
     .unwrap();
 
-    let sigs = extract_btc_input_sig(&tx.in_[1].script, &tx.in_[1].witnesses).unwrap();
+    let sigs = extract_btc_input_sig(&tx.inputs[1].script, &tx.inputs[1].witnesses).unwrap();
     assert_eq!(sigs.len(), 1);
     assert_eq!(sigs[0].scheme, "p2wpkh");
     assert_eq!(sigs[0].sighash_flag, 1);
@@ -365,7 +365,7 @@ fn extract_and_verify_p2wpkh() {
         .input_sighash(1, &sigs[0], &[], crate::BtcAmount(600000000))
         .unwrap();
 
-    let der = &tx.in_[1].witnesses[0];
+    let der = &tx.inputs[1].witnesses[0];
     let (r, s) = parse_der_signature(&der[..der.len() - 1]).unwrap();
     assert!(key1.public_key().verify(&digest, &r, &s));
 }
@@ -383,7 +383,7 @@ fn extract_and_verify_p2pkh() {
     let mut tx = parse(&tx_hex);
     tx.sign(&[BtcTxSign::new(&k, "p2pkh")]).unwrap();
 
-    let sigs = extract_btc_input_sig(&tx.in_[0].script, &tx.in_[0].witnesses).unwrap();
+    let sigs = extract_btc_input_sig(&tx.inputs[0].script, &tx.inputs[0].witnesses).unwrap();
     assert_eq!(sigs.len(), 1);
     assert_eq!(sigs[0].scheme, "p2pkh");
 
@@ -391,7 +391,7 @@ fn extract_and_verify_p2pkh() {
         .input_sighash(0, &sigs[0], &prev_script, crate::BtcAmount(0))
         .unwrap();
     let der = &{
-        let (s, n) = crate::parse_push_bytes(&tx.in_[0].script).unwrap();
+        let (s, n) = crate::parse_push_bytes(&tx.inputs[0].script).unwrap();
         let _ = n;
         s.to_vec()
     };

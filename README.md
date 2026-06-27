@@ -85,7 +85,7 @@ let raw = out.bytes(); // raw address bytes (header + credentials), for a tx out
 ```rust
 use outscript::{BtcTx, BtcTxSign};
 
-let mut tx = BtcTx::unmarshal_binary(&raw).unwrap();
+let mut tx = BtcTx::from_bytes(&raw).unwrap();
 tx.sign(&[
     BtcTxSign::new(&key0, "p2pk"),
     BtcTxSign::new(&key1, "p2wpkh").amount(600_000_000),
@@ -120,7 +120,7 @@ let mut tx = EvmTx {
 };
 tx.call("transfer(address,uint256)", &[/* AbiValue... */]).unwrap();
 tx.sign(&key).unwrap();
-let data = tx.marshal_binary().unwrap();
+let data = tx.to_bytes().unwrap();
 let sender = tx.sender_address().unwrap();
 ```
 
@@ -132,7 +132,7 @@ use outscript::solana::{new_solana_tx, transfer_instruction, SolanaKey};
 let ix = transfer_instruction(from, to, 1_000_000); // lamports
 let mut tx = new_solana_tx(from, blockhash, &[ix]).unwrap();
 tx.sign(&[seed]).unwrap();
-let data = tx.marshal_binary().unwrap();
+let data = tx.to_bytes().unwrap();
 let txid = tx.hash().unwrap(); // first signature
 ```
 
@@ -162,7 +162,7 @@ let mut tx = CardanoTx {
 // Sign with one or more 32-byte standard Ed25519 seeds (a vkey witness per seed)
 tx.sign(&[seed]).unwrap();
 
-let data = tx.marshal_binary().unwrap(); // CBOR transaction
+let data = tx.to_bytes().unwrap(); // CBOR transaction
 let txid = tx.hash().unwrap();           // blake2b-256 of the body
 ```
 

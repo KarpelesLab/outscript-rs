@@ -160,13 +160,13 @@ fn cardano_tx_round_trip() {
     let mut tx = sample_tx();
     tx.sign(&[[0x07u8; 32]]).unwrap();
 
-    let enc = tx.marshal_binary().unwrap();
+    let enc = tx.to_bytes().unwrap();
     let arr = split_array_items(&enc).unwrap();
     assert_eq!(arr.len(), 4);
     // txid must be blake2b-256 of the embedded body bytes
     assert_eq!(blake2b_256(&arr[0]), tx.hash().unwrap());
 
-    let decoded = CardanoTx::unmarshal_binary(&enc).unwrap();
+    let decoded = CardanoTx::from_bytes(&enc).unwrap();
     assert_eq!(decoded.fee, tx.fee);
     assert_eq!(decoded.ttl, tx.ttl);
     assert_eq!(decoded.inputs.len(), tx.inputs.len());
@@ -183,7 +183,7 @@ fn cardano_tx_round_trip() {
     assert_eq!(decoded.witnesses[0].signature, tx.witnesses[0].signature);
 
     // re-marshaling the decoded transaction must be byte-identical (deterministic)
-    assert_eq!(decoded.marshal_binary().unwrap(), enc);
+    assert_eq!(decoded.to_bytes().unwrap(), enc);
 }
 
 #[test]
@@ -206,8 +206,8 @@ fn cardano_tx_multiasset() {
         ttl: 0,
         witnesses: vec![],
     };
-    let enc = tx.marshal_binary().unwrap();
-    let decoded = CardanoTx::unmarshal_binary(&enc).unwrap();
+    let enc = tx.to_bytes().unwrap();
+    let decoded = CardanoTx::from_bytes(&enc).unwrap();
     assert_eq!(decoded.outputs.len(), 1);
     assert_eq!(decoded.outputs[0].assets.len(), 1);
     let a = &decoded.outputs[0].assets[0];
@@ -246,7 +246,7 @@ fn cardano_asset_amount_overflow() {
         ttl: 0,
         witnesses: vec![],
     };
-    assert!(tx.marshal_binary().is_err());
+    assert!(tx.to_bytes().is_err());
     assert!(tx.body_bytes().is_err());
 }
 
@@ -359,8 +359,8 @@ fn cardano_tx_sign_with_extended_key() {
         &w.signature.clone().try_into().unwrap()
     ));
 
-    let enc = tx.marshal_binary().unwrap();
-    let decoded = CardanoTx::unmarshal_binary(&enc).unwrap();
+    let enc = tx.to_bytes().unwrap();
+    let decoded = CardanoTx::from_bytes(&enc).unwrap();
     assert_eq!(decoded.witnesses.len(), 1);
     assert_eq!(decoded.witnesses[0].signature, w.signature);
 }

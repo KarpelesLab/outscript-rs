@@ -153,7 +153,7 @@ impl EvmTx {
     }
 
     /// Serializes the transaction.
-    pub fn marshal_binary(&self) -> Result<Vec<u8>, String> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         if !self.signed {
             return self.sign_bytes();
         }
@@ -271,7 +271,7 @@ impl EvmTx {
     }
 
     /// Parses from bytes (alias for `parse_transaction`).
-    pub fn unmarshal_binary(buf: &[u8]) -> Result<EvmTx, String> {
+    pub fn from_bytes(buf: &[u8]) -> Result<EvmTx, String> {
         Self::parse_transaction(buf)
     }
 
@@ -343,7 +343,7 @@ impl EvmTx {
 
     /// Returns the keccak-256 hash of the signed transaction's encoding.
     pub fn hash(&self) -> Result<[u8; 32], String> {
-        let data = self.marshal_binary()?;
+        let data = self.to_bytes()?;
         Ok(keccak256_once(&data))
     }
 

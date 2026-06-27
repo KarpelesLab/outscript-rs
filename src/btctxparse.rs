@@ -308,7 +308,7 @@ impl BtcTx {
         prev_script: &[u8],
         amount: BtcAmount,
     ) -> Result<[u8; 32], String> {
-        if n >= self.in_.len() {
+        if n >= self.inputs.len() {
             return Err(format!("input index {n} out of range"));
         }
         if sig.sighash_flag != 1 {
@@ -331,7 +331,7 @@ impl BtcTx {
                 let mut script_code = vec![0x76, 0xa9];
                 script_code.extend_from_slice(&push_bytes(&pk_hash));
                 script_code.extend_from_slice(&[0x88, 0xac]);
-                let (input, input_seq) = self.in_[n].preimage_bytes();
+                let (input, input_seq) = self.inputs[n].preimage_bytes();
                 let mut s = Vec::new();
                 s.extend_from_slice(&pfx);
                 s.extend_from_slice(&input);
@@ -356,7 +356,7 @@ impl BtcTx {
         prev_scripts: &[Vec<u8>],
         amounts: &[BtcAmount],
     ) -> Result<[u8; 32], String> {
-        if n >= self.in_.len() {
+        if n >= self.inputs.len() {
             return Err(format!("input index {n} out of range"));
         }
         if sig.sighash_flag != 0 {

@@ -336,7 +336,7 @@ impl CardanoTx {
     /// Encodes the full transaction (body, witness set, validity flag, and null
     /// auxiliary data) as canonical CBOR. The embedded body bytes are
     /// byte-identical to those hashed for signing.
-    pub fn marshal_binary(&self) -> Result<Vec<u8>, String> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         let body_bytes = self.body_bytes()?;
         let transaction = Cbor::Array(vec![
             Cbor::Raw(body_bytes),
@@ -348,9 +348,9 @@ impl CardanoTx {
     }
 
     /// Decodes a CBOR-encoded Cardano transaction. Supports the subset produced
-    /// by [`CardanoTx::marshal_binary`]: ADA/native-asset outputs in the legacy
+    /// by [`CardanoTx::to_bytes`]: ADA/native-asset outputs in the legacy
     /// (alonzo) array form and Ed25519 vkey witnesses.
-    pub fn unmarshal_binary(data: &[u8]) -> Result<CardanoTx, String> {
+    pub fn from_bytes(data: &[u8]) -> Result<CardanoTx, String> {
         let raw = split_array_items(data)
             .map_err(|e| format!("failed to decode cardano transaction: {e}"))?;
         if raw.len() < 2 {

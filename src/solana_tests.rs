@@ -39,8 +39,8 @@ fn compact_u16_via_tx_roundtrip() {
     let fee_payer = SolanaKey::parse("11111111111111111111111111111111").unwrap();
     let blockhash = SolanaKey::parse("11111111111111111111111111111111").unwrap();
     let tx = new_solana_tx(fee_payer, blockhash, &[]).unwrap();
-    let data = tx.marshal_binary().unwrap();
-    let tx2 = SolanaTx::unmarshal_binary(&data).unwrap();
+    let data = tx.to_bytes().unwrap();
+    let tx2 = SolanaTx::from_bytes(&data).unwrap();
     assert_eq!(
         tx2.message.account_keys.len(),
         tx.message.account_keys.len()
@@ -67,7 +67,7 @@ fn solana_transfer_sign() {
     assert_eq!(h, tx.signatures[0]);
     tx.verify().unwrap();
 
-    let data = tx.marshal_binary().unwrap();
+    let data = tx.to_bytes().unwrap();
     assert!(data.len() >= 100);
 }
 
@@ -80,31 +80,31 @@ fn solana_tx_roundtrip() {
     let ix = transfer_instruction(from, to, 500_000);
     let mut tx = new_solana_tx(from, blockhash, &[ix]).unwrap();
     tx.sign(&[s]).unwrap();
-    let data = tx.marshal_binary().unwrap();
+    let data = tx.to_bytes().unwrap();
 
-    let tx2 = SolanaTx::unmarshal_binary(&data).unwrap();
+    let tx2 = SolanaTx::from_bytes(&data).unwrap();
     assert_eq!(tx2.signatures, tx.signatures);
     assert_eq!(tx2.message.header, tx.message.header);
     assert_eq!(tx2.message.account_keys, tx.message.account_keys);
     assert_eq!(tx2.message.recent_blockhash, tx.message.recent_blockhash);
-    let data2 = tx2.marshal_binary().unwrap();
+    let data2 = tx2.to_bytes().unwrap();
     assert_eq!(data, data2);
 }
 
 #[test]
 fn pda_create_and_find() {
     let program_id = SolanaKey::parse("11111111111111111111111111111111").unwrap();
-    let (addr, bump) = find_program_address(&[b"test".to_vec()], program_id).unwrap();
-    let addr2 = create_program_address(&[b"test".to_vec(), vec![bump]], program_id).unwrap();
+    let (addr, bump) = find_program_address(&[&b"test"[..]], program_id).unwrap();
+    let addr2 = create_program_address(&[&b"test"[..], &[bump]], program_id).unwrap();
     assert_eq!(addr, addr2);
 }
 
 #[test]
 fn pda_find_deterministic() {
     let program_id = SolanaKey::parse("BPFLoaderUpgradeab1e11111111111111111111111").unwrap();
-    let (addr, bump) = find_program_address(&[b"hello".to_vec()], program_id).unwrap();
+    let (addr, bump) = find_program_address(&[&b"hello"[..]], program_id).unwrap();
     assert!(!addr.is_zero());
-    let (addr2, bump2) = find_program_address(&[b"hello".to_vec()], program_id).unwrap();
+    let (addr2, bump2) = find_program_address(&[&b"hello"[..]], program_id).unwrap();
     assert_eq!(addr, addr2);
     assert_eq!(bump, bump2);
 }
@@ -113,21 +113,18 @@ fn pda_find_deterministic() {
 fn pda_validation() {
     let program_id = SolanaKey::parse("11111111111111111111111111111111").unwrap();
     let seeds: Vec<Vec<u8>> = (0..17).map(|i| vec![i as u8]).collect();
-    assert!(create_program_address(&seeds, program_id).is_err());
-    assert!(create_program_address(&[vec![0u8; 33]], program_id).is_err());
+    let seed_refs: Vec<&[u8]> = seeds.iter().map(|s| s.as_slice()).collect();
+    assert!(create_program_address(&seed_refs, program_id).is_err());
+    assert!(create_program_address(&[[0u8; 33].as_slice()], program_id).is_err());
 }
 
 #[test]
 fn pda_multiple_seeds() {
     let program_id = SolanaKey::parse("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
     let wallet = SolanaKey::parse("83astBRguLMdt2h5U1Tpdq5tjFoJ6noeGwaY3mDLVcri").unwrap();
-    let (addr, bump) =
-        find_program_address(&[wallet.0.to_vec(), b"seed2".to_vec()], program_id).unwrap();
-    let addr2 = create_program_address(
-        &[wallet.0.to_vec(), b"seed2".to_vec(), vec![bump]],
-        program_id,
-    )
-    .unwrap();
+    let (addr, bump) = find_program_address(&[&wallet.0[..], &b"seed2"[..]], program_id).unwrap();
+    let addr2 =
+        create_program_address(&[&wallet.0[..], &b"seed2"[..], &[bump]], program_id).unwrap();
     assert_eq!(addr, addr2);
 }
 
@@ -148,7 +145,7 @@ fn build_legacy_message(header: &[u8], key_count: &[u8], num_keys: usize, ix: &[
 fn message_header_count_too_large() {
     // header: num_required_signatures=2, others=0; key_count=1
     let data = build_legacy_message(&[0x02, 0x00, 0x00], &[0x01], 1, &[0x00]);
-    assert!(SolanaMessage::unmarshal_binary(&data).is_err());
+    assert!(SolanaMessage::from_bytes(&data).is_err());
 }
 
 #[test]
@@ -174,7 +171,7 @@ fn verify_sign_no_panic_on_bad_header() {
 fn non_canonical_compact_u16_rejected() {
     // header valid, then non-canonical compact-u16 ([0x80,0x00]) for key count.
     let data = vec![0x01, 0x00, 0x00, 0x80, 0x00];
-    assert!(SolanaMessage::unmarshal_binary(&data).is_err());
+    assert!(SolanaMessage::from_bytes(&data).is_err());
 }
 
 #[test]
@@ -182,10 +179,10 @@ fn instruction_index_out_of_range() {
     // one instruction with program_id_index=5 but only 1 account key
     let ix = [0x01, 0x05, 0x00, 0x00];
     let data = build_legacy_message(&[0x01, 0x00, 0x00], &[0x01], 1, &ix);
-    assert!(SolanaMessage::unmarshal_binary(&data).is_err());
+    assert!(SolanaMessage::from_bytes(&data).is_err());
 
     // out-of-range account index
     let ix2 = [0x01, 0x00, 0x01, 0x09, 0x00];
     let data2 = build_legacy_message(&[0x01, 0x00, 0x00], &[0x01], 1, &ix2);
-    assert!(SolanaMessage::unmarshal_binary(&data2).is_err());
+    assert!(SolanaMessage::from_bytes(&data2).is_err());
 }

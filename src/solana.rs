@@ -185,11 +185,7 @@ pub fn spl_transfer_instruction(
 /// Derives the Associated Token Account address for a wallet and mint.
 pub fn associated_token_address(wallet: SolanaKey, mint: SolanaKey) -> Result<SolanaKey, String> {
     let (addr, _) = find_program_address(
-        &[
-            wallet.0.to_vec(),
-            token_program().0.to_vec(),
-            mint.0.to_vec(),
-        ],
+        &[&wallet.0[..], &token_program().0[..], &mint.0[..]],
         ata_program(),
     )?;
     Ok(addr)
@@ -491,8 +487,8 @@ pub fn new_solana_tx_v0(
 impl SolanaTx {
     fn message_bytes(&self) -> Vec<u8> {
         match &self.message_v0 {
-            Some(m) => m.marshal_binary(),
-            None => self.message.marshal_binary(),
+            Some(m) => m.to_bytes(),
+            None => self.message.to_bytes(),
         }
     }
     fn header(&self) -> SolanaMessageHeader {
@@ -577,7 +573,7 @@ impl SolanaTx {
     }
 
     /// Serializes the transaction.
-    pub fn marshal_binary(&self) -> Result<Vec<u8>, String> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         let msg = self.message_bytes();
         let mut buf = encode_compact_u16(self.signatures.len());
         for sig in &self.signatures {
@@ -594,7 +590,7 @@ impl SolanaTx {
     }
 
     /// Parses a transaction from bytes.
-    pub fn unmarshal_binary(data: &[u8]) -> Result<SolanaTx, String> {
+    pub fn from_bytes(data: &[u8]) -> Result<SolanaTx, String> {
         let mut pos = 0;
         let sig_count = decode_compact_u16(data, &mut pos)?;
         if sig_count > 256 {
@@ -620,9 +616,9 @@ impl SolanaTx {
             if version != 0 {
                 return Err(format!("unsupported transaction version: {version}"));
             }
-            tx.message_v0 = Some(SolanaMessageV0::unmarshal_binary(rest)?);
+            tx.message_v0 = Some(SolanaMessageV0::from_bytes(rest)?);
         } else {
-            tx.message = SolanaMessage::unmarshal_binary(rest)?;
+            tx.message = SolanaMessage::from_bytes(rest)?;
         }
         Ok(tx)
     }
@@ -785,7 +781,7 @@ fn read_message_common(
 
 impl SolanaMessage {
     /// Serializes the legacy message.
-    pub fn marshal_binary(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         write_message_common(
             &mut buf,
@@ -797,7 +793,7 @@ impl SolanaMessage {
         buf
     }
     /// Parses a legacy message.
-    pub fn unmarshal_binary(data: &[u8]) -> Result<SolanaMessage, String> {
+    pub fn from_bytes(data: &[u8]) -> Result<SolanaMessage, String> {
         let mut pos = 0;
         let (header, account_keys, recent_blockhash, instructions) =
             read_message_common(data, &mut pos)?;
@@ -815,7 +811,7 @@ impl SolanaMessage {
 
 impl SolanaMessageV0 {
     /// Serializes the v0 message (with version prefix 0x80).
-    pub fn marshal_binary(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = vec![0x80];
         write_message_common(
             &mut buf,
@@ -835,7 +831,7 @@ impl SolanaMessageV0 {
         buf
     }
     /// Parses a v0 message.
-    pub fn unmarshal_binary(data: &[u8]) -> Result<SolanaMessageV0, String> {
+    pub fn from_bytes(data: &[u8]) -> Result<SolanaMessageV0, String> {
         if data.is_empty() {
             return Err("unexpected EOF".into());
         }
@@ -963,15 +959,12 @@ pub fn decode_compact_u16(data: &[u8], pos: &mut usize) -> Result<usize, String>
 
 /// Derives a program address from seeds and a program id; errors if the result
 /// lies on the Ed25519 curve.
-pub fn create_program_address(
-    seeds: &[Vec<u8>],
-    program_id: SolanaKey,
-) -> Result<SolanaKey, String> {
+pub fn create_program_address(seeds: &[&[u8]], program_id: SolanaKey) -> Result<SolanaKey, String> {
     if seeds.len() > 16 {
         return Err("too many seeds: maximum 16".into());
     }
     let mut h = Sha256::new();
-    for seed in seeds {
+    for &seed in seeds {
         if seed.len() > 32 {
             return Err("seed too long: maximum 32 bytes".into());
         }
@@ -989,17 +982,16 @@ pub fn create_program_address(
 
 /// Finds a valid program address by iterating bump seeds from 255 down to 0.
 pub fn find_program_address(
-    seeds: &[Vec<u8>],
+    seeds: &[&[u8]],
     program_id: SolanaKey,
 ) -> Result<(SolanaKey, u8), String> {
-    // Clone the caller's seeds once and vary only the trailing bump byte.
-    let mut seeds_with_bump = seeds.to_vec();
-    seeds_with_bump.push(Vec::new());
     for bump in (0..=255u8).rev() {
-        let last = seeds_with_bump.last_mut().unwrap();
-        last.clear();
-        last.push(bump);
-        if let Ok(addr) = create_program_address(&seeds_with_bump, program_id) {
+        // Append the trailing bump byte to the caller's seeds for this attempt.
+        let bump_seed = [bump];
+        let mut all = Vec::with_capacity(seeds.len() + 1);
+        all.extend_from_slice(seeds);
+        all.push(&bump_seed[..]);
+        if let Ok(addr) = create_program_address(&all, program_id) {
             return Ok((addr, bump));
         }
     }

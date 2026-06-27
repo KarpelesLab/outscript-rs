@@ -82,9 +82,9 @@ pub struct BtcTx {
     /// Transaction version.
     pub version: u32,
     /// Inputs.
-    pub in_: Vec<BtcTxInput>,
+    pub inputs: Vec<BtcTxInput>,
     /// Outputs.
-    pub out: Vec<BtcTxOutput>,
+    pub outputs: Vec<BtcTxOutput>,
     /// Lock time.
     pub locktime: u32,
 }
@@ -136,7 +136,7 @@ fn signer_pubkey_script(key: &dyn Signer, name: &str) -> Result<Vec<u8>, String>
 impl BtcTx {
     /// Signs the transaction. Requires one signing entry per input.
     pub fn sign(&mut self, keys: &[BtcTxSign]) -> Result<(), String> {
-        if self.in_.is_empty() || self.in_.len() != keys.len() {
+        if self.inputs.is_empty() || self.inputs.len() != keys.len() {
             return Err("Sign requires as many keys as there are inputs".into());
         }
 
@@ -157,7 +157,7 @@ impl BtcTx {
                     let digest = self.legacy_sighash(n, &script_code, sighash);
                     let mut sig = key.sign_ecdsa_der(&digest)?;
                     sig.push((sighash & 0xff) as u8);
-                    self.in_[n].script = push_bytes(&sig);
+                    self.inputs[n].script = push_bytes(&sig);
                 }
                 "p2pkh" | "p2pukh" => {
                     if sighash & 0x40 == 0x40 {
@@ -177,7 +177,7 @@ impl BtcTx {
                     };
                     let mut script = push_bytes(&sig);
                     script.extend_from_slice(&push_bytes(&pubkey));
-                    self.in_[n].script = script;
+                    self.inputs[n].script = script;
                 }
                 "p2wpkh" | "p2sh:p2wpkh" => {
                     let (pfx, sfx) = preimage.get_or_insert_with(|| wtx.preimage()).clone();
@@ -214,7 +214,7 @@ impl BtcTx {
         } else {
             signer_pubkey_script(key, "pubkey:comp")?
         };
-        let (input, input_seq) = self.in_[n].preimage_bytes();
+        let (input, input_seq) = self.inputs[n].preimage_bytes();
         let pk_hash = hash160(&pubkey);
         let mut script_code = vec![0x76, 0xa9];
         script_code.extend_from_slice(&push_bytes(&pk_hash));
@@ -237,17 +237,17 @@ impl BtcTx {
             "p2pkh" | "p2pukh" => {
                 let mut script = push_bytes(&sig);
                 script.extend_from_slice(&push_bytes(&pubkey));
-                self.in_[n].script = script;
+                self.inputs[n].script = script;
             }
             "p2wpkh" => {
-                self.in_[n].witnesses = vec![sig, pubkey];
-                self.in_[n].script = Vec::new();
+                self.inputs[n].witnesses = vec![sig, pubkey];
+                self.inputs[n].script = Vec::new();
             }
             "p2sh:p2wpkh" => {
-                self.in_[n].witnesses = vec![sig, pubkey.clone()];
+                self.inputs[n].witnesses = vec![sig, pubkey.clone()];
                 let mut inner = vec![0u8];
                 inner.extend_from_slice(&push_bytes(&pk_hash));
-                self.in_[n].script = push_bytes(&inner);
+                self.inputs[n].script = push_bytes(&inner);
             }
             _ => {}
         }
@@ -271,7 +271,7 @@ impl BtcTx {
             (inner, ws)
         };
 
-        let (input, input_seq) = self.in_[n].preimage_bytes();
+        let (input, input_seq) = self.inputs[n].preimage_bytes();
         let amount = (k.amount.0).to_le_bytes();
         let mut sign_string = Vec::new();
         sign_string.extend_from_slice(pfx);
@@ -287,19 +287,19 @@ impl BtcTx {
 
         match inner_scheme.as_str() {
             "p2pk" | "p2puk" => {
-                self.in_[n].witnesses = vec![sig, witness_script];
+                self.inputs[n].witnesses = vec![sig, witness_script];
             }
             "p2pkh" => {
                 let pubkey = signer_pubkey_script(key, "pubkey:comp")?;
-                self.in_[n].witnesses = vec![sig, pubkey, witness_script];
+                self.inputs[n].witnesses = vec![sig, pubkey, witness_script];
             }
             "p2pukh" => {
                 let pubkey = signer_pubkey_script(key, "pubkey:uncomp")?;
-                self.in_[n].witnesses = vec![sig, pubkey, witness_script];
+                self.inputs[n].witnesses = vec![sig, pubkey, witness_script];
             }
             other => return Err(format!("p2wsh: unsupported inner scheme {other:?}")),
         }
-        self.in_[n].script = Vec::new();
+        self.inputs[n].script = Vec::new();
         Ok(())
     }
 
@@ -310,7 +310,7 @@ impl BtcTx {
             .ok_or("signer does not expose an ECDSA public key")?;
         let s = Script::new(PubKey::Secp256k1(pk));
 
-        let sc = &self.in_[n].script;
+        let sc = &self.inputs[n].script;
         let target_hash: Option<[u8; 32]> = if sc.len() == 34 && sc[0] == 0x00 && sc[1] == 0x20 {
             let mut h = [0u8; 32];
             h.copy_from_slice(&sc[2..34]);
@@ -345,7 +345,7 @@ impl BtcTx {
         let mut prefix = self.version.to_le_bytes().to_vec();
         let mut inputs_a = Vec::new();
         let mut inputs_b = Vec::new();
-        for inp in &self.in_ {
+        for inp in &self.inputs {
             let (a, b) = inp.preimage_bytes();
             inputs_a.extend_from_slice(&a);
             inputs_b.extend_from_slice(&b);
@@ -354,7 +354,7 @@ impl BtcTx {
         prefix.extend_from_slice(&dsha256(&inputs_b));
 
         let mut outputs = Vec::new();
-        for o in &self.out {
+        for o in &self.outputs {
             outputs.extend_from_slice(&o.bytes());
         }
         let mut suffix = dsha256(&outputs).to_vec();
@@ -368,18 +368,18 @@ impl BtcTx {
     }
 
     /// Alias for [`Self::bytes`], serializing the transaction to its wire form.
-    pub fn marshal_binary(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         self.bytes()
     }
 
     /// Reports whether any input has witness data.
     pub fn has_witness(&self) -> bool {
-        self.in_.iter().any(|i| !i.witnesses.is_empty())
+        self.inputs.iter().any(|i| !i.witnesses.is_empty())
     }
 
     /// Removes all input scripts and witnesses (used during signing).
     pub fn clear_inputs(&mut self) {
-        for inp in &mut self.in_ {
+        for inp in &mut self.inputs {
             inp.script.clear();
             inp.witnesses.clear();
         }
@@ -398,8 +398,8 @@ impl BtcTx {
         amount: u64,
     ) -> Result<(), String> {
         let addr = parse_bitcoin_based_address(network, address)?;
-        let n = self.out.len();
-        self.out.push(BtcTxOutput {
+        let n = self.outputs.len();
+        self.outputs.push(BtcTxOutput {
             amount: BtcAmount(amount),
             n,
             script: addr.bytes().to_vec(),
@@ -413,16 +413,16 @@ impl BtcTx {
             buf.push(0);
             buf.push(1);
         }
-        buf.extend_from_slice(&BtcVarInt(self.in_.len() as u64).bytes());
-        for inp in &self.in_ {
+        buf.extend_from_slice(&BtcVarInt(self.inputs.len() as u64).bytes());
+        for inp in &self.inputs {
             buf.extend_from_slice(&inp.bytes());
         }
-        buf.extend_from_slice(&BtcVarInt(self.out.len() as u64).bytes());
-        for o in &self.out {
+        buf.extend_from_slice(&BtcVarInt(self.outputs.len() as u64).bytes());
+        for o in &self.outputs {
             buf.extend_from_slice(&o.bytes());
         }
         if wit {
-            for inp in &self.in_ {
+            for inp in &self.inputs {
                 buf.extend_from_slice(&BtcVarInt(inp.witnesses.len() as u64).bytes());
                 for w in &inp.witnesses {
                     buf.extend_from_slice(&BtcVarInt(w.len() as u64).bytes());
@@ -435,22 +435,24 @@ impl BtcTx {
     }
 
     /// Computes the transaction id (reversed double-SHA-256).
-    pub fn hash(&self) -> Vec<u8> {
-        let mut h = dsha256(&self.export_bytes(false)).to_vec();
+    pub fn hash(&self) -> [u8; 32] {
+        let mut h = dsha256(&self.export_bytes(false));
         h.reverse();
         h
     }
 
     /// Estimates the (virtual) transaction size, accounting for segwit.
     pub fn compute_size(&self) -> usize {
-        let mut ln =
-            4 + BtcVarInt(self.in_.len() as u64).len() + BtcVarInt(self.out.len() as u64).len() + 4;
+        let mut ln = 4
+            + BtcVarInt(self.inputs.len() as u64).len()
+            + BtcVarInt(self.outputs.len() as u64).len()
+            + 4;
         let mut witln = 0;
-        for inp in &self.in_ {
+        for inp in &self.inputs {
             ln += inp.compute_size();
             witln += inp.compute_witness_size();
         }
-        for o in &self.out {
+        for o in &self.outputs {
             ln += o.compute_size();
         }
         if !self.has_witness() {
@@ -461,7 +463,7 @@ impl BtcTx {
     }
 
     /// Parses a transaction from bytes.
-    pub fn unmarshal_binary(buf: &[u8]) -> Result<BtcTx, String> {
+    pub fn from_bytes(buf: &[u8]) -> Result<BtcTx, String> {
         let mut tx = BtcTx::default();
         let mut cur = Cursor::new(buf);
         tx.read_from(&mut cur).map_err(|e| e.to_string())?;
@@ -486,28 +488,28 @@ impl BtcTx {
         if in_cnt > 10000 {
             return Err(io::Error::other("invalid transaction: too many inputs"));
         }
-        self.in_ = Vec::with_capacity(in_cnt as usize);
+        self.inputs = Vec::with_capacity(in_cnt as usize);
         for _ in 0..in_cnt {
             let mut inp = BtcTxInput::default();
             inp.read_from(r, &mut n)?;
-            self.in_.push(inp);
+            self.inputs.push(inp);
         }
         let (outcnt, c3) = BtcVarInt::read_from(r)?;
         n += c3;
         if outcnt.0 > 65536 {
             return Err(io::Error::other("invalid transaction: too many outputs"));
         }
-        self.out = Vec::with_capacity(outcnt.0 as usize);
+        self.outputs = Vec::with_capacity(outcnt.0 as usize);
         for idx in 0..outcnt.0 {
             let mut o = BtcTxOutput {
                 n: idx as usize,
                 ..Default::default()
             };
             o.read_from(r, &mut n)?;
-            self.out.push(o);
+            self.outputs.push(o);
         }
         if segwit {
-            for inp in &mut self.in_ {
+            for inp in &mut self.inputs {
                 let (wc, c4) = BtcVarInt::read_from(r)?;
                 n += c4;
                 let mut ws = Vec::with_capacity(wc.0 as usize);
@@ -656,7 +658,7 @@ impl BtcTx {
         &self,
         keys: &[BtcTxSign],
     ) -> Result<TaprootSighashParts, String> {
-        if keys.len() != self.in_.len() {
+        if keys.len() != self.inputs.len() {
             return Err("taproot: keys length does not match number of inputs".into());
         }
         let mut prev_scripts = Vec::with_capacity(keys.len());
@@ -678,14 +680,14 @@ impl BtcTx {
         prev_scripts: &[Vec<u8>],
         amounts: &[u64],
     ) -> Result<TaprootSighashParts, String> {
-        if prev_scripts.len() != self.in_.len() || amounts.len() != self.in_.len() {
+        if prev_scripts.len() != self.inputs.len() || amounts.len() != self.inputs.len() {
             return Err("taproot: prevScripts/amounts must match input count".into());
         }
         let mut prev = Vec::new();
         let mut amt = Vec::new();
         let mut spk = Vec::new();
         let mut seq = Vec::new();
-        for (i, inp) in self.in_.iter().enumerate() {
+        for (i, inp) in self.inputs.iter().enumerate() {
             if prev_scripts[i].is_empty() {
                 return Err(format!("taproot: input {i} missing prev script"));
             }
@@ -699,7 +701,7 @@ impl BtcTx {
             seq.extend_from_slice(&inp.sequence.to_le_bytes());
         }
         let mut out = Vec::new();
-        for o in &self.out {
+        for o in &self.outputs {
             out.extend_from_slice(&o.amount.0.to_le_bytes());
             out.extend_from_slice(&BtcVarInt(o.script.len() as u64).bytes());
             out.extend_from_slice(&o.script);
@@ -769,7 +771,7 @@ impl BtcTx {
     pub(crate) fn legacy_sighash(&self, n: usize, script_code: &[u8], flag: u32) -> [u8; 32] {
         let mut w = self.clone();
         w.clear_inputs();
-        w.in_[n].script = script_code.to_vec();
+        w.inputs[n].script = script_code.to_vec();
         let mut buf = w.export_bytes(false);
         buf.extend_from_slice(&flag.to_le_bytes());
         dsha256(&buf)
@@ -797,8 +799,8 @@ impl BtcTx {
         let sighash = self.taproot_key_spend_sighash(n, 0x00, parts);
         let key = k.key.ok_or("signing requires a key")?;
         let sig = key.sign_taproot(&sighash)?;
-        self.in_[n].witnesses = vec![sig.to_vec()];
-        self.in_[n].script = Vec::new();
+        self.inputs[n].witnesses = vec![sig.to_vec()];
+        self.inputs[n].script = Vec::new();
         Ok(())
     }
 }
@@ -978,8 +980,8 @@ impl Serialize for BtcTx {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut st = serializer.serialize_struct("BtcTx", 4)?;
         st.serialize_field("version", &self.version)?;
-        st.serialize_field("vin", &self.in_)?;
-        st.serialize_field("vout", &self.out)?;
+        st.serialize_field("vin", &self.inputs)?;
+        st.serialize_field("vout", &self.outputs)?;
         st.serialize_field("locktime", &self.locktime)?;
         st.end()
     }
@@ -1002,8 +1004,8 @@ impl<'de> Deserialize<'de> for BtcTx {
         let de = BtcTxDe::deserialize(deserializer)?;
         Ok(BtcTx {
             version: de.version,
-            in_: de.vin,
-            out: de.vout,
+            inputs: de.vin,
+            outputs: de.vout,
             locktime: de.locktime,
         })
     }
