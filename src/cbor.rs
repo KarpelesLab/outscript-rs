@@ -2,9 +2,9 @@
 //! serialization.
 //!
 //! Encoding follows the canonical rules required by the Cardano ledger
-//! (RFC 7049 canonical form, as produced by Go's `cbor.CanonicalEncOptions`):
-//! definite-length items, shortest-form integers, and map keys sorted
-//! length-first then lexicographically by their encoded bytes.
+//! (RFC 7049 canonical form): definite-length items, shortest-form integers,
+//! and map keys sorted length-first then lexicographically by their encoded
+//! bytes.
 //!
 //! The decoder parses the subset produced by [`Cbor::encode`] into [`Cbor`]
 //! values, and additionally provides [`scan_item`], which measures one complete
@@ -13,7 +13,11 @@
 
 /// A CBOR data item, limited to the variants outscript needs to build and parse
 /// Cardano transactions.
+///
+/// Non-exhaustive: this is a deliberate, growing subset of the CBOR model (tags,
+/// text strings, negative integers and floats may be added).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Cbor {
     /// Unsigned integer (major type 0).
     Uint(u64),

@@ -1,7 +1,6 @@
 //! EVM ABI encoding (port of `evmabi.go`).
 
 use num_bigint::{BigInt, Sign};
-use num_traits::Zero;
 
 use crate::hash::keccak256_once;
 use crate::out::Out;
@@ -11,7 +10,11 @@ fn two_pow_256() -> BigInt {
 }
 
 /// A value that can be ABI-encoded.
+///
+/// Non-exhaustive: more ABI value kinds (fixed bytes, arrays, tuples, …) may be
+/// added.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AbiValue {
     /// Unsigned/large integer.
     Uint(BigInt),
@@ -169,16 +172,21 @@ impl AbiBuffer {
 
     /// Appends a 256-bit integer (big-endian, 32 bytes).
     pub fn append_big_int(&mut self, v: &BigInt) -> Result<(), String> {
-        let mut val = v.clone();
-        if val.sign() == Sign::Minus {
+        let bound = two_pow_256();
+        // Only the (rare) negative case allocates; the common path borrows `v`.
+        let owned;
+        let val: &BigInt = if v.sign() == Sign::Minus {
             // two's complement: 2^256 + v (v is negative). For v == -1 this yields
             // an all-ones 32-byte word.
-            val = two_pow_256() + val;
-            if val.sign() != Sign::Plus {
+            owned = &bound + v;
+            if owned.sign() != Sign::Plus {
                 return Err("big.Int value exceeds negative 256 bits".into());
             }
-        }
-        if val >= two_pow_256() {
+            &owned
+        } else {
+            v
+        };
+        if *val >= bound {
             return Err("big.Int value exceeds 256 bits".into());
         }
         let mut inbuf = [0u8; 32];
@@ -233,11 +241,6 @@ pub fn evm_call(method: &str, params: &[AbiValue]) -> Result<Vec<u8>, String> {
     let mut buf = AbiBuffer::default();
     buf.encode_abi(method, params)?;
     Ok(buf.call(method))
-}
-
-#[allow(dead_code)]
-fn _zero() -> BigInt {
-    BigInt::zero()
 }
 
 #[cfg(test)]

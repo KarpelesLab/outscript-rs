@@ -284,8 +284,8 @@ impl BtcInputSig {
         if self.pubkeys.is_empty() {
             return None;
         }
-        let r: [u8; 32] = self.r.clone().try_into().ok()?;
-        let s: [u8; 32] = self.s.clone().try_into().ok()?;
+        let r: [u8; 32] = self.r[..].try_into().ok()?;
+        let s: [u8; 32] = self.s[..].try_into().ok()?;
         for pk in &self.pubkeys {
             if let Ok(pub_) = SecpPublicKey::from_sec1(pk)
                 && pub_.verify(digest, &r, &s)

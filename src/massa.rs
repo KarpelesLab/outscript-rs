@@ -21,12 +21,11 @@ pub fn parse_massa_address(address: &str) -> Result<Out, String> {
         return Err("massa address too short".into());
     }
     let chk_start = buf.len() - 4;
-    let chk = buf[chk_start..].to_vec();
-    buf.truncate(chk_start);
-    let h = dsha256(&buf);
-    if h[..4] != chk[..] {
+    let h = dsha256(&buf[..chk_start]);
+    if h[..4] != buf[chk_start..] {
         return Err("bad checksum on massa address".into());
     }
+    buf.truncate(chk_start);
 
     let mut raw = Vec::with_capacity(1 + buf.len());
     raw.push(typ);

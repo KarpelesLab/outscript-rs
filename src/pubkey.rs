@@ -1,12 +1,16 @@
 //! Public-key abstraction used by [`crate::script::Script`].
 //!
-//! Replaces the Go `crypto.PublicKey` type-switch in `getPubKeyBytes` with a
-//! small enum over the key types outscript understands.
+//! A small enum over the key types outscript understands, used to extract the
+//! raw bytes for a requested public-key format.
 
 use crate::crypto::secp256k1::SecpPublicKey;
 
 /// A public key understood by outscript: either secp256k1 or Ed25519.
+///
+/// Non-exhaustive: more key/curve types may be added as new chains are
+/// supported.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum PubKey {
     /// A secp256k1 public key (Bitcoin, EVM, ...).
     Secp256k1(SecpPublicKey),
@@ -16,8 +20,7 @@ pub enum PubKey {
 
 impl PubKey {
     /// Returns the public-key bytes for the requested internal format name
-    /// (`pubkey:comp`, `pubkey:uncomp`, `pubkey:ed25519`). Mirrors the Go
-    /// `Script.getPubKeyBytes`.
+    /// (`pubkey:comp`, `pubkey:uncomp`, `pubkey:ed25519`).
     pub fn bytes_for(&self, typ: &str) -> Result<Vec<u8>, String> {
         match (typ, self) {
             ("pubkey:ed25519", PubKey::Ed25519(k)) => Ok(k.to_vec()),

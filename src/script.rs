@@ -9,7 +9,7 @@ use crate::insertable::{Format, b, ihash, ihash160, lookup, push, ttweak};
 use crate::out::Out;
 use crate::pubkey::PubKey;
 
-/// Returns the format definition for a name, mirroring the Go `Formats` table.
+/// Returns the format definition for a name.
 pub fn format_def(name: &str) -> Option<Format> {
     let f = match name {
         "p2pkh" => vec![

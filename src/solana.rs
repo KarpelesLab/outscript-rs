@@ -2,6 +2,7 @@
 //! addresses. Port of `solanatx.go`, `solana_instructions.go`, `solana_pda.go`.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use crate::base58;
 use crate::crypto::ed25519;
@@ -41,30 +42,43 @@ impl core::fmt::Display for SolanaKey {
     }
 }
 
-fn must_key(s: &str) -> SolanaKey {
-    SolanaKey::parse(s).expect("valid well-known key")
+/// Defines a well-known program/sysvar address, decoded once and cached.
+macro_rules! well_known_key {
+    ($func:ident, $addr:literal, $doc:literal) => {
+        #[doc = $doc]
+        pub fn $func() -> SolanaKey {
+            static KEY: LazyLock<SolanaKey> =
+                LazyLock::new(|| SolanaKey::parse($addr).expect("valid well-known key"));
+            *KEY
+        }
+    };
 }
 
-/// The Solana System Program address.
-pub fn system_program() -> SolanaKey {
-    must_key("11111111111111111111111111111111")
-}
-/// The Compute Budget Program address.
-pub fn compute_budget_program() -> SolanaKey {
-    must_key("ComputeBudget111111111111111111111111111111")
-}
-/// The SPL Token Program address.
-pub fn token_program() -> SolanaKey {
-    must_key("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-}
-/// The Associated Token Account Program address.
-pub fn ata_program() -> SolanaKey {
-    must_key("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-}
-/// The Recent Blockhashes Sysvar address.
-pub fn recent_blockhashes_sysvar() -> SolanaKey {
-    must_key("SysvarRecentB1ockHashes11111111111111111111")
-}
+well_known_key!(
+    system_program,
+    "11111111111111111111111111111111",
+    "The Solana System Program address."
+);
+well_known_key!(
+    compute_budget_program,
+    "ComputeBudget111111111111111111111111111111",
+    "The Compute Budget Program address."
+);
+well_known_key!(
+    token_program,
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "The SPL Token Program address."
+);
+well_known_key!(
+    ata_program,
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+    "The Associated Token Account Program address."
+);
+well_known_key!(
+    recent_blockhashes_sysvar,
+    "SysvarRecentB1ockHashes11111111111111111111",
+    "The Recent Blockhashes Sysvar address."
+);
 
 /// An account referenced by an instruction.
 #[derive(Debug, Clone)]
@@ -169,10 +183,7 @@ pub fn spl_transfer_instruction(
 }
 
 /// Derives the Associated Token Account address for a wallet and mint.
-pub fn get_associated_token_address(
-    wallet: SolanaKey,
-    mint: SolanaKey,
-) -> Result<SolanaKey, String> {
+pub fn associated_token_address(wallet: SolanaKey, mint: SolanaKey) -> Result<SolanaKey, String> {
     let (addr, _) = find_program_address(
         &[
             wallet.0.to_vec(),
@@ -190,7 +201,7 @@ pub fn create_ata_instruction(
     wallet: SolanaKey,
     mint: SolanaKey,
 ) -> Result<SolanaInstruction, String> {
-    let ata = get_associated_token_address(wallet, mint)?;
+    let ata = associated_token_address(wallet, mint)?;
     Ok(SolanaInstruction {
         program_id: ata_program(),
         accounts: vec![
@@ -981,17 +992,16 @@ pub fn find_program_address(
     seeds: &[Vec<u8>],
     program_id: SolanaKey,
 ) -> Result<(SolanaKey, u8), String> {
-    let mut bump: u8 = 255;
-    loop {
-        let mut seeds_with_bump = seeds.to_vec();
-        seeds_with_bump.push(vec![bump]);
+    // Clone the caller's seeds once and vary only the trailing bump byte.
+    let mut seeds_with_bump = seeds.to_vec();
+    seeds_with_bump.push(Vec::new());
+    for bump in (0..=255u8).rev() {
+        let last = seeds_with_bump.last_mut().unwrap();
+        last.clear();
+        last.push(bump);
         if let Ok(addr) = create_program_address(&seeds_with_bump, program_id) {
             return Ok((addr, bump));
         }
-        if bump == 0 {
-            break;
-        }
-        bump -= 1;
     }
     Err("could not find valid program address".into())
 }

@@ -153,12 +153,8 @@ impl BtcTx {
 
             match k.scheme.as_str() {
                 "p2pk" => {
-                    let mut w = wtx.clone();
-                    w.clear_inputs();
-                    w.in_[n].script = signer_pubkey_script(key, "p2pk")?;
-                    let mut buf = w.export_bytes(false);
-                    buf.extend_from_slice(&sighash.to_le_bytes());
-                    let digest = dsha256(&buf);
+                    let script_code = signer_pubkey_script(key, "p2pk")?;
+                    let digest = self.legacy_sighash(n, &script_code, sighash);
                     let mut sig = key.sign_ecdsa_der(&digest)?;
                     sig.push((sighash & 0xff) as u8);
                     self.in_[n].script = push_bytes(&sig);
@@ -170,12 +166,8 @@ impl BtcTx {
                         self.p2wpkh_sign(n, k, sighash, &pfx, &sfx)?;
                         continue;
                     }
-                    let mut w = wtx.clone();
-                    w.clear_inputs();
-                    w.in_[n].script = signer_pubkey_script(key, &k.scheme)?;
-                    let mut buf = w.export_bytes(false);
-                    buf.extend_from_slice(&sighash.to_le_bytes());
-                    let digest = dsha256(&buf);
+                    let script_code = signer_pubkey_script(key, &k.scheme)?;
+                    let digest = self.legacy_sighash(n, &script_code, sighash);
                     let mut sig = key.sign_ecdsa_der(&digest)?;
                     sig.push((sighash & 0xff) as u8);
                     let pubkey = if k.scheme == "p2pkh" {
@@ -375,7 +367,7 @@ impl BtcTx {
         self.export_bytes(self.has_witness())
     }
 
-    /// `MarshalBinary` equivalent.
+    /// Alias for [`Self::bytes`], serializing the transaction to its wire form.
     pub fn marshal_binary(&self) -> Vec<u8> {
         self.bytes()
     }
@@ -391,11 +383,6 @@ impl BtcTx {
             inp.script.clear();
             inp.witnesses.clear();
         }
-    }
-
-    /// Deep-copies the transaction.
-    pub fn dup(&self) -> BtcTx {
-        self.clone()
     }
 
     /// Adds an output for the given address, auto-detecting the network.
@@ -470,8 +457,7 @@ impl BtcTx {
             return ln;
         }
         witln += 2; // marker, flag
-        let add = if witln % 4 != 0 { 1 } else { 0 };
-        ln + witln / 4 + add
+        ln + witln.div_ceil(4)
     }
 
     /// Parses a transaction from bytes.
@@ -580,7 +566,7 @@ impl BtcTxInput {
     /// Fills the input with placeholder data of the expected signature size for
     /// the given scheme (used for fee estimation).
     pub fn prefill(&mut self, scheme: &str) -> Result<(), String> {
-        // sizes mirror the Go prefill values
+        // worst-case sizes used for fee estimation
         let empty_sig = vec![0u8; 72];
         let comp_key = vec![0u8; 33];
         let uncomp_key = vec![0u8; 65];
@@ -858,7 +844,7 @@ fn read_var_buf<R: Read>(r: &mut R, n: &mut u64) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-// --- JSON (serde), matching the Go wire format ---
+// --- JSON (serde) ---
 
 #[derive(Serialize)]
 struct ScriptPubKeyJson {

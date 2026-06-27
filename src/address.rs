@@ -41,10 +41,6 @@ pub fn encode_base58_addr(version: u8, buf: &[u8]) -> String {
     base58::encode(&data)
 }
 
-fn make_out_net(name: &str, script: Vec<u8>, flags: &[&str]) -> Out {
-    Out::make(name, script, flags)
-}
-
 /// Parses an EVM (`0x...`) address.
 pub fn parse_evm_address(address: &str) -> Result<Out, String> {
     if address.len() != 42 || !address.starts_with("0x") {
@@ -52,7 +48,7 @@ pub fn parse_evm_address(address: &str) -> Result<Out, String> {
     }
     let data =
         hex::decode(&address[2..]).map_err(|e| format!("failed to parse ethereum address: {e}"))?;
-    if address != address.to_lowercase() && address != eip55(&data) {
+    if address.bytes().any(|b| b.is_ascii_uppercase()) && address != eip55(&data) {
         return Err("bad checksum on ethereum address".into());
     }
     Ok(Out::make("eth", data, &["evm"]))
@@ -110,7 +106,7 @@ pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, 
             if typ == 1 && (net == "bitcoin" || net == "bitcoin-testnet") && buf.len() == 32 {
                 let mut script = vec![0x51];
                 script.extend_from_slice(&push_bytes(&buf));
-                return Ok(make_out_net("p2tr", script, &[net]));
+                return Ok(Out::make("p2tr", script, &[net]));
             }
             if typ != 0 {
                 return Err(format!("unsupported segwit type {typ}"));
@@ -118,8 +114,8 @@ pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, 
             let mut script = vec![0x00];
             script.extend_from_slice(&push_bytes(&buf));
             return match buf.len() {
-                20 => Ok(make_out_net("p2wpkh", script, &[net])),
-                32 => Ok(make_out_net("p2wsh", script, &[net])),
+                20 => Ok(Out::make("p2wpkh", script, &[net])),
+                32 => Ok(Out::make("p2wsh", script, &[net])),
                 n => Err(format!("invalid segwit address length {n}")),
             };
         }
@@ -159,8 +155,8 @@ pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, 
 
 fn cashaddr_out(typ: u8, buf: &[u8]) -> Result<Out, String> {
     match typ {
-        0 => Ok(make_out_net("p2pkh", p2pkh_script(buf), &["bitcoin-cash"])),
-        1 => Ok(make_out_net("p2sh", p2sh_script(buf), &["bitcoin-cash"])),
+        0 => Ok(Out::make("p2pkh", p2pkh_script(buf), &["bitcoin-cash"])),
+        1 => Ok(Out::make("p2sh", p2sh_script(buf), &["bitcoin-cash"])),
         n => Err(format!("unsupported bitcoincash address type {n}")),
     }
 }
@@ -168,11 +164,11 @@ fn cashaddr_out(typ: u8, buf: &[u8]) -> Result<Out, String> {
 fn parse_base58_versioned(network: &str, buf: &[u8]) -> Result<Out, String> {
     let version = buf[0];
     let payload = &buf[1..];
-    let pkh = |net: &str| make_out_net("p2pkh", p2pkh_script(payload), &[net]);
-    let psh = |net: &str| make_out_net("p2sh", p2sh_script(payload), &[net]);
-    // For auto, also attach multiple flags as in the Go original.
-    let pkh_multi = |nets: &[&str]| make_out_net("p2pkh", p2pkh_script(payload), nets);
-    let psh_multi = |nets: &[&str]| make_out_net("p2sh", p2sh_script(payload), nets);
+    let pkh = |net: &str| Out::make("p2pkh", p2pkh_script(payload), &[net]);
+    let psh = |net: &str| Out::make("p2sh", p2sh_script(payload), &[net]);
+    // For auto, also attach multiple flags.
+    let pkh_multi = |nets: &[&str]| Out::make("p2pkh", p2pkh_script(payload), nets);
+    let psh_multi = |nets: &[&str]| Out::make("p2sh", p2sh_script(payload), nets);
 
     match network {
         "auto" => match version {

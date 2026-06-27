@@ -69,8 +69,7 @@ impl core::fmt::Display for Out {
 }
 
 /// Attempts to identify the output-script type of `script`, optionally using a
-/// public-key hint to distinguish compressed/uncompressed variants. Mirrors the
-/// Go `GuessOut`.
+/// public-key hint to distinguish compressed/uncompressed variants.
 pub fn guess_out(script: &[u8], pubkey_hint: Option<&PubKey>) -> Out {
     if script.is_empty() {
         return Out::make("empty", script.to_vec(), &["invalid"]);

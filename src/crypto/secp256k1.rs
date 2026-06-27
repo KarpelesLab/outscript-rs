@@ -2,10 +2,9 @@
 //! BIP-340 Schnorr / BIP-341 taproot, built on `purecrypto`'s hazmat secp256k1
 //! scalar/point arithmetic.
 //!
-//! This replaces the Go dependency `github.com/KarpelesLab/secp256k1`. The
-//! ECDSA path is byte-compatible with that library (same RFC6979 nonce, same
-//! low-S normalization, same recovery-code semantics) so that signed
-//! transactions match the Go output exactly.
+//! The ECDSA path uses the standard RFC6979 deterministic nonce, low-S
+//! normalization, and recovery-code semantics, so signatures are reproducible
+//! and interoperable with other conforming implementations.
 
 use num_bigint::BigUint;
 use num_traits::Num;
@@ -43,6 +42,7 @@ fn is_over_half_order(s_be: &[u8; 32]) -> bool {
 
 /// Errors from secp256k1 operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// A secret key, scalar or coordinate was out of range.
     InvalidKey,
@@ -273,14 +273,14 @@ impl SecpPrivateKey {
 
 fn canon_int(value_be: &[u8; 32]) -> Vec<u8> {
     // Prepend a 0x00 then strip leading 0x00 bytes while the next byte's high
-    // bit is clear (keeps the integer positive), matching the Go Serialize().
-    let mut buf = Vec::with_capacity(33);
-    buf.push(0x00);
-    buf.extend_from_slice(value_be);
-    while buf.len() > 1 && buf[0] == 0x00 && buf[1] & 0x80 == 0 {
-        buf.remove(0);
+    // bit is clear (keeps the DER integer positive and minimally encoded).
+    let mut buf = [0u8; 33];
+    buf[1..].copy_from_slice(value_be);
+    let mut start = 0;
+    while start < 32 && buf[start] == 0x00 && buf[start + 1] & 0x80 == 0 {
+        start += 1;
     }
-    buf
+    buf[start..].to_vec()
 }
 
 fn der_encode(r_be: &[u8; 32], s_be: &[u8; 32]) -> Vec<u8> {

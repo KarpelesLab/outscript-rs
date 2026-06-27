@@ -26,15 +26,15 @@ fn chain_config(network: &str) -> Option<ChainRewardInfo> {
             halving_interval,
         })
     };
+    const COIN: i64 = 100_000_000;
     match network {
-        "bitcoin" => cfg(RewardModel::Halving, 50_0000_0000, 210_000),
-        "namecoin" => cfg(RewardModel::Halving, 50_0000_0000, 210_000),
-        "bitcoin-cash" => cfg(RewardModel::Halving, 50_0000_0000, 210_000),
-        "bitcoin-testnet" => cfg(RewardModel::Halving, 50_0000_0000, 210_000),
-        "litecoin" => cfg(RewardModel::Halving, 50_0000_0000, 840_000),
-        "monacoin" => cfg(RewardModel::Halving, 50_0000_0000, 1_051_200),
+        "bitcoin" | "namecoin" | "bitcoin-cash" | "bitcoin-testnet" => {
+            cfg(RewardModel::Halving, 50 * COIN, 210_000)
+        }
+        "litecoin" => cfg(RewardModel::Halving, 50 * COIN, 840_000),
+        "monacoin" => cfg(RewardModel::Halving, 50 * COIN, 1_051_200),
         "dogecoin" => cfg(RewardModel::Doge, 0, 0),
-        "dash" => cfg(RewardModel::Dash, 5 * 100_000_000, 0),
+        "dash" => cfg(RewardModel::Dash, 5 * COIN, 0),
         "electraproto" => cfg(RewardModel::Zero, 0, 0),
         _ => None,
     }

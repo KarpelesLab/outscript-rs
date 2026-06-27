@@ -12,7 +12,10 @@ use crate::hash::keccak256_once;
 use crate::rlp::{self, RlpItem};
 
 /// EVM transaction type.
+///
+/// Non-exhaustive: Ethereum continues to define new EIP-2718 transaction types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EvmTxType {
     /// Legacy (pre-EIP-2718).
     Legacy,
@@ -483,7 +486,7 @@ mod tests {
     }
 }
 
-// --- JSON (serde), matching the Go evmTxJson format ---
+// --- JSON (serde) ---
 
 fn hex0x_u64(v: u64) -> String {
     format!("0x{v:x}")

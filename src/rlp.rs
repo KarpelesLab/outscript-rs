@@ -16,6 +16,7 @@ pub enum RlpItem {
 
 /// Errors from RLP operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Unexpected end of input.
     UnexpectedEof,
@@ -137,15 +138,7 @@ impl RlpItem {
                     out
                 }
             }
-            RlpItem::List(items) => {
-                let mut body = Vec::new();
-                for it in items {
-                    body.extend_from_slice(&it.encode());
-                }
-                let mut out = encode_len(body.len(), true);
-                out.extend_from_slice(&body);
-                out
-            }
+            RlpItem::List(items) => encode_list(items),
         }
     }
 
@@ -229,9 +222,16 @@ pub fn decode(buf: &[u8]) -> Result<Vec<RlpItem>, Error> {
     Ok(res)
 }
 
-/// Encodes a top-level list of items (equivalent to Go `rlp.EncodeValue([]any)`).
+/// Encodes a list of items as a single RLP list (length prefix + concatenated
+/// item encodings).
 pub fn encode_list(items: &[RlpItem]) -> Vec<u8> {
-    RlpItem::List(items.to_vec()).encode()
+    let mut body = Vec::new();
+    for it in items {
+        body.extend_from_slice(&it.encode());
+    }
+    let mut out = encode_len(body.len(), true);
+    out.extend_from_slice(&body);
+    out
 }
 
 #[cfg(test)]

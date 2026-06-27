@@ -1,12 +1,16 @@
 //! Composable `Insertable` operations that define how an output script is
-//! derived from a public key (port of the Go `Insertable`/`Format` types).
+//! derived from a public key.
 
 use crate::hash::{HashFn, hash_chain, ripemd160_vec, sha256_vec};
 use crate::pushbytes::push_bytes;
 use crate::script::Script;
 
 /// A component that produces bytes for inclusion in an output script.
+///
+/// Non-exhaustive: more script-building primitives may be added as new output
+/// formats are supported.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum Insertable {
     /// A fixed byte sequence.
     Bytes(Vec<u8>),
@@ -56,7 +60,7 @@ impl Insertable {
     }
 }
 
-// --- concise constructors mirroring the Go Format definitions ---
+// --- concise constructors for the built-in formats ---
 
 pub(crate) fn b(bytes: &[u8]) -> Insertable {
     Insertable::Bytes(bytes.to_vec())

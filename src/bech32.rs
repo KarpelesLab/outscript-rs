@@ -88,8 +88,8 @@ fn bech32_encode(hrp: &str, data: &[u8], spec: u32) -> String {
 
 /// Decodes a bech32/bech32m string into (hrp, 5-bit data, spec constant).
 fn bech32_decode(s: &str) -> Result<(String, Vec<u8>, u32), Error> {
-    let has_lower = s.chars().any(|c| c.is_ascii_lowercase());
-    let has_upper = s.chars().any(|c| c.is_ascii_uppercase());
+    let has_lower = s.bytes().any(|b| b.is_ascii_lowercase());
+    let has_upper = s.bytes().any(|b| b.is_ascii_uppercase());
     if has_lower && has_upper {
         return err("mixed case bech32 string");
     }

@@ -1,8 +1,8 @@
 //! Hashing helpers built on `purecrypto::hash`.
 //!
-//! Mirrors the chained-hash behaviour of the Go code's `gobottle.Hash`, which
-//! applies a sequence of hash functions where each function consumes the output
-//! of the previous one (e.g. HASH160 = RIPEMD160(SHA256(x))).
+//! Supports chained hashing, where a sequence of hash functions is applied so
+//! that each function consumes the output of the previous one (e.g.
+//! HASH160 = RIPEMD160(SHA256(x))).
 
 use purecrypto::hash::{Blake2bMac, Blake3, blake2b256, keccak256, ripemd160, sha256};
 
@@ -41,7 +41,7 @@ pub fn ether_hash_vec(data: &[u8]) -> Vec<u8> {
 }
 
 /// Applies a sequence of hash functions, chaining the output of one into the
-/// input of the next. Equivalent to the Go `gobottle.Hash(data, fns...)`.
+/// input of the next.
 pub fn hash_chain(data: &[u8], fns: &[HashFn]) -> Vec<u8> {
     let mut cur = data.to_vec();
     for f in fns {
@@ -93,9 +93,8 @@ pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
 
 /// The Ethereum public-key hash used by the `eth` format.
 ///
-/// Mirrors the Go `etherHash`: keccak-256 over the public key bytes with the
-/// leading byte (the SEC1 `0x04` uncompressed prefix) stripped, returning the
-/// last 20 bytes of the digest.
+/// Keccak-256 over the public key bytes with the leading byte (the SEC1 `0x04`
+/// uncompressed prefix) stripped, returning the last 20 bytes of the digest.
 pub fn ether_hash(uncompressed_pubkey: &[u8]) -> [u8; 20] {
     let body = if uncompressed_pubkey.is_empty() {
         uncompressed_pubkey

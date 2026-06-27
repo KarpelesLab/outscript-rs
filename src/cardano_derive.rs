@@ -79,11 +79,7 @@ impl CardanoExtendedKey {
     /// Returns the 32-byte chain code, or `None` if this key was created without
     /// one (and therefore cannot derive children).
     pub fn chain_code(&self) -> Option<[u8; 32]> {
-        if self.has_chain {
-            Some(self.chain_code)
-        } else {
-            None
-        }
+        self.has_chain.then_some(self.chain_code)
     }
 
     /// Returns the 32-byte Ed25519 public key for this extended key.

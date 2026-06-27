@@ -15,19 +15,16 @@ pub struct BtcAmount(pub u64);
 impl BtcAmount {
     /// Formats the amount as a decimal string with exactly 8 decimal places.
     pub fn to_decimal_string(self) -> String {
-        let mut s = self.0.to_string();
-        if s.len() <= 8 {
-            // pad to at least 9 chars so we can insert a leading "0."
-            let pad = 9 - s.len();
-            s = "0".repeat(pad) + &s;
-        }
+        // Zero-pad to at least 9 digits so there's always an integer part to the
+        // left of the 8 fractional digits.
+        let s = format!("{:09}", self.0);
         let ln = s.len();
         format!("{}.{}", &s[..ln - 8], &s[ln - 8..])
     }
 
     /// Parses a textual amount. Accepts decimal strings (e.g. "1.5"), integer
     /// strings (multiplied by 10^8), and `0x`-prefixed hex (treated as raw
-    /// satoshis). Mirrors the Go `UnmarshalText`.
+    /// satoshis).
     pub fn from_text(s: &str) -> Result<BtcAmount, String> {
         if let Some(hex_part) = s.strip_prefix("0x") {
             let v = u64::from_str_radix(hex_part, 16).map_err(|e| e.to_string())?;
@@ -48,7 +45,7 @@ impl BtcAmount {
                 if dec_count > 8 {
                     return Err("cannot parse amount with more than 8 decimals".into());
                 }
-                let without_dot: String = s[..pos].chars().chain(s[pos + 1..].chars()).collect();
+                let without_dot = s.replacen('.', "", 1);
                 let mut v: u64 = without_dot
                     .parse()
                     .map_err(|e: std::num::ParseIntError| e.to_string())?;
