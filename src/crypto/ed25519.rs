@@ -2,7 +2,7 @@
 //! by Solana program-derived addresses.
 
 use purecrypto::ec::ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature};
-use purecrypto::ec::edwards25519::hazmat::EdwardsPoint;
+use purecrypto::ec::edwards25519::hazmat::{EdwardsPoint, Scalar};
 
 /// Derives the 32-byte raw Ed25519 public key from a 32-byte seed.
 pub fn public_from_seed(seed: &[u8; 32]) -> [u8; 32] {
@@ -29,6 +29,49 @@ pub fn verify(public: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
 /// key.
 pub fn is_on_curve(point: &[u8; 32]) -> bool {
     EdwardsPoint::decompress(point).is_some()
+}
+
+// --- Low-level scalar / point primitives, used by Cardano BIP32-Ed25519 ---
+//
+// These expose the ref10-style operations (scalar reduction, scalar·B, A + s·B,
+// and the s = a·b + c combiner) that extended-key signing and key derivation
+// need. All scalars are 32-byte little-endian encodings.
+
+/// Builds a [`Scalar`] from a 32-byte little-endian value, reducing it modulo the
+/// group order L. Derived BIP32-Ed25519 scalars are not in canonical (< L) form,
+/// so reduction (rather than a canonical decode) is required.
+fn scalar_from_le(bytes: &[u8; 32]) -> Scalar {
+    let mut wide = [0u8; 64];
+    wide[..32].copy_from_slice(bytes);
+    Scalar::from_bytes_mod_order(&wide)
+}
+
+/// Reduces a 64-byte little-endian value modulo L (the wide reduction used for
+/// hash-to-scalar in EdDSA).
+pub fn scalar_reduce_wide(wide: &[u8; 64]) -> [u8; 32] {
+    Scalar::from_bytes_mod_order(wide).to_bytes()
+}
+
+/// Returns the compressed public key `A = (scalar mod L)·B`.
+pub fn scalar_mul_base(scalar: &[u8; 32]) -> [u8; 32] {
+    EdwardsPoint::mul_base(&scalar_from_le(scalar)).compress()
+}
+
+/// Computes `s = (a·b + c) mod L` from three 32-byte scalars.
+pub fn scalar_mul_add(a: &[u8; 32], b: &[u8; 32], c: &[u8; 32]) -> [u8; 32] {
+    scalar_from_le(a)
+        .mul(&scalar_from_le(b))
+        .add(&scalar_from_le(c))
+        .to_bytes()
+}
+
+/// Returns the compressed encoding of `A + scalar·B`, where `A` is the point
+/// decoded from `pubkey`. Returns `None` if `pubkey` is not a valid point. Used
+/// for watch-only (public) BIP32-Ed25519 child derivation.
+pub fn point_add_base(pubkey: &[u8; 32], scalar: &[u8; 32]) -> Option<[u8; 32]> {
+    let a = EdwardsPoint::decompress(pubkey)?;
+    let tweak = EdwardsPoint::mul_base(&scalar_from_le(scalar));
+    Some(a.add(&tweak).compress())
 }
 
 #[cfg(test)]

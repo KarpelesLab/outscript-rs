@@ -3,13 +3,15 @@
 //! It supports Bitcoin and Bitcoin-like cryptocurrency output script formats
 //! (P2PKH, P2SH, P2WPKH, P2WSH, P2PK, P2TR, etc.), EVM-based networks (Ethereum
 //! and compatible chains), and other blockchains such as Litecoin, Dogecoin,
-//! Namecoin, Monacoin, Electraproto, Dash, Bitcoin Cash, Massa and Solana.
+//! Namecoin, Monacoin, Electraproto, Dash, Bitcoin Cash, Massa, Solana and
+//! Cardano.
 //!
 //! This is a Rust port of the Go library `github.com/KarpelesLab/outscript`. All
 //! cryptography is provided by the `purecrypto` crate.
 
 pub mod base58;
 pub mod bech32;
+pub mod cbor;
 pub mod crypto;
 pub mod hash;
 pub mod pushbytes;
@@ -19,6 +21,9 @@ pub mod address;
 pub mod btcguess;
 pub mod btctx;
 pub mod btctxparse;
+pub mod cardano;
+pub mod cardano_derive;
+pub mod cardanotx;
 pub mod evmabi;
 pub mod evmtx;
 pub mod insertable;
@@ -39,6 +44,17 @@ pub use btcguess::{GuessResult, guess_by_in_script, guess_by_out_script};
 pub use btctx::{BtcTx, BtcTxInput, BtcTxOutput, BtcTxSign, Signer};
 pub use btctxparse::{BtcInputSig, extract_btc_input_sig};
 pub use btcvarint::BtcVarInt;
+pub use cardano::{
+    cardano_base_address, cardano_enterprise_address, cardano_key_hash, cardano_reward_address,
+    parse_cardano_address,
+};
+pub use cardano_derive::{
+    CARDANO_HARDENED, CardanoExtendedKey, CardanoExtendedPubKey, cardano_harden,
+    cardano_icarus_master_key,
+};
+pub use cardanotx::{
+    CardanoAsset, CardanoInput, CardanoOutput, CardanoSigner, CardanoTx, CardanoVkeyWitness,
+};
 pub use evmabi::{AbiBuffer, AbiValue, evm_call};
 pub use evmtx::{EvmTx, EvmTxType};
 pub use insertable::{Format, Insertable};
@@ -54,5 +70,7 @@ pub use solana_addr::parse_solana_address;
 mod address_tests;
 #[cfg(test)]
 mod btctx_tests;
+#[cfg(test)]
+mod cardano_tests;
 #[cfg(test)]
 mod solana_tests;

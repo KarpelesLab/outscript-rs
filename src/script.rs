@@ -43,6 +43,12 @@ pub fn format_def(name: &str) -> Option<Format> {
             ihash(lookup("massa_pubkey"), &[HashFn::Blake3]),
         ],
         "solana" => vec![lookup("pubkey:ed25519")],
+        // cardano: type-6 enterprise address payload (mainnet header 0x61) followed
+        // by the blake2b-224 payment key hash. Out::address adjusts the network nibble.
+        "cardano" => vec![
+            b(&[0x61]),
+            ihash(lookup("pubkey:ed25519"), &[HashFn::Blake2b224]),
+        ],
         _ => return None,
     };
     Some(f)
@@ -70,6 +76,7 @@ pub const ALL_FORMATS: &[&str] = &[
     "massa_pubkey",
     "massa",
     "solana",
+    "cardano",
 ];
 
 /// Typical formats available for each network (port of `FormatsPerNetwork`).
@@ -90,6 +97,7 @@ pub fn formats_per_network(network: &str) -> Option<&'static [&'static str]> {
         "evm" => &["eth"],
         "massa" => &["massa"],
         "solana" => &["solana"],
+        "cardano" => &["cardano"],
         _ => return None,
     })
 }

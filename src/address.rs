@@ -255,6 +255,7 @@ impl Out {
 
         match self.base_name() {
             "solana" => Ok(base58::encode(&self.raw)),
+            "cardano" => crate::cardano::cardano_address_from_out(&self.raw, net),
             "eth" | "evm" => Ok(eip55(&self.raw)),
             "massa_pubkey" => {
                 let h = dsha256(&self.raw);

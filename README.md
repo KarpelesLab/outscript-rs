@@ -28,6 +28,7 @@ All cryptography is provided by the pure-Rust
 | EVM (Ethereum, etc.) | EIP-55 checksummed | `EvmTx` |
 | Massa | AU (user) / AS (smart contract) | - |
 | Solana | Base58 (32 bytes) | `SolanaTx` |
+| Cardano | Shelley bech32 (addr / addr_test / stake) | `CardanoTx` |
 
 ## Usage
 
@@ -49,6 +50,18 @@ let eth  = s.address("eth", &[]).unwrap();              // 0x...
 let pk = ed25519::public_from_seed(&seed);
 let s = Script::new(PubKey::Ed25519(pk));
 let sol = s.address("solana", &["solana"]).unwrap();    // base58
+
+// Cardano (ed25519). "cardano" yields a Shelley enterprise address (payment
+// credential only); pass "cardano-testnet" for the testnet form.
+let addr = s.address("cardano", &[]).unwrap();                  // addr1...
+let test = s.address("cardano", &["cardano-testnet"]).unwrap(); // addr_test1...
+
+// Base (payment+stake) and reward addresses need two key hashes:
+use outscript::{cardano_base_address, cardano_reward_address, cardano_key_hash};
+let ph = cardano_key_hash(&payment_pub);
+let sh = cardano_key_hash(&stake_pub);
+let base   = cardano_base_address(&ph, &sh, "cardano").unwrap();  // addr1...
+let reward = cardano_reward_address(&sh, "cardano").unwrap();     // stake1...
 ```
 
 ### Address parsing
@@ -60,6 +73,11 @@ let out = parse_bitcoin_based_address("auto", "1A1zP1...").unwrap(); // auto-det
 let out = parse_evm_address("0x2AeB8ADD...").unwrap();
 let out = parse_solana_address("83astBRgu...").unwrap();
 let out = parse_massa_address("AU16f3K8u...").unwrap();
+
+// Cardano (addr / addr_test / stake / stake_test)
+use outscript::parse_cardano_address;
+let out = parse_cardano_address("addr1vx2fxv2umyhttkxyxp8...").unwrap();
+let raw = out.bytes(); // raw address bytes (header + credentials), for a tx output
 ```
 
 ### Bitcoin transactions
@@ -118,6 +136,78 @@ let data = tx.marshal_binary().unwrap();
 let txid = tx.hash().unwrap(); // first signature
 ```
 
+### Cardano transactions
+
+Builds Shelley/Conway-era transactions: a CBOR-encoded body (inputs, outputs,
+fee, optional TTL), ADA and native-asset outputs, and Ed25519 vkey witnesses.
+The transaction id and signing digest are `blake2b-256` of the transaction body.
+
+```rust
+use outscript::{CardanoTx, CardanoInput, CardanoOutput, parse_cardano_address};
+
+let to = parse_cardano_address("addr1vx2fxv2umyhttkxyxp8...").unwrap();
+
+let mut tx = CardanoTx {
+    inputs: vec![CardanoInput { txid: prev_txid /* 32 bytes */, index: 0 }],
+    outputs: vec![CardanoOutput {
+        address: to.bytes().to_vec(),
+        amount: 1_000_000, // lovelace
+        assets: vec![],
+    }],
+    fee: 170_000,
+    ttl: 41_000_000, // optional (slot); 0 omits it
+    witnesses: vec![],
+};
+
+// Sign with one or more 32-byte standard Ed25519 seeds (a vkey witness per seed)
+tx.sign(&[seed]).unwrap();
+
+let data = tx.marshal_binary().unwrap(); // CBOR transaction
+let txid = tx.hash().unwrap();           // blake2b-256 of the body
+```
+
+Cardano HD wallets (CIP-1852) use BIP32-Ed25519 *extended* keys, which store an
+already-expanded 64-byte secret and cannot be used as a standard Ed25519 seed.
+Sign with those (or any external/HSM signer) through the `CardanoSigner` trait:
+
+```rust
+use outscript::CardanoExtendedKey;
+
+// secret is the 64-byte extended secret (e.g. the first 64 bytes of an xprv)
+let ext = CardanoExtendedKey::new(&secret).unwrap();
+tx.sign_with(&[&ext]).unwrap(); // standard Ed25519 signature, verifiable as usual
+```
+
+#### HD key derivation (CIP-1852 / BIP32-Ed25519)
+
+Derive keys from BIP-39 entropy using the Icarus master-key scheme and the
+CIP-1852 path `m/1852'/1815'/account'/role/index`:
+
+```rust
+use outscript::{cardano_icarus_master_key, cardano_harden as h, cardano_key_hash,
+    cardano_base_address};
+
+let master = cardano_icarus_master_key(&entropy, &[]).unwrap(); // &[] = no passphrase
+
+// payment key m/1852'/1815'/0'/0/0 and stake key m/1852'/1815'/0'/2/0
+let spend = master.derive_path(&[h(1852), h(1815), h(0), 0, 0]).unwrap();
+let stake = master.derive_path(&[h(1852), h(1815), h(0), 2, 0]).unwrap();
+
+let ph = cardano_key_hash(&spend.public_key());
+let sh = cardano_key_hash(&stake.public_key());
+let addr = cardano_base_address(&ph, &sh, "cardano").unwrap(); // addr1...
+
+// `spend` signs transactions directly via sign_with.
+// Watch-only soft derivation (no private key) is available from an xpub:
+let xpub = master.derive_path(&[h(1852), h(1815), h(0), 0]).unwrap()
+    .extended_public_key().unwrap();
+let child = xpub.derive_child(0).unwrap();
+```
+
+Native tokens are added via `CardanoOutput.assets` (`CardanoAsset { policy_id,
+asset_name, amount }`). Plutus scripts, certificates, staking actions and
+metadata are out of scope.
+
 ### Block rewards
 
 ```rust
@@ -132,7 +222,7 @@ let total  = outscript::cumulative_reward("bitcoin", 840_000).unwrap(); // total
 - **Script** — holds a [`PubKey`] and evaluates named formats, caching results.
 - **Out** — a generated output script with its format name, hex and network
   flags; converts to/from human-readable addresses.
-- **Transactions** — `BtcTx`, `EvmTx`, `SolanaTx` with binary
+- **Transactions** — `BtcTx`, `EvmTx`, `SolanaTx`, `CardanoTx` with binary
   serialization, signing and hashing.
 
 ## License

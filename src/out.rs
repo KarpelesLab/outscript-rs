@@ -55,6 +55,8 @@ impl Out {
             "p2pk" | "p2puk" => parse_push_bytes(&self.raw).map(|(pub_, _)| hash160(pub_).to_vec()),
             "p2sh" => parse_push_bytes(&self.raw[1..]).map(|(d, _)| d.to_vec()),
             "eth" | "massa" | "solana" => Some(self.raw.clone()),
+            // raw is "header byte + credential(s)"; return the payment/stake credential
+            "cardano" if self.raw.len() >= 29 => Some(self.raw[1..29].to_vec()),
             _ => None,
         }
     }

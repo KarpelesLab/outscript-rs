@@ -4,7 +4,7 @@
 //! applies a sequence of hash functions where each function consumes the output
 //! of the previous one (e.g. HASH160 = RIPEMD160(SHA256(x))).
 
-use purecrypto::hash::{Blake3, keccak256, ripemd160, sha256};
+use purecrypto::hash::{Blake2bMac, Blake3, blake2b256, keccak256, ripemd160, sha256};
 
 /// A single hash function usable in a [`hash_chain`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +17,8 @@ pub enum HashFn {
     Keccak256,
     /// BLAKE3 with 32-byte output (used for Massa).
     Blake3,
+    /// BLAKE2b with 28-byte (224-bit) output (used for Cardano key credentials).
+    Blake2b224,
     /// Ethereum public-key hash (keccak-256 over the body with the SEC1 prefix
     /// byte stripped, returning the last 20 bytes). Terminal in a chain.
     EtherHash,
@@ -29,6 +31,7 @@ impl HashFn {
             HashFn::Ripemd160 => ripemd160(data).to_vec(),
             HashFn::Keccak256 => keccak256(data).to_vec(),
             HashFn::Blake3 => Blake3::hash(data).to_vec(),
+            HashFn::Blake2b224 => blake2b224(data).to_vec(),
             HashFn::EtherHash => ether_hash(data).to_vec(),
         }
     }
@@ -67,6 +70,22 @@ pub fn keccak256_once(data: &[u8]) -> [u8; 32] {
 /// BLAKE3 with 32-byte output (used for Massa addresses).
 pub fn blake3_256(data: &[u8]) -> [u8; 32] {
     Blake3::hash(data)
+}
+
+/// BLAKE2b with a 224-bit (28-byte) digest, used to derive Cardano key
+/// credentials from public keys.
+pub fn blake2b224(data: &[u8]) -> [u8; 28] {
+    let mut h = Blake2bMac::new_unkeyed(28);
+    h.update(data);
+    let mut out = [0u8; 28];
+    h.finalize_into(&mut out);
+    out
+}
+
+/// BLAKE2b with a 256-bit (32-byte) digest, used as the Cardano transaction id
+/// and signing digest.
+pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
+    blake2b256(data)
 }
 
 /// The Ethereum public-key hash used by the `eth` format.
