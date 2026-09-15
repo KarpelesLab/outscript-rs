@@ -870,7 +870,7 @@ impl ReadError {
         match self {
             ReadError::Io(e) => e,
             ReadError::Eof => io::Error::from(io::ErrorKind::UnexpectedEof),
-            other => io::Error::other(other.to_string()),
+            other => io::Error::other(other.into_error()),
         }
     }
 }

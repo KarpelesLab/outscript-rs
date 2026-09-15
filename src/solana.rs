@@ -4,7 +4,7 @@
 
 use purecrypto::hash::{Digest, Sha256};
 
-use crate::address::Error;
+use crate::address::Error as AddressError;
 use crate::base58;
 use crate::crypto::ed25519;
 #[cfg(feature = "alloc")]
@@ -21,7 +21,7 @@ pub struct SolanaKey(pub [u8; 32]);
 
 impl SolanaKey {
     /// Parses a base58-encoded key (must decode to 32 bytes).
-    pub fn parse(s: &str) -> Result<SolanaKey, Error> {
+    pub fn parse(s: &str) -> Result<SolanaKey, AddressError> {
         crate::solana_addr::decode_solana_key(s).map(SolanaKey)
     }
     /// Writes the base58 encoding into `out` (44 bytes always suffice),

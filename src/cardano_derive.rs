@@ -232,11 +232,11 @@ impl CardanoExtendedKey {
 
 #[cfg(feature = "alloc")]
 impl CardanoSigner for CardanoExtendedKey {
-    fn cardano_public_key(&self) -> Vec<u8> {
-        self.pub_key.to_vec()
+    fn cardano_public_key(&self) -> [u8; 32] {
+        self.pub_key
     }
-    fn sign_cardano(&self, message: &[u8]) -> Result<Vec<u8>, String> {
-        Ok(self.sign(message).to_vec())
+    fn sign_cardano(&self, message: &[u8]) -> Result<[u8; 64], crate::crypto::SignerError> {
+        Ok(self.sign(message))
     }
 }
 

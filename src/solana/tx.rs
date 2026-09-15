@@ -5,9 +5,66 @@ use alloc::collections::BTreeMap;
 
 use super::*;
 
+/// Errors from Solana transaction operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// The data ended unexpectedly.
+    UnexpectedEof,
+    /// More than 256 accounts are referenced.
+    TooManyAccounts,
+    /// A count exceeds its limit or the remaining data.
+    CountTooLarge,
+    /// The message header counts are inconsistent with the account keys.
+    InvalidHeader,
+    /// An instruction references an account index out of range.
+    IndexOutOfRange,
+    /// A signing key is not one of the transaction's required signers.
+    NotRequiredSigner,
+    /// Fewer signatures than required signers.
+    MissingSignatures,
+    /// The signature at this index is missing or not 64 bytes.
+    InvalidSignature(usize),
+    /// The signature at this index does not verify.
+    VerificationFailed(usize),
+    /// The transaction has no signature (and so no id).
+    NoSignature,
+    /// The message is not a versioned message.
+    NotVersioned,
+    /// The message or transaction version is not supported.
+    UnsupportedVersion(u8),
+    /// A compact-u16 is malformed.
+    CompactU16(CompactU16Error),
+    /// Program-derived address derivation failed.
+    Pda(PdaError),
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::UnexpectedEof => f.write_str("unexpected EOF"),
+            Error::TooManyAccounts => f.write_str("transaction references more than 256 accounts"),
+            Error::CountTooLarge => f.write_str("count exceeds its limit"),
+            Error::InvalidHeader => f.write_str("invalid message header"),
+            Error::IndexOutOfRange => f.write_str("account index out of range"),
+            Error::NotRequiredSigner => f.write_str("key is not a required signer"),
+            Error::MissingSignatures => f.write_str("missing signatures"),
+            Error::InvalidSignature(i) => write!(f, "signature {i} is missing or invalid"),
+            Error::VerificationFailed(i) => write!(f, "signature {i} verification failed"),
+            Error::NoSignature => f.write_str("transaction has no signature"),
+            Error::NotVersioned => f.write_str("not a versioned message"),
+            Error::UnsupportedVersion(v) => write!(f, "unsupported version {v}"),
+            Error::CompactU16(e) => e.fmt(f),
+            Error::Pda(e) => e.fmt(f),
+        }
+    }
+}
+
+impl core::error::Error for Error {}
+
 /// Decodes a compact-u16 length, advancing `pos`.
-fn read_len(data: &[u8], pos: &mut usize) -> Result<usize, String> {
-    decode_compact_u16(data, pos).map_err(|e| e.to_string())
+fn read_len(data: &[u8], pos: &mut usize) -> Result<usize, Error> {
+    decode_compact_u16(data, pos).map_err(Error::CompactU16)
 }
 
 /// Encodes a value in Solana compact-u16 format.
@@ -126,8 +183,8 @@ pub fn create_ata_instruction(
     payer: SolanaKey,
     wallet: SolanaKey,
     mint: SolanaKey,
-) -> Result<SolanaInstruction, String> {
-    let ata = associated_token_address(wallet, mint).map_err(|e| e.to_string())?;
+) -> Result<SolanaInstruction, Error> {
+    let ata = associated_token_address(wallet, mint).map_err(Error::Pda)?;
     Ok(SolanaInstruction {
         program_id: ata_program(),
         accounts: vec![
@@ -280,7 +337,7 @@ type CompiledAccounts = (Vec<SolanaKey>, BTreeMap<SolanaKey, u8>, SolanaMessageH
 fn compile_accounts(
     fee_payer: SolanaKey,
     instructions: &[SolanaInstruction],
-) -> Result<CompiledAccounts, String> {
+) -> Result<CompiledAccounts, Error> {
     let mut seen: BTreeMap<SolanaKey, AccountInfo> = BTreeMap::new();
     seen.insert(
         fee_payer,
@@ -338,10 +395,7 @@ fn compile_accounts(
     all.extend_from_slice(&nw);
     all.extend_from_slice(&nr);
     if all.len() > 256 {
-        return Err(format!(
-            "transaction has {} accounts, maximum is 256",
-            all.len()
-        ));
+        return Err(Error::TooManyAccounts);
     }
 
     let mut index = BTreeMap::new();
@@ -375,7 +429,7 @@ pub fn new_solana_tx(
     fee_payer: SolanaKey,
     recent_blockhash: SolanaKey,
     instructions: &[SolanaInstruction],
-) -> Result<SolanaTx, String> {
+) -> Result<SolanaTx, Error> {
     let (account_keys, index, header) = compile_accounts(fee_payer, instructions)?;
     let compiled = compile_instructions(instructions, &index);
     let num_signers = header.num_required_signatures as usize;
@@ -397,7 +451,7 @@ pub fn new_solana_tx_v0(
     recent_blockhash: SolanaKey,
     lookups: Vec<SolanaAddressTableLookup>,
     instructions: &[SolanaInstruction],
-) -> Result<SolanaTx, String> {
+) -> Result<SolanaTx, Error> {
     let (account_keys, index, header) = compile_accounts(fee_payer, instructions)?;
     let compiled = compile_instructions(instructions, &index);
     let num_signers = header.num_required_signatures as usize;
@@ -436,81 +490,66 @@ impl SolanaTx {
 
     /// Signs the transaction message with the given Ed25519 seeds, matching each
     /// to its signature slot by public key.
-    pub fn sign(&mut self, seeds: &[[u8; 32]]) -> Result<(), String> {
+    pub fn sign(&mut self, seeds: &[[u8; 32]]) -> Result<(), Error> {
         let msg = self.message_bytes();
         let num_signers = self.header().num_required_signatures as usize;
         let account_keys: Vec<SolanaKey> = self.account_keys().to_vec();
         if num_signers > account_keys.len() {
-            return Err(format!(
-                "invalid header: {num_signers} required signers but only {} account keys",
-                account_keys.len()
-            ));
+            return Err(Error::InvalidHeader);
         }
         for seed in seeds {
             let pubkey = SolanaKey(ed25519::public_from_seed(seed));
             let idx = account_keys[..num_signers]
                 .iter()
                 .position(|k| *k == pubkey);
-            let idx = idx.ok_or_else(|| format!("key {pubkey} is not a required signer"))?;
+            let idx = idx.ok_or(Error::NotRequiredSigner)?;
             self.signatures[idx] = ed25519::sign(seed, &msg).to_vec();
         }
         Ok(())
     }
 
     /// Verifies all required signatures.
-    pub fn verify(&self) -> Result<(), String> {
+    pub fn verify(&self) -> Result<(), Error> {
         let msg = self.message_bytes();
         let num_signers = self.header().num_required_signatures as usize;
         if num_signers > self.account_keys().len() {
-            return Err(format!(
-                "invalid header: {num_signers} required signers but only {} account keys",
-                self.account_keys().len()
-            ));
+            return Err(Error::InvalidHeader);
         }
         if self.signatures.len() < num_signers {
-            return Err(format!(
-                "expected {} signatures, got {}",
-                num_signers,
-                self.signatures.len()
-            ));
+            return Err(Error::MissingSignatures);
         }
         for i in 0..num_signers {
             let sig = &self.signatures[i];
             if sig.len() != 64 {
-                return Err(format!(
-                    "signature {i} is missing or has invalid length {}",
-                    sig.len()
-                ));
+                return Err(Error::InvalidSignature(i));
             }
             let pubkey = self.account_keys()[i];
             let mut s = [0u8; 64];
             s.copy_from_slice(sig);
             if !ed25519::verify(&pubkey.0, &msg, &s) {
-                return Err(format!(
-                    "signature {i} (signer {pubkey}) verification failed"
-                ));
+                return Err(Error::VerificationFailed(i));
             }
         }
         Ok(())
     }
 
     /// Returns the transaction id (the first signature).
-    pub fn hash(&self) -> Result<Vec<u8>, String> {
+    pub fn hash(&self) -> Result<Vec<u8>, Error> {
         if self.signatures.is_empty() || self.signatures[0].is_empty() {
-            return Err("transaction has no signature".into());
+            return Err(Error::NoSignature);
         }
         Ok(self.signatures[0].clone())
     }
 
     /// Serializes the transaction.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let msg = self.message_bytes();
         let mut buf = encode_compact_u16(self.signatures.len());
         for sig in &self.signatures {
             if sig.is_empty() {
                 buf.extend(core::iter::repeat_n(0u8, 64));
             } else if sig.len() != 64 {
-                return Err(format!("invalid signature length: {}", sig.len()));
+                return Err(Error::InvalidSignature(0));
             } else {
                 buf.extend_from_slice(sig);
             }
@@ -520,18 +559,16 @@ impl SolanaTx {
     }
 
     /// Parses a transaction from bytes.
-    pub fn from_bytes(data: &[u8]) -> Result<SolanaTx, String> {
+    pub fn from_bytes(data: &[u8]) -> Result<SolanaTx, Error> {
         let mut pos = 0;
         let sig_count = read_len(data, &mut pos)?;
         if sig_count > 256 {
-            return Err(format!(
-                "signature count {sig_count} exceeds maximum of 256"
-            ));
+            return Err(Error::CountTooLarge);
         }
         let mut signatures = Vec::with_capacity(sig_count);
         for _ in 0..sig_count {
             if data.len() < pos + 64 {
-                return Err("unexpected EOF".into());
+                return Err(Error::UnexpectedEof);
             }
             signatures.push(data[pos..pos + 64].to_vec());
             pos += 64;
@@ -544,7 +581,7 @@ impl SolanaTx {
         if !rest.is_empty() && rest[0] & 0x80 != 0 {
             let version = rest[0] & 0x7f;
             if version != 0 {
-                return Err(format!("unsupported transaction version: {version}"));
+                return Err(Error::UnsupportedVersion(version));
             }
             tx.message_v0 = Some(SolanaMessageV0::from_bytes(rest)?);
         } else {
@@ -582,24 +619,15 @@ fn write_message_common(
 /// Checks that the message header account counts are internally consistent with
 /// the number of account keys. Prevents out-of-bounds indexing in sign/verify
 /// when handling a crafted message.
-fn validate_solana_header(h: &SolanaMessageHeader, num_keys: usize) -> Result<(), String> {
+fn validate_solana_header(h: &SolanaMessageHeader, num_keys: usize) -> Result<(), Error> {
     if h.num_required_signatures as usize > num_keys {
-        return Err(format!(
-            "num_required_signatures {} exceeds account key count {num_keys}",
-            h.num_required_signatures
-        ));
+        return Err(Error::InvalidHeader);
     }
     if h.num_readonly_signed > h.num_required_signatures {
-        return Err(format!(
-            "num_readonly_signed {} exceeds num_required_signatures {}",
-            h.num_readonly_signed, h.num_required_signatures
-        ));
+        return Err(Error::InvalidHeader);
     }
     if h.num_required_signatures as usize + h.num_readonly_unsigned as usize > num_keys {
-        return Err(format!(
-            "num_required_signatures + num_readonly_unsigned ({}) exceeds account key count {num_keys}",
-            h.num_required_signatures as usize + h.num_readonly_unsigned as usize
-        ));
+        return Err(Error::InvalidHeader);
     }
     Ok(())
 }
@@ -609,19 +637,14 @@ fn validate_solana_header(h: &SolanaMessageHeader, num_keys: usize) -> Result<()
 fn validate_instruction_indexes(
     instructions: &[SolanaCompiledInstruction],
     addressable: usize,
-) -> Result<(), String> {
-    for (i, ix) in instructions.iter().enumerate() {
+) -> Result<(), Error> {
+    for ix in instructions {
         if ix.program_id_index as usize >= addressable {
-            return Err(format!(
-                "instruction {i} program id index {} out of range ({addressable} addressable accounts)",
-                ix.program_id_index
-            ));
+            return Err(Error::IndexOutOfRange);
         }
         for &ai in &ix.account_indices {
             if ai as usize >= addressable {
-                return Err(format!(
-                    "instruction {i} account index {ai} out of range ({addressable} addressable accounts)"
-                ));
+                return Err(Error::IndexOutOfRange);
             }
         }
     }
@@ -638,10 +661,10 @@ fn read_message_common(
         SolanaKey,
         Vec<SolanaCompiledInstruction>,
     ),
-    String,
+    Error,
 > {
     if data.len() < *pos + 3 {
-        return Err("unexpected EOF".into());
+        return Err(Error::UnexpectedEof);
     }
     let header = SolanaMessageHeader {
         num_required_signatures: data[*pos],
@@ -651,14 +674,12 @@ fn read_message_common(
     *pos += 3;
     let key_count = read_len(data, pos)?;
     if key_count > 256 {
-        return Err(format!(
-            "account key count {key_count} exceeds maximum of 256"
-        ));
+        return Err(Error::CountTooLarge);
     }
     let mut account_keys = Vec::with_capacity(key_count);
     for _ in 0..key_count {
         if data.len() < *pos + 32 {
-            return Err("unexpected EOF".into());
+            return Err(Error::UnexpectedEof);
         }
         let mut k = [0u8; 32];
         k.copy_from_slice(&data[*pos..*pos + 32]);
@@ -667,7 +688,7 @@ fn read_message_common(
     }
     validate_solana_header(&header, account_keys.len())?;
     if data.len() < *pos + 32 {
-        return Err("unexpected EOF".into());
+        return Err(Error::UnexpectedEof);
     }
     let mut bh = [0u8; 32];
     bh.copy_from_slice(&data[*pos..*pos + 32]);
@@ -676,27 +697,24 @@ fn read_message_common(
     // Sanity cap: every instruction needs at least one byte (the program id
     // index), so the count cannot exceed the remaining bytes.
     if ix_count > data.len() - *pos {
-        return Err(format!(
-            "instruction count {ix_count} exceeds remaining bytes {}",
-            data.len() - *pos
-        ));
+        return Err(Error::CountTooLarge);
     }
     let mut instructions = Vec::with_capacity(ix_count);
     for _ in 0..ix_count {
         if data.len() < *pos + 1 {
-            return Err("unexpected EOF".into());
+            return Err(Error::UnexpectedEof);
         }
         let program_id_index = data[*pos];
         *pos += 1;
         let acc_count = read_len(data, pos)?;
         if data.len() < *pos + acc_count {
-            return Err("unexpected EOF".into());
+            return Err(Error::UnexpectedEof);
         }
         let account_indices = data[*pos..*pos + acc_count].to_vec();
         *pos += acc_count;
         let data_len = read_len(data, pos)?;
         if data.len() < *pos + data_len {
-            return Err("unexpected EOF".into());
+            return Err(Error::UnexpectedEof);
         }
         let ix_data = data[*pos..*pos + data_len].to_vec();
         *pos += data_len;
@@ -723,7 +741,7 @@ impl SolanaMessage {
         buf
     }
     /// Parses a legacy message.
-    pub fn from_bytes(data: &[u8]) -> Result<SolanaMessage, String> {
+    pub fn from_bytes(data: &[u8]) -> Result<SolanaMessage, Error> {
         let mut pos = 0;
         let (header, account_keys, recent_blockhash, instructions) =
             read_message_common(data, &mut pos)?;
@@ -761,16 +779,16 @@ impl SolanaMessageV0 {
         buf
     }
     /// Parses a v0 message.
-    pub fn from_bytes(data: &[u8]) -> Result<SolanaMessageV0, String> {
+    pub fn from_bytes(data: &[u8]) -> Result<SolanaMessageV0, Error> {
         if data.is_empty() {
-            return Err("unexpected EOF".into());
+            return Err(Error::UnexpectedEof);
         }
         if data[0] & 0x80 == 0 {
-            return Err("not a versioned message: MSB not set".into());
+            return Err(Error::NotVersioned);
         }
         let version = data[0] & 0x7f;
         if version != 0 {
-            return Err(format!("unsupported message version: {version}"));
+            return Err(Error::UnsupportedVersion(version));
         }
         let mut pos = 1;
         let (header, account_keys, recent_blockhash, instructions) =
@@ -779,28 +797,25 @@ impl SolanaMessageV0 {
         // Sanity cap: every lookup needs at least one byte, so the count cannot
         // exceed the remaining bytes.
         if lookup_count > data.len() - pos {
-            return Err(format!(
-                "address table lookup count {lookup_count} exceeds remaining bytes {}",
-                data.len() - pos
-            ));
+            return Err(Error::CountTooLarge);
         }
         let mut lookups = Vec::with_capacity(lookup_count);
         for _ in 0..lookup_count {
             if data.len() < pos + 32 {
-                return Err("unexpected EOF".into());
+                return Err(Error::UnexpectedEof);
             }
             let mut k = [0u8; 32];
             k.copy_from_slice(&data[pos..pos + 32]);
             pos += 32;
             let w_count = read_len(data, &mut pos)?;
             if data.len() < pos + w_count {
-                return Err("unexpected EOF".into());
+                return Err(Error::UnexpectedEof);
             }
             let writable_indexes = data[pos..pos + w_count].to_vec();
             pos += w_count;
             let r_count = read_len(data, &mut pos)?;
             if data.len() < pos + r_count {
-                return Err("unexpected EOF".into());
+                return Err(Error::UnexpectedEof);
             }
             let readonly_indexes = data[pos..pos + r_count].to_vec();
             pos += r_count;
