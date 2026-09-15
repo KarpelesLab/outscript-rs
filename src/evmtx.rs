@@ -10,35 +10,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::address::eip55;
 use crate::crypto::secp256k1::{SecpPrivateKey, recover_public_key};
 use crate::evmabi::{AbiValue, evm_call};
+pub use crate::evmraw::EvmTxType;
 use crate::hash::keccak256_once;
 use crate::rlp::{self, RlpItem};
-
-/// EVM transaction type.
-///
-/// Non-exhaustive: Ethereum continues to define new EIP-2718 transaction types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum EvmTxType {
-    /// Legacy (pre-EIP-2718).
-    Legacy,
-    /// EIP-2930 access-list transaction.
-    Eip2930,
-    /// EIP-1559 dynamic-fee transaction.
-    Eip1559,
-    /// EIP-4844 blob transaction.
-    Eip4844,
-}
-
-impl EvmTxType {
-    fn type_value(self) -> u8 {
-        match self {
-            EvmTxType::Legacy => 0,
-            EvmTxType::Eip2930 => 1,
-            EvmTxType::Eip1559 => 2,
-            EvmTxType::Eip4844 => 3,
-        }
-    }
-}
 
 /// An EVM transaction.
 #[derive(Debug, Clone)]
@@ -468,6 +442,75 @@ mod tests {
             tx.sender_address().unwrap(),
             "0x2AeB8ADD8337360E088B7D9ce4e857b9BE60f3a7"
         );
+    }
+
+    fn to_raw(tx: &EvmTx) -> (crate::evmraw::RawEvmTx<'_>, crate::evmraw::EvmSignature) {
+        let u128_of = |v: &BigInt| u128::try_from(v).unwrap();
+        let to = tx.to.strip_prefix("0x").unwrap();
+        let raw = crate::evmraw::RawEvmTx {
+            tx_type: tx.tx_type,
+            chain_id: tx.chain_id,
+            nonce: tx.nonce,
+            max_priority_fee_per_gas: u128_of(&tx.gas_tip_cap),
+            max_fee_per_gas: u128_of(&tx.gas_fee_cap),
+            gas: tx.gas,
+            to: (!to.is_empty()).then(|| hex::decode(to).unwrap().try_into().unwrap()),
+            value: bigint_to_32(&tx.value).unwrap(),
+            data: &tx.data,
+        };
+        let sig = crate::evmraw::EvmSignature {
+            v: tx.y.to_u64().unwrap(),
+            r: bigint_to_32(&tx.r).unwrap(),
+            s: bigint_to_32(&tx.s).unwrap(),
+        };
+        (raw, sig)
+    }
+
+    /// `RawEvmTx` must encode, hash and sign identically to `EvmTx`.
+    #[test]
+    fn raw_evm_tx_matches_evmtx() {
+        let bin = hex::decode("02f87101830bdfbb80850243e1963982798e94e866fecdb429c72c30868d3582192a878298698487d3c0ba13571e2080c080a08032999a5ae9477f5f52134c9dc1690d1e25d0bb78ef0f22b949afd0df73a9e4a07106563a788499eb370a48e7c86c08e357866fcc12867a8c530b5ca22175e784").unwrap();
+        let tx = EvmTx::parse_transaction(&bin).unwrap();
+        let (raw, sig) = to_raw(&tx);
+        let mut out = vec![0u8; raw.signed_len(&sig).unwrap()];
+        raw.encode_signed_to_slice(&sig, &mut out).unwrap();
+        assert_eq!(out, bin);
+        assert_eq!(raw.tx_hash(&sig).unwrap(), tx.hash().unwrap());
+        assert_eq!(
+            eip55(&raw.recover_sender(&sig).unwrap()),
+            "0x4838B106FCe9647Bdf1E7877BF73cE8B0BAD5f97"
+        );
+
+        for (tx_type, chain_id) in [
+            (EvmTxType::Legacy, 0),
+            (EvmTxType::Legacy, 1),
+            (EvmTxType::Eip2930, 5),
+            (EvmTxType::Eip1559, 1),
+        ] {
+            let mut tx = EvmTx {
+                tx_type,
+                chain_id,
+                nonce: 7,
+                gas_tip_cap: BigInt::from(1_000_000_000u64),
+                gas_fee_cap: BigInt::from(20_000_000_000u64),
+                gas: 21000,
+                to: "0x2aeb8add8337360e088b7d9ce4e857b9be60f3a7".into(),
+                value: BigInt::from(10u64).pow(18),
+                data: vec![1, 2, 3],
+                ..Default::default()
+            };
+            let unsigned = tx.clone();
+            tx.sign(&key()).unwrap();
+            let (raw, _) = to_raw(&unsigned);
+            assert_eq!(
+                raw.signing_hash().unwrap(),
+                keccak256_once(&unsigned.sign_bytes().unwrap())
+            );
+            let sig = raw.sign(&key()).unwrap();
+            let mut out = vec![0u8; raw.signed_len(&sig).unwrap()];
+            raw.encode_signed_to_slice(&sig, &mut out).unwrap();
+            assert_eq!(out, tx.to_bytes().unwrap(), "{tx_type:?}/{chain_id}");
+        }
     }
 
     #[test]

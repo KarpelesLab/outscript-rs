@@ -14,8 +14,8 @@
 //! - `std` (default): implies `alloc`, and adds `std::io` adapters
 //!   (`BtcVarInt::read_from`/`write_to`, `BtcTx::read_from`).
 //! - `alloc`: the full API on `no_std` targets with a global allocator —
-//!   `Out`/`Script`, address parsing, and transaction building for every
-//!   supported chain.
+//!   `Out`/`Script`, the `BtcTx`/`EvmTx`/`SolanaTx`/`CardanoTx` builders and
+//!   parsers, RLP/CBOR and serde JSON.
 //!
 //! With neither feature the crate is `no_std` and never allocates. That core
 //! offers:
@@ -26,6 +26,9 @@
 //!   ([`generate_script`]), address rendering
 //!   ([`encode_address_to_slice`], plus the [`cardano`] address builders) and
 //!   address decoding ([`decode_bitcoin_based_address`] and friends);
+//! - transaction signing: [`btcraw`] (legacy, BIP-143 and taproot sighashes,
+//!   serialization, txid) and [`evmraw`] (legacy/EIP-2930/EIP-1559 signing,
+//!   encoding, hashing and sender recovery);
 //! - [`solana`] keys, program-derived addresses and compact-u16; [`evmabi`]
 //!   selectors, words and ERC-20 calldata; [`BtcAmount`] parsing/formatting;
 //!   [`btcguess`] script heuristics;
@@ -57,6 +60,7 @@ pub mod cardano;
 pub mod cardano_derive;
 pub mod crypto;
 pub mod evmabi;
+pub mod evmraw;
 pub mod hash;
 pub mod inline;
 pub mod massa;

@@ -223,7 +223,7 @@ The crate is `#![no_std]`. Its Cargo features form three tiers:
 |----------|-----------|
 | `std` (default) | everything, plus `std::io` adapters (`BtcTx::read_from`, `BtcVarInt::read_from`/`write_to`) |
 | `alloc` | everything else: `Out`/`Script`, address parsing, all transaction types, RLP/CBOR, JSON |
-| none | a heap-free core: hashing, secp256k1 ECDSA/Schnorr/taproot, Ed25519, Cardano BIP32-Ed25519 keys, and caller-buffer codecs |
+| none | a heap-free core (below) |
 
 ```toml
 # heap-free core only
@@ -232,25 +232,49 @@ outscript = { version = "0.1", default-features = false }
 outscript = { version = "0.1", default-features = false, features = ["alloc"] }
 ```
 
-The no-alloc codecs write into buffers you provide:
+Without `alloc` you still get:
+
+- **Keys and signing** — secp256k1 ECDSA/Schnorr/taproot, Ed25519, Cardano
+  BIP32-Ed25519 derivation.
+- **Scripts and addresses** — `generate_script` for every built-in format,
+  `encode_address_to_slice` to render them, and `decode_*_address` to parse
+  Bitcoin-family, EVM, Massa, Solana and Cardano addresses.
+- **Transaction signing** — `btcraw::RawTx` (legacy, BIP-143 and taproot
+  sighashes, serialization, txid) and `evmraw::RawEvmTx` (legacy/EIP-2930/
+  EIP-1559 signing, encoding, hash, sender recovery).
+- **Utilities** — Solana keys/PDAs/compact-u16, EVM ABI selectors and ERC-20
+  calldata, `BtcAmount` parsing/formatting, script guessing, and base58,
+  bech32/CashAddr, EIP-55, pushdata and varint codecs.
+
+Results come back in caller buffers or small inline values:
 
 ```rust
-use outscript::{bech32, crypto::secp256k1::SecpPrivateKey, eip55_to_slice, hash};
+use outscript::{PubKey, address, generate_script, crypto::secp256k1::SecpPrivateKey};
+use outscript::evmraw::{EvmTxType, RawEvmTx};
 
 let key = SecpPrivateKey::from_bytes(&secret).unwrap();
-let pubkey = key.public_key();
+let pubkey = PubKey::Secp256k1(key.public_key());
 
-// bc1q... (P2WPKH)
-let mut addr = [0u8; 90];
-let n = bech32::segwit_addr_encode_to_slice("bc", 0, &hash::hash160(&pubkey.serialize_compressed()), &mut addr).unwrap();
+// bc1q... for the key's P2WPKH script
+let script = generate_script(&pubkey, "p2wpkh").unwrap();
+let mut buf = [0u8; address::MAX_ADDRESS_LEN];
+let n = address::encode_address_to_slice("p2wpkh", &script, "bitcoin", &mut buf).unwrap();
 
-// 0x... (EIP-55)
-let mut eth = [0u8; 42];
-eip55_to_slice(&hash::ether_hash(&pubkey.serialize_uncompressed()), &mut eth).unwrap();
-
-// DER signature stored inline, no heap
-let sig = key.sign_der(&digest);
-let der: &[u8] = &sig;
+// sign an EIP-1559 transfer and encode it for broadcast
+let tx = RawEvmTx {
+    tx_type: EvmTxType::Eip1559,
+    chain_id: 1,
+    nonce: 0,
+    max_priority_fee_per_gas: 1_000_000_000,
+    max_fee_per_gas: 30_000_000_000,
+    gas: 21_000,
+    to: Some(recipient),
+    value: amount_be,
+    data: &[],
+};
+let sig = tx.sign(&key).unwrap();
+let mut raw = [0u8; 128];
+let len = tx.encode_signed_to_slice(&sig, &mut raw).unwrap();
 ```
 
 ## Architecture
