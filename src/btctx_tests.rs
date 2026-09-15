@@ -513,3 +513,282 @@ fn raw_tx_matches_btctx() {
         assert_eq!(raw.txid(), tx.hash());
     }
 }
+
+/// Signing through the PSBT roles (create, update, sign, finalize, extract)
+/// must produce exactly the transaction `BtcTx::sign` produces, for every
+/// script type both support, including a PSBT signed by two parties in turn.
+#[test]
+fn psbt_workflow_matches_btctx_sign() {
+    use crate::psbt::Psbt;
+
+    let k1 = key("eb696a065ef48a2192da5b28b694f87544b30fae8327c4510137a922f32c6dcf");
+    let k2 = key("619c335025c7f4012e556c2a58b2506e30b8511b53ade95ea316fd8c3286feb9");
+    let prev_txid = arr32("0101010101010101010101010101010101010101010101010101010101010101");
+
+    // a previous transaction paying `script` at output 0, for legacy inputs
+    let prev_tx = |script: &[u8]| {
+        let mut tx = BtcTx {
+            version: 1,
+            ..Default::default()
+        };
+        tx.inputs.push(BtcTxInput {
+            txid: prev_txid,
+            sequence: 0xffff_ffff,
+            ..Default::default()
+        });
+        tx.outputs.push(BtcTxOutput {
+            amount: crate::BtcAmount(90_000),
+            n: 0,
+            script: script.to_vec(),
+        });
+        tx
+    };
+
+    // (scheme, signing key, second key or None) — "2in" cases spend two
+    // inputs with different keys and sign the PSBT in two passes
+    let cases: &[(&str, &SecpPrivateKey)] = &[
+        ("p2pk", &k1),
+        ("p2pkh", &k1),
+        ("p2pukh", &k1),
+        ("p2wpkh", &k1),
+        ("p2sh:p2wpkh", &k2),
+        ("p2wsh:p2pkh", &k1),
+        ("p2tr", &k2),
+    ];
+    for &(scheme, sk) in cases {
+        let s = Script::new(sk.public_key());
+        let spent_script = s.generate(scheme).unwrap();
+        let prev = prev_tx(&spent_script);
+
+        let mut tx = BtcTx {
+            version: 2,
+            locktime: 7,
+            ..Default::default()
+        };
+        tx.inputs.push(BtcTxInput {
+            txid: prev.hash(),
+            vout: 0,
+            sequence: 0xffff_fffd,
+            ..Default::default()
+        });
+        tx.add_output("bc1q0yy3juscd3zfavw76g4h3eqdqzda7qyf58rj4m", 80_000)
+            .unwrap();
+
+        // reference: BtcTx::sign
+        let mut reference = tx.clone();
+        let sign_scheme = if scheme == "p2wsh:p2pkh" {
+            "p2wsh:p2pkh"
+        } else {
+            scheme
+        };
+        reference
+            .sign(&[BtcTxSign::new(sk, sign_scheme)
+                .amount(90_000)
+                .prev_script(spent_script.clone())])
+            .unwrap();
+
+        // PSBT: create, add UTXO and scripts, sign, finalize, extract
+        let mut psbt = tx.to_psbt().unwrap();
+        let p = Psbt::parse(&psbt).unwrap();
+        psbt = if matches!(scheme, "p2pk" | "p2pkh" | "p2pukh") {
+            p.set_input_record_to_vec(0, &[0x00], &prev.bytes())
+                .unwrap()
+        } else {
+            p.set_witness_utxo_to_vec(0, 90_000, &spent_script).unwrap()
+        };
+        if scheme == "p2sh:p2wpkh" {
+            let redeem = s.generate("p2wpkh").unwrap();
+            psbt = Psbt::parse(&psbt)
+                .unwrap()
+                .set_input_record_to_vec(0, &[0x04], &redeem)
+                .unwrap();
+        }
+        if scheme == "p2wsh:p2pkh" {
+            let ws = s.generate("p2pkh").unwrap();
+            psbt = Psbt::parse(&psbt)
+                .unwrap()
+                .set_input_record_to_vec(0, &[0x05], &ws)
+                .unwrap();
+        }
+
+        // the other key is not involved
+        let p = Psbt::parse(&psbt).unwrap();
+        let other = if core::ptr::eq(sk, &k1) { &k2 } else { &k1 };
+        assert_eq!(
+            p.sign_input_to_vec(0, other),
+            Err(crate::psbt::Error::KeyNotInvolved),
+            "{scheme}"
+        );
+        let (signed, count) = p.sign_to_vec(other).unwrap();
+        assert_eq!((count, signed.as_slice()), (0, psbt.as_slice()), "{scheme}");
+
+        let (signed, count) = p.sign_to_vec(sk).unwrap();
+        assert_eq!(count, 1, "{scheme}");
+        let signed = Psbt::parse(&signed).unwrap();
+        let (finalized, count) = signed.finalize_to_vec().unwrap();
+        assert_eq!(count, 1, "{scheme}");
+        let finalized = Psbt::parse(&finalized).unwrap();
+        let raw = finalized.extract_tx_to_vec().unwrap();
+        assert_eq!(
+            hex::encode(&raw),
+            hex::encode(reference.bytes()),
+            "{scheme}"
+        );
+
+        // base64 round trip of the signed PSBT
+        let text = signed.to_base64();
+        assert_eq!(Psbt::decode_base64(&text).unwrap(), signed.as_bytes());
+    }
+}
+
+/// Two parties sign different inputs (P2WPKH and P2TR) of one PSBT
+/// independently; combining and finalizing yields the `BtcTx::sign` result.
+#[test]
+fn psbt_two_signers_combine() {
+    use crate::psbt::Psbt;
+
+    let k1 = key("eb696a065ef48a2192da5b28b694f87544b30fae8327c4510137a922f32c6dcf");
+    let k2 = key("619c335025c7f4012e556c2a58b2506e30b8511b53ade95ea316fd8c3286feb9");
+    let spk1 = Script::new(k1.public_key()).generate("p2wpkh").unwrap();
+    let spk2 = Script::new(k2.public_key()).generate("p2tr").unwrap();
+
+    let mut tx = BtcTx {
+        version: 2,
+        ..Default::default()
+    };
+    for (i, fill) in [(0u32, 0x11u8), (1, 0x22)] {
+        tx.inputs.push(BtcTxInput {
+            txid: [fill; 32],
+            vout: i,
+            sequence: 0xffff_ffff,
+            ..Default::default()
+        });
+    }
+    tx.add_output("bc1q0yy3juscd3zfavw76g4h3eqdqzda7qyf58rj4m", 150_000)
+        .unwrap();
+
+    let mut reference = tx.clone();
+    reference
+        .sign(&[
+            BtcTxSign::new(&k1, "p2wpkh")
+                .amount(100_000)
+                .prev_script(spk1.clone()),
+            BtcTxSign::new(&k2, "p2tr")
+                .amount(60_000)
+                .prev_script(spk2.clone()),
+        ])
+        .unwrap();
+
+    let base = tx.to_psbt().unwrap();
+    let base = Psbt::parse(&base)
+        .unwrap()
+        .set_witness_utxo_to_vec(0, 100_000, &spk1)
+        .unwrap();
+    let base = Psbt::parse(&base)
+        .unwrap()
+        .set_witness_utxo_to_vec(1, 60_000, &spk2)
+        .unwrap();
+    let base = Psbt::parse(&base).unwrap();
+
+    let (by1, n1) = base.sign_to_vec(&k1).unwrap();
+    let (by2, n2) = base.sign_to_vec(&k2).unwrap();
+    assert_eq!((n1, n2), (1, 1));
+    let (by1, by2) = (Psbt::parse(&by1).unwrap(), Psbt::parse(&by2).unwrap());
+
+    // a partially signed PSBT finalizes only the signed input
+    let (partial, count) = by1.finalize_to_vec().unwrap();
+    assert_eq!(count, 1);
+    let partial = Psbt::parse(&partial).unwrap();
+    assert!(!partial.is_finalized());
+    assert_eq!(
+        partial.extract_tx_to_vec(),
+        Err(crate::psbt::Error::NotFinalized)
+    );
+
+    let combined = by1.combine_to_vec(&by2).unwrap();
+    let (finalized, count) = Psbt::parse(&combined).unwrap().finalize_to_vec().unwrap();
+    assert_eq!(count, 2);
+    let raw = Psbt::parse(&finalized)
+        .unwrap()
+        .extract_tx_to_vec()
+        .unwrap();
+    assert_eq!(hex::encode(&raw), hex::encode(reference.bytes()));
+
+    // the already-finalized input is left alone by later combining/finalizing
+    let late = partial.combine_to_vec(&by2).unwrap();
+    let (late_final, count) = Psbt::parse(&late).unwrap().finalize_to_vec().unwrap();
+    assert_eq!(count, 1);
+    let raw = Psbt::parse(&late_final)
+        .unwrap()
+        .extract_tx_to_vec()
+        .unwrap();
+    assert_eq!(hex::encode(&raw), hex::encode(reference.bytes()));
+}
+
+/// A taproot input with PSBT_IN_SIGHASH_TYPE = SIGHASH_ALL gets a 65-byte
+/// signature that verifies against the output key over the SIGHASH_ALL
+/// message.
+#[test]
+fn psbt_taproot_sighash_all() {
+    use crate::btcraw::{RawTx, RawTxIn, RawTxOut};
+    use crate::psbt::Psbt;
+
+    let k = key("619c335025c7f4012e556c2a58b2506e30b8511b53ade95ea316fd8c3286feb9");
+    let spk = Script::new(k.public_key()).generate("p2tr").unwrap();
+    let inputs = [RawTxIn {
+        txid: [0x33; 32],
+        vout: 0,
+        sequence: 0xffff_ffff,
+        ..Default::default()
+    }];
+    let outputs = [RawTxOut {
+        amount: 1_000,
+        script: &spk,
+    }];
+    let tx = RawTx {
+        version: 2,
+        inputs: &inputs,
+        outputs: &outputs,
+        locktime: 0,
+    };
+    let psbt = Psbt::create_to_vec(&tx).unwrap();
+    let psbt = Psbt::parse(&psbt)
+        .unwrap()
+        .set_witness_utxo_to_vec(0, 5_000, &spk)
+        .unwrap();
+    let psbt = Psbt::parse(&psbt)
+        .unwrap()
+        .set_input_record_to_vec(0, &[0x03], &1u32.to_le_bytes())
+        .unwrap();
+    let (signed, n) = Psbt::parse(&psbt).unwrap().sign_to_vec(&k).unwrap();
+    assert_eq!(n, 1);
+    let signed = Psbt::parse(&signed).unwrap();
+    let sig = signed.input(0).unwrap().tap_key_sig().unwrap();
+    assert_eq!((sig.len(), sig[64]), (65, 0x01));
+
+    let prevouts = [RawTxOut {
+        amount: 5_000,
+        script: &spk,
+    }];
+    let msg = tx
+        .taproot_midstate(&prevouts)
+        .unwrap()
+        .key_spend_sighash_with_type(0, 1)
+        .unwrap();
+    let output_key: [u8; 32] = spk[2..].try_into().unwrap();
+    assert!(bip340_verify(
+        &output_key,
+        &msg,
+        sig[..64].try_into().unwrap()
+    ));
+
+    // unsupported sighash types are refused rather than mis-signed
+    let none = Psbt::parse(&psbt)
+        .unwrap()
+        .set_input_record_to_vec(0, &[0x03], &2u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        Psbt::parse(&none).unwrap().sign_to_vec(&k).err(),
+        Some(crate::psbt::Error::UnsupportedSighash)
+    );
+}

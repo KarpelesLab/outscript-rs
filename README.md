@@ -101,6 +101,40 @@ BIP-341 tweak) and external signers implementing the [`Signer::sign_taproot`]
 method (TSS / MuSig2 / FROST / HSM). Use [`crypto::secp256k1::taproot_tweak`]
 and [`BtcTx::taproot_sighash`] to compute the tweaked key and sighash offline.
 
+### PSBT (BIP-174)
+
+Parse, update, sign (fully or partially), combine, finalize and extract
+Partially Signed Bitcoin Transactions. Every operation works on borrowed bytes
+and writes into a caller buffer, so it also runs without `alloc`; the
+`*_to_vec` variants below need `alloc`.
+
+```rust
+use outscript::psbt::Psbt;
+
+// creator: from an unsigned BtcTx (or a btcraw::RawTx with create_to_slice)
+let psbt = tx.to_psbt().unwrap();
+
+// updater: attach what signers need
+let psbt = Psbt::parse(&psbt)?.set_witness_utxo_to_vec(0, 100_000, &prev_spk)?;
+
+// signer: signs every input the key is involved in
+let (psbt, signed) = Psbt::parse(&psbt)?.sign_to_vec(&key)?;
+
+// combiner / finalizer / extractor
+let psbt = Psbt::parse(&psbt)?.combine_to_vec(&Psbt::parse(&other_signers_psbt)?)?;
+let (psbt, finalized) = Psbt::parse(&psbt)?.finalize_to_vec()?;
+let raw_tx = Psbt::parse(&psbt)?.extract_tx_to_vec()?;
+
+// base64
+let text = Psbt::parse(&psbt)?.to_base64();
+let bytes = Psbt::decode_base64(&text)?;
+```
+
+Signing covers P2PKH, P2PK, multisig, P2WPKH, P2WSH, their P2SH-nested forms
+and P2TR key path (`SIGHASH_ALL`, and `SIGHASH_DEFAULT` for taproot), through
+the `PsbtSigner` trait for external signers. The implementation reproduces
+the BIP-174 test vectors byte for byte.
+
 ### EVM transactions
 
 ```rust
@@ -239,8 +273,9 @@ Without `alloc` you still get:
 - **Scripts and addresses** — `generate_script` for every built-in format,
   `encode_address_to_slice` to render them, and `decode_*_address` to parse
   Bitcoin-family, EVM, Massa, Solana and Cardano addresses.
-- **Transaction signing** — `btcraw::RawTx` (legacy, BIP-143 and taproot
-  sighashes, serialization, txid) and `evmraw::RawEvmTx` (legacy/EIP-2930/
+- **Transaction signing** — `psbt::Psbt` (the full BIP-174 workflow),
+  `btcraw::RawTx` (legacy, BIP-143 and taproot sighashes, serialization,
+  txid) and `evmraw::RawEvmTx` (legacy/EIP-2930/
   EIP-1559 signing, encoding, hash, sender recovery).
 - **Utilities** — Solana keys/PDAs/compact-u16, EVM ABI selectors and ERC-20
   calldata, `BtcAmount` parsing/formatting, script guessing, and base58,

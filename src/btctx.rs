@@ -338,6 +338,21 @@ impl BtcTx {
         })
     }
 
+    /// Creates a BIP-174 PSBT for this transaction, which must not carry any
+    /// scriptSig or witness yet. Add UTXO and script information with the
+    /// [`Psbt`](crate::psbt::Psbt) updater methods before signing.
+    pub fn to_psbt(&self) -> Result<Vec<u8>, String> {
+        if self
+            .inputs
+            .iter()
+            .any(|i| !i.script.is_empty() || !i.witnesses.is_empty())
+        {
+            return Err("psbt: transaction inputs must be unsigned".into());
+        }
+        self.with_raw(crate::psbt::Psbt::create_to_vec)
+            .map_err(|e| format!("psbt: {e}"))
+    }
+
     /// The BIP-143 hashes shared by every input.
     pub(crate) fn segwit_v0_midstate(&self) -> SegwitV0Midstate {
         self.with_raw(|raw| raw.segwit_v0_midstate())

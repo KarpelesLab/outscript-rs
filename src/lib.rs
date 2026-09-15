@@ -27,12 +27,14 @@
 //!   ([`encode_address_to_slice`], plus the [`cardano`] address builders) and
 //!   address decoding ([`decode_bitcoin_based_address`] and friends);
 //! - transaction signing: [`btcraw`] (legacy, BIP-143 and taproot sighashes,
-//!   serialization, txid) and [`evmraw`] (legacy/EIP-2930/EIP-1559 signing,
-//!   encoding, hashing and sender recovery);
+//!   serialization, txid), [`psbt`] (BIP-174 creator, updater, signer,
+//!   combiner, finalizer and extractor) and [`evmraw`]
+//!   (legacy/EIP-2930/EIP-1559 signing, encoding, hashing and sender
+//!   recovery);
 //! - [`solana`] keys, program-derived addresses and compact-u16; [`evmabi`]
 //!   selectors, words and ERC-20 calldata; [`BtcAmount`] parsing/formatting;
 //!   [`btcguess`] script heuristics;
-//! - caller-buffer codecs: [`base58`], [`bech32`] (segwit, CashAddr and generic
+//! - caller-buffer codecs: [`base58`], [`base64`], [`bech32`] (segwit, CashAddr and generic
 //!   bech32), [`eip55_to_slice`], [`encode_base58_addr_to_slice`],
 //!   [`pushbytes`] and [`BtcVarInt`].
 
