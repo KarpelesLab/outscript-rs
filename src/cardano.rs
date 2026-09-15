@@ -14,7 +14,7 @@
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
 
-use crate::address::Error;
+use crate::address::{DecodedAddress, Error};
 use crate::bech32::{self, Variant};
 use crate::hash::blake2b224;
 #[cfg(feature = "alloc")]
@@ -172,45 +172,38 @@ pub fn cardano_reward_address(stake_key_hash: &[u8], network: &str) -> Result<St
     to_string_with(|out| cardano_reward_address_to_slice(stake_key_hash, network, out))
 }
 
-/// Parses a Bech32-encoded Cardano Shelley address (`addr…`, `addr_test…`,
-/// `stake…`, `stake_test…`) and returns the corresponding [`Out`]. The raw
-/// payload (header byte followed by credentials) is preserved so the address can
-/// be re-encoded via [`Out::address`].
-#[cfg(feature = "alloc")]
-pub fn parse_cardano_address(address: &str) -> Result<Out, String> {
-    let mut payload = vec![0u8; address.len()];
-    let (hrp, n, variant) = bech32::decode_to_slice(address, &mut payload)
-        .map_err(|e| format!("failed to decode cardano address: {e}"))?;
+/// Decodes a Bech32-encoded Cardano Shelley address (`addr…`, `addr_test…`,
+/// `stake…`, `stake_test…`) without allocating. The script is the raw payload
+/// (header byte followed by credentials), so it can be re-encoded with
+/// [`cardano_address_from_raw_to_slice`].
+pub fn decode_cardano_address(address: &str) -> Result<DecodedAddress, Error> {
+    let mut buf = [0u8; 57];
+    let (hrp, n, variant) = bech32::decode_to_slice(address, &mut buf).map_err(|e| match e {
+        bech32::Error::BufferTooSmall => Error::InvalidLength,
+        e => Error::Bech32(e),
+    })?;
     if variant != Variant::Bech32 {
-        return Err("failed to decode cardano address: invalid bech32 checksum".into());
+        return Err(Error::Bech32(bech32::Error::InvalidChecksum));
     }
-    payload.truncate(n);
-    let hrp = hrp.to_ascii_lowercase();
-    match hrp.as_str() {
-        "addr" | "addr_test" | "stake" | "stake_test" => {}
-        other => return Err(format!("unsupported cardano address prefix {other:?}")),
+    let hrp_is = |want: &str| hrp.eq_ignore_ascii_case(want);
+    if !(hrp_is("addr") || hrp_is("addr_test") || hrp_is("stake") || hrp_is("stake_test")) {
+        return Err(Error::UnsupportedNetwork);
     }
-    if payload.is_empty() {
-        return Err("empty cardano address payload".into());
-    }
-
-    let header = payload[0];
+    let payload = &buf[..n];
+    let header = *payload.first().ok_or(Error::InvalidLength)?;
     let typ = header >> 4;
     let net = header & 0x0f;
     if net != NET_MAINNET && net != NET_TESTNET {
-        return Err(format!("unsupported cardano network id {net}"));
+        return Err(Error::UnsupportedNetwork);
     }
 
     let want_len = match typ {
         TYPE_BASE => 1 + 28 + 28,
         TYPE_ENTERPRISE | TYPE_REWARD => 1 + 28,
-        _ => return Err(format!("unsupported cardano address type {typ}")),
+        _ => return Err(Error::UnsupportedVersion(typ)),
     };
     if payload.len() != want_len {
-        return Err(format!(
-            "invalid cardano address length {} for type {typ}",
-            payload.len()
-        ));
+        return Err(Error::InvalidLength);
     }
 
     // Cross-check that the human-readable prefix agrees with the header byte, so a
@@ -218,29 +211,32 @@ pub fn parse_cardano_address(address: &str) -> Result<Out, String> {
     // "stake"/"stake_test" must wrap a reward address; "addr"/"addr_test" must
     // wrap a payment (base/enterprise) address. The "_test" suffix must match the
     // testnet network id and its absence the mainnet id.
-    let hrp_is_stake = hrp == "stake" || hrp == "stake_test";
+    let hrp_is_stake = hrp_is("stake") || hrp_is("stake_test");
     if hrp_is_stake != (typ == TYPE_REWARD) {
-        return Err(format!(
-            "cardano address prefix {hrp:?} does not match header type {typ}"
-        ));
+        return Err(Error::NetworkMismatch);
     }
-    let want_net = if hrp.ends_with("_test") {
-        NET_TESTNET
-    } else {
-        NET_MAINNET
-    };
-    if net != want_net {
-        return Err(format!(
-            "cardano address prefix {hrp:?} does not match header network id {net}"
-        ));
+    let hrp_is_test = hrp_is("addr_test") || hrp_is("stake_test");
+    if (net == NET_TESTNET) != hrp_is_test {
+        return Err(Error::NetworkMismatch);
     }
 
-    let flag = if net == NET_TESTNET {
-        "cardano-testnet"
+    let flags: &'static [&'static str] = if net == NET_TESTNET {
+        &["cardano-testnet"]
     } else {
-        "cardano"
+        &["cardano"]
     };
-    Ok(Out::make("cardano", payload, &[flag]))
+    Ok(DecodedAddress::new("cardano", &[payload], flags))
+}
+
+/// Parses a Bech32-encoded Cardano Shelley address (`addr…`, `addr_test…`,
+/// `stake…`, `stake_test…`) and returns the corresponding [`Out`]. The raw
+/// payload (header byte followed by credentials) is preserved so the address can
+/// be re-encoded via [`Out::address`].
+#[cfg(feature = "alloc")]
+pub fn parse_cardano_address(address: &str) -> Result<Out, String> {
+    decode_cardano_address(address)
+        .map(Out::from)
+        .map_err(|e| format!("failed to parse cardano address: {e}"))
 }
 
 #[cfg(feature = "alloc")]

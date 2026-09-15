@@ -23,8 +23,9 @@
 //! - [`hash`], [`crypto`] (secp256k1 ECDSA/Schnorr/taproot, Ed25519) and
 //!   [`cardano_derive`] (BIP32-Ed25519 keys);
 //! - output-script generation for every built-in format
-//!   ([`generate_script`]) and address rendering
-//!   ([`encode_address_to_slice`], plus the [`cardano`] address builders);
+//!   ([`generate_script`]), address rendering
+//!   ([`encode_address_to_slice`], plus the [`cardano`] address builders) and
+//!   address decoding ([`decode_bitcoin_based_address`] and friends);
 //! - caller-buffer codecs: [`base58`], [`bech32`] (segwit, CashAddr and generic
 //!   bech32), [`eip55_to_slice`], [`encode_base58_addr_to_slice`],
 //!   [`pushbytes`] and [`BtcVarInt`].
@@ -52,9 +53,11 @@ pub mod cardano_derive;
 pub mod crypto;
 pub mod hash;
 pub mod inline;
+pub mod massa;
 pub mod pubkey;
 pub mod pushbytes;
 pub mod script;
+pub mod solana_addr;
 
 #[cfg(feature = "alloc")]
 pub mod btcguess;
@@ -73,8 +76,6 @@ pub mod evmtx;
 #[cfg(feature = "alloc")]
 pub mod insertable;
 #[cfg(feature = "alloc")]
-pub mod massa;
-#[cfg(feature = "alloc")]
 pub mod out;
 #[cfg(feature = "alloc")]
 pub mod reward;
@@ -82,23 +83,27 @@ pub mod reward;
 pub mod rlp;
 #[cfg(feature = "alloc")]
 pub mod solana;
-#[cfg(feature = "alloc")]
-pub mod solana_addr;
 
 mod btcamount;
 mod btcvarint;
 
-pub use address::{eip55_to_slice, encode_address_to_slice, encode_base58_addr_to_slice};
+pub use address::{
+    DecodedAddress, decode_bitcoin_based_address, decode_evm_address, eip55_to_slice,
+    encode_address_to_slice, encode_base58_addr_to_slice,
+};
 pub use btcamount::BtcAmount;
 pub use btcvarint::BtcVarInt;
+pub use cardano::decode_cardano_address;
 pub use cardano_derive::{
     CARDANO_HARDENED, CardanoExtendedKey, CardanoExtendedPubKey, cardano_harden,
     cardano_icarus_master_key,
 };
 pub use inline::InlineBytes;
+pub use massa::decode_massa_address;
 pub use pubkey::PubKey;
 pub use pushbytes::{parse_push_bytes, push_bytes_to_slice};
 pub use script::{ALL_FORMATS, ScriptBytes, formats_per_network, generate_script};
+pub use solana_addr::decode_solana_address;
 
 #[cfg(feature = "alloc")]
 pub use address::{eip55, encode_base58_addr, parse_bitcoin_based_address, parse_evm_address};

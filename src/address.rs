@@ -7,13 +7,12 @@ use crate::base58;
 use crate::bech32;
 use crate::hash::{dsha256, keccak256_once, sha256_once};
 use crate::pushbytes::parse_push_bytes;
+use crate::script::ScriptBytes;
 
 #[cfg(feature = "alloc")]
 use crate::out::Out;
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
-#[cfg(feature = "alloc")]
-use crate::pushbytes::push_bytes;
 
 /// Errors from heap-free address encoding and decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +30,15 @@ pub enum Error {
     BufferTooSmall,
     /// A bech32/CashAddr encoding error.
     Bech32(bech32::Error),
+    /// The string is not a recognized address encoding.
+    InvalidAddress,
+    /// The address checksum does not verify.
+    BadChecksum,
+    /// The address belongs to a different network than the one requested.
+    NetworkMismatch,
+    /// The base58 version byte, witness version or address type is not
+    /// supported.
+    UnsupportedVersion(u8),
 }
 
 impl core::fmt::Display for Error {
@@ -42,6 +50,10 @@ impl core::fmt::Display for Error {
             Error::InvalidLength => f.write_str("invalid address payload length"),
             Error::BufferTooSmall => f.write_str("address output buffer too small"),
             Error::Bech32(e) => e.fmt(f),
+            Error::InvalidAddress => f.write_str("unsupported or malformed address"),
+            Error::BadChecksum => f.write_str("bad address checksum"),
+            Error::NetworkMismatch => f.write_str("address is for a different network"),
+            Error::UnsupportedVersion(v) => write!(f, "unsupported address version {v:#x}"),
         }
     }
 }
@@ -245,50 +257,117 @@ pub fn encode_base58_addr(version: u8, buf: &[u8]) -> String {
     String::from_utf8(out).expect("base58 output is ASCII")
 }
 
-#[cfg(feature = "alloc")]
-/// Parses an EVM (`0x...`) address.
-pub fn parse_evm_address(address: &str) -> Result<Out, String> {
-    if address.len() != 42 || !address.starts_with("0x") {
-        return Err("EVM addresses must be 42 characters long and start with 0x".into());
+/// An address decoded without allocating: the output script it pays to, its
+/// format name and the networks it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedAddress {
+    /// Format name, e.g. "p2pkh", "p2wsh", "eth", "cardano".
+    pub format: &'static str,
+    /// The output script (for EVM, Massa, Solana and Cardano: the raw address
+    /// payload, as produced by [`generate_script`](crate::script::generate_script)).
+    pub script: ScriptBytes,
+    /// The networks the address is valid on.
+    pub networks: &'static [&'static str],
+}
+
+impl DecodedAddress {
+    pub(crate) fn new(
+        format: &'static str,
+        parts: &[&[u8]],
+        networks: &'static [&'static str],
+    ) -> Self {
+        let mut script = ScriptBytes::new();
+        for p in parts {
+            script
+                .extend_from_slice(p)
+                .expect("decoded payload fits a script buffer");
+        }
+        DecodedAddress {
+            format,
+            script,
+            networks,
+        }
     }
-    let data =
-        hex::decode(&address[2..]).map_err(|e| format!("failed to parse ethereum address: {e}"))?;
-    if address.bytes().any(|b| b.is_ascii_uppercase()) && address != eip55(&data) {
-        return Err("bad checksum on ethereum address".into());
+}
+
+#[cfg(feature = "alloc")]
+impl From<DecodedAddress> for Out {
+    fn from(a: DecodedAddress) -> Out {
+        Out::make(a.format, a.script.to_vec(), a.networks)
     }
-    Ok(Out::make("eth", data, &["evm"]))
 }
 
-#[cfg(feature = "alloc")]
-fn p2pkh_script(hash: &[u8]) -> Vec<u8> {
-    let mut s = vec![0x76, 0xa9];
-    s.extend_from_slice(&push_bytes(hash));
-    s.extend_from_slice(&[0x88, 0xac]);
-    s
+/// The single-network flag list for a known network name.
+fn network_flags(net: &str) -> &'static [&'static str] {
+    match net {
+        "bitcoin" => &["bitcoin"],
+        "bitcoin-cash" => &["bitcoin-cash"],
+        "bitcoin-testnet" => &["bitcoin-testnet"],
+        "litecoin" => &["litecoin"],
+        "namecoin" => &["namecoin"],
+        "dogecoin" => &["dogecoin"],
+        "monacoin" => &["monacoin"],
+        "electraproto" => &["electraproto"],
+        "dash" => &["dash"],
+        _ => &[],
+    }
 }
 
-#[cfg(feature = "alloc")]
-fn p2sh_script(hash: &[u8]) -> Vec<u8> {
-    let mut s = vec![0xa9];
-    s.extend_from_slice(&push_bytes(hash));
-    s.push(0x87);
-    s
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
-#[cfg(feature = "alloc")]
-/// Parses a Bitcoin-family address for the given network. The special network
-/// `"auto"` attempts to detect the network from the address.
-pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, String> {
+/// Decodes an EVM (`0x...`) address. Mixed-case addresses must carry a valid
+/// EIP-55 checksum.
+pub fn decode_evm_address(address: &str) -> Result<DecodedAddress, Error> {
+    let digits = address
+        .strip_prefix("0x")
+        .filter(|d| d.len() == 40)
+        .ok_or(Error::InvalidAddress)?
+        .as_bytes();
+    let mut addr = [0u8; 20];
+    for (i, pair) in digits.as_chunks::<2>().0.iter().enumerate() {
+        let (hi, lo) = hex_nibble(pair[0])
+            .zip(hex_nibble(pair[1]))
+            .ok_or(Error::InvalidAddress)?;
+        addr[i] = (hi << 4) | lo;
+    }
+    if address.bytes().any(|b| b.is_ascii_uppercase()) {
+        let mut checksummed = [0u8; 42];
+        eip55_to_slice(&addr, &mut checksummed);
+        if checksummed != address.as_bytes() {
+            return Err(Error::BadChecksum);
+        }
+    }
+    Ok(DecodedAddress::new("eth", &[&addr], &["evm"]))
+}
+
+fn p2pkh(hash: &[u8], networks: &'static [&'static str]) -> DecodedAddress {
+    DecodedAddress::new(
+        "p2pkh",
+        &[&[0x76, 0xa9, 0x14], hash, &[0x88, 0xac]],
+        networks,
+    )
+}
+
+fn p2sh(hash: &[u8], networks: &'static [&'static str]) -> DecodedAddress {
+    DecodedAddress::new("p2sh", &[&[0xa9, 0x14], hash, &[0x87]], networks)
+}
+
+/// Decodes a Bitcoin-family address for `network`, without allocating. The
+/// special network `"auto"` detects the network from the address.
+pub fn decode_bitcoin_based_address(network: &str, address: &str) -> Result<DecodedAddress, Error> {
     // case 1: explicit bitcoincash: prefix
     if address.starts_with("bitcoincash:") {
         if network != "bitcoin-cash" && network != "auto" {
-            return Err(format!(
-                "bitcoincash address provided while expecting a {network} address"
-            ));
+            return Err(Error::NetworkMismatch);
         }
-        let (typ, buf) = bech32::cashaddr_decode("bitcoincash:", address)
-            .map_err(|e| format!("failed to parse bitcoin cash address: {e}"))?;
-        return cashaddr_out(typ, &buf);
+        return decode_cashaddr(address);
     }
 
     // attempt segwit bech32 decode
@@ -296,7 +375,10 @@ pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, 
         && pos > 0
     {
         let hrp = &address[..pos];
-        if let Ok((typ, buf)) = bech32::segwit_addr_decode(hrp, address) {
+        let mut program = [0u8; 40];
+        if let Ok((version, len)) = bech32::segwit_addr_decode_to_slice(hrp, address, &mut program)
+        {
+            let program = &program[..len];
             let net = match hrp {
                 "ltc" => "litecoin",
                 "nc" => "namecoin",
@@ -304,158 +386,138 @@ pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, 
                 "tb" => "bitcoin-testnet",
                 "mona" => "monacoin",
                 "ep" => "electraproto",
-                _ => return Err(format!("unsupported hrp value {hrp}")),
+                _ => return Err(Error::UnsupportedNetwork),
             };
             if net != network && network != "auto" {
-                return Err(format!(
-                    "got a {net} address where we expected a {network} address"
+                return Err(Error::NetworkMismatch);
+            }
+            let flags = network_flags(net);
+            if version == 1 && (net == "bitcoin" || net == "bitcoin-testnet") && len == 32 {
+                return Ok(DecodedAddress::new(
+                    "p2tr",
+                    &[&[0x51, 0x20], program],
+                    flags,
                 ));
             }
-            if typ == 1 && (net == "bitcoin" || net == "bitcoin-testnet") && buf.len() == 32 {
-                let mut script = vec![0x51];
-                script.extend_from_slice(&push_bytes(&buf));
-                return Ok(Out::make("p2tr", script, &[net]));
-            }
-            if typ != 0 {
-                return Err(format!("unsupported segwit type {typ}"));
-            }
-            let mut script = vec![0x00];
-            script.extend_from_slice(&push_bytes(&buf));
-            return match buf.len() {
-                20 => Ok(Out::make("p2wpkh", script, &[net])),
-                32 => Ok(Out::make("p2wsh", script, &[net])),
-                n => Err(format!("invalid segwit address length {n}")),
+            return match (version, len) {
+                (0, 20) => Ok(DecodedAddress::new(
+                    "p2wpkh",
+                    &[&[0x00, 0x14], program],
+                    flags,
+                )),
+                (0, 32) => Ok(DecodedAddress::new(
+                    "p2wsh",
+                    &[&[0x00, 0x20], program],
+                    flags,
+                )),
+                (0, _) => Err(Error::InvalidLength),
+                (v, _) => Err(Error::UnsupportedVersion(v)),
             };
         }
     }
 
     // base58check
-    if let Ok(mut buf) = base58::decode(address)
-        && buf.len() >= 5
+    let mut buf = [0u8; 64];
+    if let Ok(n) = base58::decode_to_slice(address, &mut buf)
+        && n >= 5
     {
-        let chk_start = buf.len() - 4;
-        let chk = buf[chk_start..].to_vec();
-        buf.truncate(chk_start);
-        let h = dsha256(&buf);
-        if h[..4] == chk[..] {
+        let (payload, chk) = buf[..n].split_at(n - 4);
+        if dsha256(payload)[..4] == *chk {
             // a standard P2PKH/P2SH payload is exactly 1 version byte + a 20-byte
             // hash; reject anything else rather than emit a non-standard script.
-            if buf.len() != 21 {
-                return Err(format!(
-                    "invalid base58 address payload length {}",
-                    buf.len()
-                ));
+            if payload.len() != 21 {
+                return Err(Error::InvalidLength);
             }
-            return parse_base58_versioned(network, &buf);
+            return decode_base58_versioned(network, payload[0], &payload[1..]);
         }
     }
 
     // bitcoincash: addr missing its prefix
     if (network == "auto" || network == "bitcoin-cash")
-        && let Ok((typ, buf)) =
-            bech32::cashaddr_decode("bitcoincash:", &format!("bitcoincash:{address}"))
+        && let Ok(a) = decode_cashaddr(address)
     {
-        return cashaddr_out(typ, &buf);
+        return Ok(a);
     }
 
-    Err(format!("unsupported address {address}"))
+    Err(Error::InvalidAddress)
 }
 
-#[cfg(feature = "alloc")]
-fn cashaddr_out(typ: u8, buf: &[u8]) -> Result<Out, String> {
+fn decode_cashaddr(address: &str) -> Result<DecodedAddress, Error> {
+    let mut hash = [0u8; 64];
+    let (typ, len) = bech32::cashaddr_decode_to_slice("bitcoincash:", address, &mut hash)?;
+    // only the 20-byte P2PKH/P2SH forms have an output script here
+    if len != 20 {
+        return Err(Error::InvalidLength);
+    }
     match typ {
-        0 => Ok(Out::make("p2pkh", p2pkh_script(buf), &["bitcoin-cash"])),
-        1 => Ok(Out::make("p2sh", p2sh_script(buf), &["bitcoin-cash"])),
-        n => Err(format!("unsupported bitcoincash address type {n}")),
+        0 => Ok(p2pkh(&hash[..20], &["bitcoin-cash"])),
+        1 => Ok(p2sh(&hash[..20], &["bitcoin-cash"])),
+        n => Err(Error::UnsupportedVersion(n)),
     }
 }
 
-#[cfg(feature = "alloc")]
-fn parse_base58_versioned(network: &str, buf: &[u8]) -> Result<Out, String> {
-    let version = buf[0];
-    let payload = &buf[1..];
-    let pkh = |net: &str| Out::make("p2pkh", p2pkh_script(payload), &[net]);
-    let psh = |net: &str| Out::make("p2sh", p2sh_script(payload), &[net]);
-    // For auto, also attach multiple flags.
-    let pkh_multi = |nets: &[&str]| Out::make("p2pkh", p2pkh_script(payload), nets);
-    let psh_multi = |nets: &[&str]| Out::make("p2sh", p2sh_script(payload), nets);
-
-    match network {
-        "auto" => match version {
-            0x00 => Ok(pkh_multi(&["bitcoin", "bitcoin-cash"])),
-            0x05 => Ok(psh_multi(&["bitcoin", "bitcoin-cash"])),
-            0x0d => Ok(psh("namecoin")),
-            0x10 => Ok(psh("dash")),
-            0x16 => Ok(psh("dogecoin")),
-            0x1e => Ok(pkh("dogecoin")),
-            0x30 => Ok(pkh("litecoin")),
-            0x32 => Ok(psh("litecoin")),
-            0x34 => Ok(pkh("namecoin")),
-            0x37 => Ok(psh("monacoin")),
-            0x4c => Ok(pkh("dash")),
-            0x6f => Ok(pkh("bitcoin-testnet")),
-            0x89 => Ok(psh("electraproto")),
-            0xc4 => Ok(psh("bitcoin-testnet")),
-            v => Err(format!("unsupported base58 address version={v:x}")),
-        },
-        "bitcoin" | "bitcoin-cash" => match version {
-            0x00 => Ok(pkh(network)),
-            0x05 => Ok(psh(network)),
-            v => Err(format!(
-                "unsupported {network} base58 address version={v:x}"
-            )),
-        },
-        "bitcoin-testnet" => match version {
-            0x6f => Ok(pkh(network)),
-            0xc4 => Ok(psh(network)),
-            v => Err(format!(
-                "unsupported {network} base58 address version={v:x}"
-            )),
-        },
-        "litecoin" => match version {
-            0x30 => Ok(pkh("litecoin")),
-            0x32 => Ok(psh("litecoin")),
-            v => Err(format!(
-                "unsupported {network} base58 address version={v:x}"
-            )),
-        },
-        "namecoin" => match version {
-            0x34 => Ok(pkh("namecoin")),
-            0x0d => Ok(psh("namecoin")),
-            v => Err(format!(
-                "unsupported {network} base58 address version={v:x}"
-            )),
-        },
-        "dogecoin" => match version {
-            0x16 => Ok(psh("dogecoin")),
-            0x1e => Ok(pkh("dogecoin")),
-            v => Err(format!(
-                "unsupported {network} base58 address version={v:x}"
-            )),
-        },
-        "monacoin" => match version {
-            0x32 => Ok(pkh("monacoin")),
-            0x37 => Ok(psh("monacoin")),
-            v => Err(format!(
-                "unsupported {network} base58 address version={v:x}"
-            )),
-        },
-        "electraproto" => match version {
-            0x37 => Ok(pkh("electraproto")),
-            0x89 => Ok(psh("electraproto")),
-            v => Err(format!(
-                "unsupported {network} base58 address version={v:x}"
-            )),
-        },
-        "dash" => match version {
-            0x4c => Ok(pkh("dash")),
-            0x10 => Ok(psh("dash")),
-            v => Err(format!(
-                "unsupported {network} base58 address version={v:x}"
-            )),
-        },
-        _ => Err(format!("unsupported {network} network for address parsing")),
+fn decode_base58_versioned(
+    network: &str,
+    version: u8,
+    hash: &[u8],
+) -> Result<DecodedAddress, Error> {
+    if network == "auto" {
+        return match version {
+            0x00 => Ok(p2pkh(hash, &["bitcoin", "bitcoin-cash"])),
+            0x05 => Ok(p2sh(hash, &["bitcoin", "bitcoin-cash"])),
+            0x0d => Ok(p2sh(hash, &["namecoin"])),
+            0x10 => Ok(p2sh(hash, &["dash"])),
+            0x16 => Ok(p2sh(hash, &["dogecoin"])),
+            0x1e => Ok(p2pkh(hash, &["dogecoin"])),
+            0x30 => Ok(p2pkh(hash, &["litecoin"])),
+            0x32 => Ok(p2sh(hash, &["litecoin"])),
+            0x34 => Ok(p2pkh(hash, &["namecoin"])),
+            0x37 => Ok(p2sh(hash, &["monacoin"])),
+            0x4c => Ok(p2pkh(hash, &["dash"])),
+            0x6f => Ok(p2pkh(hash, &["bitcoin-testnet"])),
+            0x89 => Ok(p2sh(hash, &["electraproto"])),
+            0xc4 => Ok(p2sh(hash, &["bitcoin-testnet"])),
+            v => Err(Error::UnsupportedVersion(v)),
+        };
     }
+    // bitcoin-cash legacy addresses share bitcoin's versions
+    let lookup = if network == "bitcoin-cash" {
+        "bitcoin"
+    } else {
+        network
+    };
+    let (pkh, sh) = base58_versions(lookup).ok_or(Error::UnsupportedNetwork)?;
+    let flags = network_flags(network);
+    match version {
+        v if v == pkh => Ok(p2pkh(hash, flags)),
+        v if v == sh => Ok(p2sh(hash, flags)),
+        v => Err(Error::UnsupportedVersion(v)),
+    }
+}
+
+/// Parses an EVM (`0x...`) address.
+#[cfg(feature = "alloc")]
+pub fn parse_evm_address(address: &str) -> Result<Out, String> {
+    decode_evm_address(address)
+        .map(Out::from)
+        .map_err(|e| format!("failed to parse ethereum address: {e}"))
+}
+
+/// Parses a Bitcoin-family address for the given network. The special network
+/// `"auto"` attempts to detect the network from the address.
+#[cfg(feature = "alloc")]
+pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, String> {
+    decode_bitcoin_based_address(network, address)
+        .map(Out::from)
+        .map_err(|e| match e {
+            Error::NetworkMismatch => {
+                format!("{address} is not a {network} address")
+            }
+            Error::UnsupportedNetwork => {
+                format!("unsupported network {network:?} for address {address}")
+            }
+            e => format!("failed to parse address {address}: {e}"),
+        })
 }
 
 #[cfg(feature = "alloc")]
