@@ -1,16 +1,56 @@
 //! EVM ABI encoding (port of `evmabi.go`).
+//!
+//! The fixed-size helpers ([`function_selector`], [`address_word`],
+//! [`uint_word`], [`erc20_transfer_calldata`]) never allocate; the dynamic
+//! `AbiBuffer` encoder needs `alloc`.
 
+#[cfg(feature = "alloc")]
 use crate::prelude::*;
 
+#[cfg(feature = "alloc")]
 use num_bigint::{BigInt, Sign};
 
 use crate::hash::keccak256_once;
+#[cfg(feature = "alloc")]
 use crate::out::Out;
 
+/// Returns the 4-byte function selector for a signature such as
+/// `"transfer(address,uint256)"`: the first 4 bytes of its keccak-256 hash.
+pub fn function_selector(signature: &str) -> [u8; 4] {
+    let h = keccak256_once(signature.as_bytes());
+    [h[0], h[1], h[2], h[3]]
+}
+
+/// Encodes a 20-byte address as a 32-byte ABI word (left-padded with zeros).
+pub fn address_word(addr: &[u8; 20]) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[12..].copy_from_slice(addr);
+    w
+}
+
+/// Encodes an unsigned integer as a 32-byte big-endian ABI word.
+pub fn uint_word(v: u128) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[16..].copy_from_slice(&v.to_be_bytes());
+    w
+}
+
+/// Builds ERC-20 `transfer(address,uint256)` calldata for sending `amount` (a
+/// 32-byte big-endian uint256, e.g. from [`uint_word`]) to `to`.
+pub fn erc20_transfer_calldata(to: &[u8; 20], amount: &[u8; 32]) -> [u8; 68] {
+    let mut out = [0u8; 68];
+    out[..4].copy_from_slice(&function_selector("transfer(address,uint256)"));
+    out[4..36].copy_from_slice(&address_word(to));
+    out[36..].copy_from_slice(amount);
+    out
+}
+
+#[cfg(feature = "alloc")]
 fn two_pow_256() -> BigInt {
     BigInt::from(1) << 256
 }
 
+#[cfg(feature = "alloc")]
 /// A value that can be ABI-encoded.
 ///
 /// Non-exhaustive: more ABI value kinds (fixed bytes, arrays, tuples, …) may be
@@ -34,11 +74,13 @@ pub enum AbiValue {
     Out(Out),
 }
 
+#[cfg(feature = "alloc")]
 struct AbiString {
     offset: usize,
     data: Vec<u8>,
 }
 
+#[cfg(feature = "alloc")]
 /// A builder for EVM ABI-encoded data.
 #[derive(Default)]
 pub struct AbiBuffer {
@@ -46,6 +88,7 @@ pub struct AbiBuffer {
     str: Vec<AbiString>,
 }
 
+#[cfg(feature = "alloc")]
 impl AbiBuffer {
     /// Creates a new buffer seeded with `buf`.
     pub fn new(buf: Vec<u8>) -> AbiBuffer {
@@ -230,13 +273,13 @@ impl AbiBuffer {
 
     /// Returns the ABI-encoded method call (4-byte selector + encoded args).
     pub fn call(&self, method: &str) -> Vec<u8> {
-        let hash = keccak256_once(method.as_bytes());
-        let mut out = hash[..4].to_vec();
+        let mut out = function_selector(method).to_vec();
         out.extend_from_slice(&self.bytes());
         out
     }
 }
 
+#[cfg(feature = "alloc")]
 /// Generates calldata for an EVM call, performing no validation that the
 /// parameters match the ABI signature.
 pub fn evm_call(method: &str, params: &[AbiValue]) -> Result<Vec<u8>, String> {
@@ -248,8 +291,24 @@ pub fn evm_call(method: &str, params: &[AbiValue]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "alloc")]
     use crate::address::parse_evm_address;
 
+    #[test]
+    fn erc20_transfer_fixed() {
+        let mut to = [0u8; 20];
+        hex::decode_to_slice("5fb84129ad9e7818f099966de975ff41213f028d", &mut to).unwrap();
+        let data = erc20_transfer_calldata(&to, &uint_word(123456789123456789));
+        let mut want = [0u8; 68];
+        hex::decode_to_slice(
+            "a9059cbb0000000000000000000000005fb84129ad9e7818f099966de975ff41213f028d00000000000000000000000000000000000000000000000001b69b4bacd05f15",
+            &mut want,
+        )
+        .unwrap();
+        assert_eq!(data, want);
+    }
+
+    #[cfg(feature = "alloc")]
     #[test]
     fn transfer_encode_auto() {
         let mut buf = AbiBuffer::default();
@@ -266,6 +325,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn address_abi_type_encodes() {
         // The "address" ABI type must be usable via encode_abi (the evm_call path),
@@ -304,6 +364,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn negative_two_complement() {
         // -1 must encode as the all-ones 32-byte word, not be rejected.
@@ -312,6 +373,7 @@ mod tests {
         assert_eq!(hex::encode(buf.bytes()), "f".repeat(64));
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn cast_vote_with_reason() {
         let call = evm_call(

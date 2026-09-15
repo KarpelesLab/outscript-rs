@@ -139,7 +139,6 @@ pub fn decode(input: &str) -> Result<Vec<u8>, Error> {
 
 /// Decodes a base58 string that must represent exactly 32 bytes, at compile
 /// time. Panics (a compile error in const context) on invalid input.
-#[cfg(feature = "alloc")]
 pub(crate) const fn decode_32_const(input: &str) -> [u8; 32] {
     let bytes = input.as_bytes();
     let mut zeros = 0;
@@ -245,7 +244,6 @@ mod tests {
         assert_eq!(decode("StV1DL6CwTryKyV").unwrap(), b"hello world");
     }
 
-    #[cfg(feature = "alloc")]
     #[test]
     fn const_decode_matches_runtime() {
         for s in [
@@ -253,7 +251,9 @@ mod tests {
             "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
             "SysvarRecentB1ockHashes11111111111111111111",
         ] {
-            assert_eq!(decode_32_const(s)[..], decode(s).unwrap()[..]);
+            let mut buf = [0u8; 32];
+            assert_eq!(decode_to_slice(s, &mut buf), Ok(32));
+            assert_eq!(decode_32_const(s), buf);
         }
     }
 

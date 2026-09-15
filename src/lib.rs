@@ -26,6 +26,9 @@
 //!   ([`generate_script`]), address rendering
 //!   ([`encode_address_to_slice`], plus the [`cardano`] address builders) and
 //!   address decoding ([`decode_bitcoin_based_address`] and friends);
+//! - [`solana`] keys, program-derived addresses and compact-u16; [`evmabi`]
+//!   selectors, words and ERC-20 calldata; [`BtcAmount`] parsing/formatting;
+//!   [`btcguess`] script heuristics;
 //! - caller-buffer codecs: [`base58`], [`bech32`] (segwit, CashAddr and generic
 //!   bech32), [`eip55_to_slice`], [`encode_base58_addr_to_slice`],
 //!   [`pushbytes`] and [`BtcVarInt`].
@@ -48,19 +51,20 @@ mod prelude {
 pub mod address;
 pub mod base58;
 pub mod bech32;
+pub mod btcguess;
 pub mod cardano;
 pub mod cardano_derive;
 pub mod crypto;
+pub mod evmabi;
 pub mod hash;
 pub mod inline;
 pub mod massa;
 pub mod pubkey;
 pub mod pushbytes;
 pub mod script;
+pub mod solana;
 pub mod solana_addr;
 
-#[cfg(feature = "alloc")]
-pub mod btcguess;
 #[cfg(feature = "alloc")]
 pub mod btctx;
 #[cfg(feature = "alloc")]
@@ -69,8 +73,6 @@ pub mod btctxparse;
 pub mod cardanotx;
 #[cfg(feature = "alloc")]
 pub mod cbor;
-#[cfg(feature = "alloc")]
-pub mod evmabi;
 #[cfg(feature = "alloc")]
 pub mod evmtx;
 #[cfg(feature = "alloc")]
@@ -81,8 +83,6 @@ pub mod out;
 pub mod reward;
 #[cfg(feature = "alloc")]
 pub mod rlp;
-#[cfg(feature = "alloc")]
-pub mod solana;
 
 mod btcamount;
 mod btcvarint;
@@ -91,7 +91,8 @@ pub use address::{
     DecodedAddress, decode_bitcoin_based_address, decode_evm_address, eip55_to_slice,
     encode_address_to_slice, encode_base58_addr_to_slice,
 };
-pub use btcamount::BtcAmount;
+pub use btcamount::{AmountError, BtcAmount};
+pub use btcguess::{ScriptGuess, guess_in_script, guess_out_script};
 pub use btcvarint::BtcVarInt;
 pub use cardano::decode_cardano_address;
 pub use cardano_derive::{
