@@ -52,6 +52,7 @@ pub mod address;
 pub mod base58;
 pub mod bech32;
 pub mod btcguess;
+pub mod btcraw;
 pub mod cardano;
 pub mod cardano_derive;
 pub mod crypto;
@@ -86,6 +87,7 @@ pub mod rlp;
 
 mod btcamount;
 mod btcvarint;
+mod sink;
 
 pub use address::{
     DecodedAddress, decode_bitcoin_based_address, decode_evm_address, eip55_to_slice,

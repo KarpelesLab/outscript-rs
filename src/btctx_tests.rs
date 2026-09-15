@@ -465,3 +465,51 @@ fn read_from_matches_from_bytes() {
     let err = BtcTx::default().read_from(&mut &raw[..10]).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
 }
+
+/// The heap-free `RawTx` view must serialize and hash exactly like `BtcTx`,
+/// with and without witness data.
+#[test]
+fn raw_tx_matches_btctx() {
+    use crate::btcraw::{RawTx, RawTxIn, RawTxOut};
+
+    let witness_tx = "0100000000010213206299feb17742091c3cb2ab45faa3aa87922d3c030cafb3f798850a2722bf0000000000feffffffa12f2424b9599898a1d30f06e1ce55eba7fabfeee82ae9356f07375806632ff3010000006b483045022100fcc8cf3014248e1a0d6dcddf03e80f7e591605ad0dbace27d2c0d87274f8cd66022053fcfff64f35f22a14deb657ac57f110084fb07bb917c3b42e7d033c54c7717b012102b9e4dcc33c9cc9cb5f42b96dddb3b475b067f3e21125f79e10c853e5ca8fba31feffffff02206f9800000000001976a9144841b9874d913c430048c78a7b18baebdbea440588ac8096980000000000160014e4873ef43eac347471dd94bc899c51b395a509a502483045022100dd8250f8b5c2035d8feefae530b10862a63030590a851183cb61b3672eb4f26e022057fe7bc8593f05416c185d829b574290fb8706423451ebd0a0ae50c276b87b43012102179862f40b85fa43487500f1d6b13c864b5eb0a83999738db0f7a6b91b2ec64f00db080000";
+    for hex_tx in [witness_tx, BIP143_TX] {
+        let tx = parse(hex_tx);
+        let witnesses: Vec<Vec<&[u8]>> = tx
+            .inputs
+            .iter()
+            .map(|i| i.witnesses.iter().map(Vec::as_slice).collect())
+            .collect();
+        let inputs: Vec<RawTxIn> = tx
+            .inputs
+            .iter()
+            .zip(&witnesses)
+            .map(|(i, w)| RawTxIn {
+                txid: i.txid,
+                vout: i.vout,
+                script_sig: &i.script,
+                sequence: i.sequence,
+                witness: w,
+            })
+            .collect();
+        let outputs: Vec<RawTxOut> = tx
+            .outputs
+            .iter()
+            .map(|o| RawTxOut {
+                amount: o.amount.0,
+                script: &o.script,
+            })
+            .collect();
+        let raw = RawTx {
+            version: tx.version,
+            inputs: &inputs,
+            outputs: &outputs,
+            locktime: tx.locktime,
+        };
+        let mut buf = vec![0u8; raw.serialized_len()];
+        assert_eq!(raw.serialize_to_slice(&mut buf), Ok(buf.len()));
+        assert_eq!(buf, tx.bytes());
+        assert_eq!(hex::encode(&buf), hex_tx);
+        assert_eq!(raw.txid(), tx.hash());
+    }
+}

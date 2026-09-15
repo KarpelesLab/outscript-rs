@@ -7,7 +7,7 @@ use crate::btcamount::BtcAmount;
 use crate::btctx::BtcTx;
 use crate::crypto::secp256k1::SecpPublicKey;
 use crate::hash::hash160;
-use crate::pushbytes::{parse_push_bytes, push_bytes};
+use crate::pushbytes::parse_push_bytes;
 
 /// Parsed signature data for a single recognized spend.
 #[derive(Debug, Clone, Default)]
@@ -320,29 +320,22 @@ impl BtcTx {
             ));
         }
         match sig.scheme.as_str() {
-            "p2pkh" => Ok(self.legacy_sighash(n, prev_script, sig.sighash_flag)),
+            "p2pkh" => self.legacy_sighash(n, prev_script, sig.sighash_flag),
             "p2sh-multisig" => {
                 if sig.redeem_script.is_empty() {
                     return Err("p2sh-multisig requires RedeemScript".into());
                 }
-                Ok(self.legacy_sighash(n, &sig.redeem_script, sig.sighash_flag))
+                self.legacy_sighash(n, &sig.redeem_script, sig.sighash_flag)
             }
             "p2wpkh" => {
-                let (pfx, sfx) = self.preimage();
                 let pk_hash = hash160(&sig.pubkey);
-                let mut script_code = vec![0x76, 0xa9];
-                script_code.extend_from_slice(&push_bytes(&pk_hash));
-                script_code.extend_from_slice(&[0x88, 0xac]);
-                let (input, input_seq) = self.inputs[n].preimage_bytes();
-                let mut s = Vec::new();
-                s.extend_from_slice(&pfx);
-                s.extend_from_slice(&input);
-                s.extend_from_slice(&push_bytes(&script_code));
-                s.extend_from_slice(&amount.0.to_le_bytes());
-                s.extend_from_slice(&input_seq);
-                s.extend_from_slice(&sfx);
-                s.extend_from_slice(&sig.sighash_flag.to_le_bytes());
-                Ok(crate::hash::dsha256(&s))
+                let script_code = crate::btctx::p2pkh_script_code(&pk_hash);
+                Ok(self.segwit_v0_midstate().sighash(
+                    &self.inputs[n].raw(),
+                    &script_code,
+                    amount.0,
+                    sig.sighash_flag,
+                ))
             }
             other => Err(format!("unsupported scheme: {other}")),
         }
@@ -370,12 +363,14 @@ impl BtcTx {
         let amounts_u: Vec<u64> = amounts.iter().map(|a| a.0).collect();
         let parts = self.taproot_sighash_parts_raw(prev_scripts, &amounts_u)?;
         match sig.scheme.as_str() {
-            "p2tr-keypath" => Ok(self.taproot_key_spend_sighash(n, 0x00, &parts)),
+            "p2tr-keypath" => parts.key_spend_sighash(n).map_err(|e| e.to_string()),
             "p2tr-scriptpath" => {
                 if sig.leaf_script.is_empty() {
                     return Err("p2tr-scriptpath requires LeafScript".into());
                 }
-                Ok(self.taproot_script_path_sighash(n, &parts, &sig.leaf_script))
+                parts
+                    .script_path_sighash(n, &sig.leaf_script)
+                    .map_err(|e| e.to_string())
             }
             other => Err(format!("not a taproot scheme: {other}")),
         }

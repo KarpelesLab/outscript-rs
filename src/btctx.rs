@@ -13,8 +13,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::address::parse_bitcoin_based_address;
 use crate::btcamount::BtcAmount;
+use crate::btcraw::{PrevOut, RawTx, RawTxIn, RawTxOut, SegwitV0Midstate, TaprootMidstate};
 use crate::btcvarint::BtcVarInt;
-use crate::crypto::secp256k1::{SecpPublicKey, tagged_hash};
+use crate::crypto::secp256k1::SecpPublicKey;
 use crate::hash::{dsha256, hash160, sha256_once};
 use crate::pubkey::PubKey;
 use crate::pushbytes::push_bytes;
@@ -143,8 +144,7 @@ impl BtcTx {
             return Err("Sign requires as many keys as there are inputs".into());
         }
 
-        let wtx = self.clone();
-        let mut preimage: Option<(Vec<u8>, Vec<u8>)> = None;
+        let mut midstate: Option<SegwitV0Midstate> = None;
         let mut taproot_parts: Option<TaprootSighashParts> = None;
 
         for (n, k) in keys.iter().enumerate() {
@@ -157,7 +157,7 @@ impl BtcTx {
             match k.scheme.as_str() {
                 "p2pk" => {
                     let script_code = signer_pubkey_script(key, "p2pk")?;
-                    let digest = self.legacy_sighash(n, &script_code, sighash);
+                    let digest = self.legacy_sighash(n, &script_code, sighash)?;
                     let mut sig = key.sign_ecdsa_der(&digest)?;
                     sig.push((sighash & 0xff) as u8);
                     self.inputs[n].script = push_bytes(&sig);
@@ -165,12 +165,12 @@ impl BtcTx {
                 "p2pkh" | "p2pukh" => {
                     if sighash & 0x40 == 0x40 {
                         // bitcoin-cash forkid: same preimage as segwit
-                        let (pfx, sfx) = preimage.get_or_insert_with(|| wtx.preimage()).clone();
-                        self.p2wpkh_sign(n, k, sighash, &pfx, &sfx)?;
+                        let mid = *midstate.get_or_insert_with(|| self.segwit_v0_midstate());
+                        self.p2wpkh_sign(n, k, sighash, &mid)?;
                         continue;
                     }
                     let script_code = signer_pubkey_script(key, &k.scheme)?;
-                    let digest = self.legacy_sighash(n, &script_code, sighash);
+                    let digest = self.legacy_sighash(n, &script_code, sighash)?;
                     let mut sig = key.sign_ecdsa_der(&digest)?;
                     sig.push((sighash & 0xff) as u8);
                     let pubkey = if k.scheme == "p2pkh" {
@@ -183,12 +183,12 @@ impl BtcTx {
                     self.inputs[n].script = script;
                 }
                 "p2wpkh" | "p2sh:p2wpkh" => {
-                    let (pfx, sfx) = preimage.get_or_insert_with(|| wtx.preimage()).clone();
-                    self.p2wpkh_sign(n, k, sighash, &pfx, &sfx)?;
+                    let mid = *midstate.get_or_insert_with(|| self.segwit_v0_midstate());
+                    self.p2wpkh_sign(n, k, sighash, &mid)?;
                 }
                 "p2wsh" | "p2wsh:p2pk" | "p2wsh:p2puk" | "p2wsh:p2pkh" | "p2wsh:p2pukh" => {
-                    let (pfx, sfx) = preimage.get_or_insert_with(|| wtx.preimage()).clone();
-                    self.p2wsh_sign(n, k, sighash, &pfx, &sfx)?;
+                    let mid = *midstate.get_or_insert_with(|| self.segwit_v0_midstate());
+                    self.p2wsh_sign(n, k, sighash, &mid)?;
                 }
                 "p2tr" => {
                     if taproot_parts.is_none() {
@@ -208,8 +208,7 @@ impl BtcTx {
         n: usize,
         k: &BtcTxSign,
         sighash: u32,
-        pfx: &[u8],
-        sfx: &[u8],
+        mid: &SegwitV0Midstate,
     ) -> Result<(), String> {
         let key = k.key.ok_or("signing requires a key")?;
         let pubkey = if k.scheme == "p2pukh" {
@@ -217,22 +216,9 @@ impl BtcTx {
         } else {
             signer_pubkey_script(key, "pubkey:comp")?
         };
-        let (input, input_seq) = self.inputs[n].preimage_bytes();
         let pk_hash = hash160(&pubkey);
-        let mut script_code = vec![0x76, 0xa9];
-        script_code.extend_from_slice(&push_bytes(&pk_hash));
-        script_code.extend_from_slice(&[0x88, 0xac]);
-        let amount = (k.amount.0).to_le_bytes();
-
-        let mut sign_string = Vec::new();
-        sign_string.extend_from_slice(pfx);
-        sign_string.extend_from_slice(&input);
-        sign_string.extend_from_slice(&push_bytes(&script_code));
-        sign_string.extend_from_slice(&amount);
-        sign_string.extend_from_slice(&input_seq);
-        sign_string.extend_from_slice(sfx);
-        sign_string.extend_from_slice(&sighash.to_le_bytes());
-        let digest = dsha256(&sign_string);
+        let script_code = p2pkh_script_code(&pk_hash);
+        let digest = mid.sighash(&self.inputs[n].raw(), &script_code, k.amount.0, sighash);
         let mut sig = key.sign_ecdsa_der(&digest)?;
         sig.push((sighash & 0xff) as u8);
 
@@ -262,8 +248,7 @@ impl BtcTx {
         n: usize,
         k: &BtcTxSign,
         sighash: u32,
-        pfx: &[u8],
-        sfx: &[u8],
+        mid: &SegwitV0Midstate,
     ) -> Result<(), String> {
         let key = k.key.ok_or("signing requires a key")?;
         let (inner_scheme, witness_script) = if k.scheme == "p2wsh" {
@@ -274,17 +259,7 @@ impl BtcTx {
             (inner, ws)
         };
 
-        let (input, input_seq) = self.inputs[n].preimage_bytes();
-        let amount = (k.amount.0).to_le_bytes();
-        let mut sign_string = Vec::new();
-        sign_string.extend_from_slice(pfx);
-        sign_string.extend_from_slice(&input);
-        sign_string.extend_from_slice(&push_bytes(&witness_script));
-        sign_string.extend_from_slice(&amount);
-        sign_string.extend_from_slice(&input_seq);
-        sign_string.extend_from_slice(sfx);
-        sign_string.extend_from_slice(&sighash.to_le_bytes());
-        let digest = dsha256(&sign_string);
+        let digest = mid.sighash(&self.inputs[n].raw(), &witness_script, k.amount.0, sighash);
         let mut sig = key.sign_ecdsa_der(&digest)?;
         sig.push((sighash & 0xff) as u8);
 
@@ -343,26 +318,29 @@ impl BtcTx {
         }
     }
 
-    /// Computes the segwit preimage prefix/suffix (BIP-143).
-    pub(crate) fn preimage(&self) -> (Vec<u8>, Vec<u8>) {
-        let mut prefix = self.version.to_le_bytes().to_vec();
-        let mut inputs_a = Vec::new();
-        let mut inputs_b = Vec::new();
-        for inp in &self.inputs {
-            let (a, b) = inp.preimage_bytes();
-            inputs_a.extend_from_slice(&a);
-            inputs_b.extend_from_slice(&b);
-        }
-        prefix.extend_from_slice(&dsha256(&inputs_a));
-        prefix.extend_from_slice(&dsha256(&inputs_b));
+    /// Runs `f` on a borrowed [`RawTx`] view of this transaction. Scripts and
+    /// witnesses are left empty: the view only serves sighash computation.
+    fn with_raw<R>(&self, f: impl FnOnce(&RawTx<'_>) -> R) -> R {
+        let inputs: Vec<RawTxIn<'_>> = self.inputs.iter().map(BtcTxInput::raw).collect();
+        let outputs: Vec<RawTxOut<'_>> = self
+            .outputs
+            .iter()
+            .map(|o| RawTxOut {
+                amount: o.amount.0,
+                script: &o.script,
+            })
+            .collect();
+        f(&RawTx {
+            version: self.version,
+            inputs: &inputs,
+            outputs: &outputs,
+            locktime: self.locktime,
+        })
+    }
 
-        let mut outputs = Vec::new();
-        for o in &self.outputs {
-            outputs.extend_from_slice(&o.bytes());
-        }
-        let mut suffix = dsha256(&outputs).to_vec();
-        suffix.extend_from_slice(&self.locktime.to_le_bytes());
-        (prefix, suffix)
+    /// The BIP-143 hashes shared by every input.
+    pub(crate) fn segwit_v0_midstate(&self) -> SegwitV0Midstate {
+        self.with_raw(|raw| raw.segwit_v0_midstate())
     }
 
     /// Serializes the transaction (including witness data if present).
@@ -553,12 +531,14 @@ impl BtcTxInput {
         buf
     }
 
-    pub(crate) fn preimage_bytes(&self) -> (Vec<u8>, Vec<u8>) {
-        let mut txid = self.txid;
-        txid.reverse();
-        let mut a = txid.to_vec();
-        a.extend_from_slice(&self.vout.to_le_bytes());
-        (a, self.sequence.to_le_bytes().to_vec())
+    /// The outpoint and sequence as a [`RawTxIn`] (without script or witness).
+    pub(crate) fn raw(&self) -> RawTxIn<'_> {
+        RawTxIn {
+            txid: self.txid,
+            vout: self.vout,
+            sequence: self.sequence,
+            ..Default::default()
+        }
     }
 
     fn read_source<S: ByteSource>(&mut self, r: &mut S, n: &mut u64) -> Result<(), ReadError> {
@@ -650,12 +630,15 @@ impl BtcTxOutput {
 // --- taproot (BIP-341) sighash ---
 
 /// Cached per-transaction BIP-341 sighash components.
-pub struct TaprootSighashParts {
-    sha_prevouts: [u8; 32],
-    sha_amounts: [u8; 32],
-    sha_scriptpubs: [u8; 32],
-    sha_sequences: [u8; 32],
-    sha_outputs: [u8; 32],
+pub type TaprootSighashParts = TaprootMidstate;
+
+/// The P2PKH script used as the BIP-143 scriptCode of a P2WPKH spend.
+pub(crate) fn p2pkh_script_code(pk_hash: &[u8; 20]) -> [u8; 25] {
+    let mut s = [0u8; 25];
+    s[..3].copy_from_slice(&[0x76, 0xa9, 0x14]);
+    s[3..23].copy_from_slice(pk_hash);
+    s[23..].copy_from_slice(&[0x88, 0xac]);
+    s
 }
 
 impl BtcTx {
@@ -666,18 +649,20 @@ impl BtcTx {
         if keys.len() != self.inputs.len() {
             return Err("taproot: keys length does not match number of inputs".into());
         }
-        let mut prev_scripts = Vec::with_capacity(keys.len());
-        let mut amounts = Vec::with_capacity(keys.len());
+        let mut prevouts = Vec::with_capacity(keys.len());
         for (i, k) in keys.iter().enumerate() {
             if k.prev_script.is_empty() {
                 return Err(format!(
                     "taproot: input {i} missing PrevScript (required when any input uses p2tr)"
                 ));
             }
-            prev_scripts.push(k.prev_script.clone());
-            amounts.push(k.amount.0);
+            prevouts.push(PrevOut {
+                amount: k.amount.0,
+                script: &k.prev_script,
+            });
         }
-        self.taproot_sighash_parts_raw(&prev_scripts, &amounts)
+        self.with_raw(|raw| raw.taproot_midstate(&prevouts))
+            .map_err(|e| format!("taproot: {e}"))
     }
 
     pub(crate) fn taproot_sighash_parts_raw(
@@ -688,105 +673,35 @@ impl BtcTx {
         if prev_scripts.len() != self.inputs.len() || amounts.len() != self.inputs.len() {
             return Err("taproot: prevScripts/amounts must match input count".into());
         }
-        let mut prev = Vec::new();
-        let mut amt = Vec::new();
-        let mut spk = Vec::new();
-        let mut seq = Vec::new();
-        for (i, inp) in self.inputs.iter().enumerate() {
-            if prev_scripts[i].is_empty() {
+        let mut prevouts = Vec::with_capacity(prev_scripts.len());
+        for (i, (script, &amount)) in prev_scripts.iter().zip(amounts).enumerate() {
+            if script.is_empty() {
                 return Err(format!("taproot: input {i} missing prev script"));
             }
-            let mut txid = inp.txid;
-            txid.reverse();
-            prev.extend_from_slice(&txid);
-            prev.extend_from_slice(&inp.vout.to_le_bytes());
-            amt.extend_from_slice(&amounts[i].to_le_bytes());
-            spk.extend_from_slice(&BtcVarInt(prev_scripts[i].len() as u64).bytes());
-            spk.extend_from_slice(&prev_scripts[i]);
-            seq.extend_from_slice(&inp.sequence.to_le_bytes());
+            prevouts.push(PrevOut { amount, script });
         }
-        let mut out = Vec::new();
-        for o in &self.outputs {
-            out.extend_from_slice(&o.amount.0.to_le_bytes());
-            out.extend_from_slice(&BtcVarInt(o.script.len() as u64).bytes());
-            out.extend_from_slice(&o.script);
-        }
-        Ok(TaprootSighashParts {
-            sha_prevouts: sha256_once(&prev),
-            sha_amounts: sha256_once(&amt),
-            sha_scriptpubs: sha256_once(&spk),
-            sha_sequences: sha256_once(&seq),
-            sha_outputs: sha256_once(&out),
-        })
-    }
-
-    pub(crate) fn taproot_key_spend_sighash(
-        &self,
-        n: usize,
-        hash_type: u8,
-        parts: &TaprootSighashParts,
-    ) -> [u8; 32] {
-        let mut buf = Vec::with_capacity(175);
-        buf.push(0x00); // epoch
-        buf.push(hash_type);
-        buf.extend_from_slice(&self.version.to_le_bytes());
-        buf.extend_from_slice(&self.locktime.to_le_bytes());
-        buf.extend_from_slice(&parts.sha_prevouts);
-        buf.extend_from_slice(&parts.sha_amounts);
-        buf.extend_from_slice(&parts.sha_scriptpubs);
-        buf.extend_from_slice(&parts.sha_sequences);
-        buf.extend_from_slice(&parts.sha_outputs);
-        buf.push(0x00); // spend_type: key-path, no annex
-        buf.extend_from_slice(&(n as u32).to_le_bytes());
-        tagged_hash("TapSighash", &[&buf])
-    }
-
-    /// BIP-342 script-path sighash for a tapscript leaf (leaf version 0xc0,
-    /// SIGHASH_DEFAULT, no annex).
-    pub(crate) fn taproot_script_path_sighash(
-        &self,
-        n: usize,
-        parts: &TaprootSighashParts,
-        leaf_script: &[u8],
-    ) -> [u8; 32] {
-        let leaf_len = BtcVarInt(leaf_script.len() as u64).bytes();
-        let tapleaf_hash = tagged_hash("TapLeaf", &[&[0xc0], &leaf_len, leaf_script]);
-
-        let mut buf = Vec::with_capacity(207);
-        buf.push(0x00); // epoch
-        buf.push(0x00); // hash type (SIGHASH_DEFAULT)
-        buf.extend_from_slice(&self.version.to_le_bytes());
-        buf.extend_from_slice(&self.locktime.to_le_bytes());
-        buf.extend_from_slice(&parts.sha_prevouts);
-        buf.extend_from_slice(&parts.sha_amounts);
-        buf.extend_from_slice(&parts.sha_scriptpubs);
-        buf.extend_from_slice(&parts.sha_sequences);
-        buf.extend_from_slice(&parts.sha_outputs);
-        buf.push(0x02); // spend_type: script-path, no annex
-        buf.extend_from_slice(&(n as u32).to_le_bytes());
-        buf.extend_from_slice(&tapleaf_hash);
-        buf.push(0x00); // key_version
-        buf.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // codesep position
-        tagged_hash("TapSighash", &[&buf])
+        self.with_raw(|raw| raw.taproot_midstate(&prevouts))
+            .map_err(|e| format!("taproot: {e}"))
     }
 
     /// Pre-segwit legacy sighash: clear inputs, substitute `script_code` at
     /// input `n`, serialize without witness, append the sighash flag (u32 LE),
     /// double-SHA256.
-    pub(crate) fn legacy_sighash(&self, n: usize, script_code: &[u8], flag: u32) -> [u8; 32] {
-        let mut w = self.clone();
-        w.clear_inputs();
-        w.inputs[n].script = script_code.to_vec();
-        let mut buf = w.export_bytes(false);
-        buf.extend_from_slice(&flag.to_le_bytes());
-        dsha256(&buf)
+    pub(crate) fn legacy_sighash(
+        &self,
+        n: usize,
+        script_code: &[u8],
+        flag: u32,
+    ) -> Result<[u8; 32], String> {
+        self.with_raw(|raw| raw.legacy_sighash(n, script_code, flag))
+            .map_err(|e| e.to_string())
     }
 
     /// Computes the BIP-341 key-path SIGHASH_DEFAULT digest for input `idx`.
     /// Each entry in `keys` must have its `prev_script` and `amount` set.
     pub fn taproot_sighash(&self, keys: &[BtcTxSign], idx: usize) -> Result<[u8; 32], String> {
         let parts = self.taproot_sighash_parts_from_keys(keys)?;
-        Ok(self.taproot_key_spend_sighash(idx, 0x00, &parts))
+        parts.key_spend_sighash(idx).map_err(|e| e.to_string())
     }
 
     fn p2tr_sign(
@@ -801,7 +716,7 @@ impl BtcTx {
                 k.sighash
             ));
         }
-        let sighash = self.taproot_key_spend_sighash(n, 0x00, parts);
+        let sighash = parts.key_spend_sighash(n).map_err(|e| e.to_string())?;
         let key = k.key.ok_or("signing requires a key")?;
         let sig = key.sign_taproot(&sighash)?;
         self.inputs[n].witnesses = vec![sig.to_vec()];
