@@ -1,8 +1,9 @@
-//! Public-key abstraction used by [`crate::script::Script`].
+//! Public-key abstraction used by [`crate::script`].
 //!
 //! A small enum over the key types outscript understands, used to extract the
 //! raw bytes for a requested public-key format.
 
+#[cfg(feature = "alloc")]
 use crate::prelude::*;
 
 use crate::crypto::secp256k1::SecpPublicKey;
@@ -20,6 +21,7 @@ pub enum PubKey {
     Ed25519([u8; 32]),
 }
 
+#[cfg(feature = "alloc")]
 impl PubKey {
     /// Returns the public-key bytes for the requested internal format name
     /// (`pubkey:comp`, `pubkey:uncomp`, `pubkey:ed25519`).

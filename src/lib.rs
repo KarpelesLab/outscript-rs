@@ -18,11 +18,16 @@
 //!   supported chain.
 //!
 //! With neither feature the crate is `no_std` and never allocates. That core
-//! offers [`hash`], [`crypto`] (secp256k1 ECDSA/Schnorr/taproot, Ed25519),
-//! [`cardano_derive`] (BIP32-Ed25519 keys), and caller-buffer codecs:
-//! [`base58`], [`bech32`] (segwit, CashAddr and generic bech32),
-//! [`eip55_to_slice`], [`encode_base58_addr_to_slice`], [`pushbytes`] and
-//! [`BtcVarInt`].
+//! offers:
+//!
+//! - [`hash`], [`crypto`] (secp256k1 ECDSA/Schnorr/taproot, Ed25519) and
+//!   [`cardano_derive`] (BIP32-Ed25519 keys);
+//! - output-script generation for every built-in format
+//!   ([`generate_script`]) and address rendering
+//!   ([`encode_address_to_slice`], plus the [`cardano`] address builders);
+//! - caller-buffer codecs: [`base58`], [`bech32`] (segwit, CashAddr and generic
+//!   bech32), [`eip55_to_slice`], [`encode_base58_addr_to_slice`],
+//!   [`pushbytes`] and [`BtcVarInt`].
 
 #![cfg_attr(not(any(feature = "std", test)), no_std)]
 
@@ -42,10 +47,14 @@ mod prelude {
 pub mod address;
 pub mod base58;
 pub mod bech32;
+pub mod cardano;
 pub mod cardano_derive;
 pub mod crypto;
 pub mod hash;
+pub mod inline;
+pub mod pubkey;
 pub mod pushbytes;
+pub mod script;
 
 #[cfg(feature = "alloc")]
 pub mod btcguess;
@@ -53,8 +62,6 @@ pub mod btcguess;
 pub mod btctx;
 #[cfg(feature = "alloc")]
 pub mod btctxparse;
-#[cfg(feature = "alloc")]
-pub mod cardano;
 #[cfg(feature = "alloc")]
 pub mod cardanotx;
 #[cfg(feature = "alloc")]
@@ -70,13 +77,9 @@ pub mod massa;
 #[cfg(feature = "alloc")]
 pub mod out;
 #[cfg(feature = "alloc")]
-pub mod pubkey;
-#[cfg(feature = "alloc")]
 pub mod reward;
 #[cfg(feature = "alloc")]
 pub mod rlp;
-#[cfg(feature = "alloc")]
-pub mod script;
 #[cfg(feature = "alloc")]
 pub mod solana;
 #[cfg(feature = "alloc")]
@@ -85,14 +88,17 @@ pub mod solana_addr;
 mod btcamount;
 mod btcvarint;
 
-pub use address::{eip55_to_slice, encode_base58_addr_to_slice};
+pub use address::{eip55_to_slice, encode_address_to_slice, encode_base58_addr_to_slice};
 pub use btcamount::BtcAmount;
 pub use btcvarint::BtcVarInt;
 pub use cardano_derive::{
     CARDANO_HARDENED, CardanoExtendedKey, CardanoExtendedPubKey, cardano_harden,
     cardano_icarus_master_key,
 };
+pub use inline::InlineBytes;
+pub use pubkey::PubKey;
 pub use pushbytes::{parse_push_bytes, push_bytes_to_slice};
+pub use script::{ALL_FORMATS, ScriptBytes, formats_per_network, generate_script};
 
 #[cfg(feature = "alloc")]
 pub use address::{eip55, encode_base58_addr, parse_bitcoin_based_address, parse_evm_address};
@@ -122,15 +128,16 @@ pub use massa::parse_massa_address;
 #[cfg(feature = "alloc")]
 pub use out::{Out, get_outs, guess_out};
 #[cfg(feature = "alloc")]
-pub use pubkey::PubKey;
-#[cfg(feature = "alloc")]
 pub use pushbytes::push_bytes;
 #[cfg(feature = "alloc")]
 pub use reward::{block_reward, cumulative_reward};
 #[cfg(feature = "alloc")]
-pub use script::{Script, format_def, formats_per_network};
+pub use script::{Script, format_def};
 #[cfg(feature = "alloc")]
 pub use solana_addr::parse_solana_address;
+
+#[cfg(test)]
+mod nostd_tests;
 
 #[cfg(all(test, feature = "alloc"))]
 mod address_tests;

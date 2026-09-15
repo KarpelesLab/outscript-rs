@@ -4,18 +4,181 @@
 use purecrypto::hash::{Digest, Sha256};
 
 use crate::base58;
-use crate::hash::{keccak256_once, sha256_once};
-
-#[cfg(feature = "alloc")]
 use crate::bech32;
-#[cfg(feature = "alloc")]
-use crate::hash::dsha256;
+use crate::hash::{dsha256, keccak256_once, sha256_once};
+use crate::pushbytes::parse_push_bytes;
+
 #[cfg(feature = "alloc")]
 use crate::out::Out;
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
 #[cfg(feature = "alloc")]
-use crate::pushbytes::{parse_push_bytes, push_bytes};
+use crate::pushbytes::push_bytes;
+
+/// Errors from heap-free address encoding and decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// The script format has no address form.
+    UnsupportedFormat,
+    /// The network is not supported for this format.
+    UnsupportedNetwork,
+    /// The script bytes do not match their format.
+    InvalidScript,
+    /// A key hash or payload has the wrong length.
+    InvalidLength,
+    /// The output buffer is too small.
+    BufferTooSmall,
+    /// A bech32/CashAddr encoding error.
+    Bech32(bech32::Error),
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::UnsupportedFormat => f.write_str("format has no address form"),
+            Error::UnsupportedNetwork => f.write_str("unsupported network for this address"),
+            Error::InvalidScript => f.write_str("invalid script for address type"),
+            Error::InvalidLength => f.write_str("invalid address payload length"),
+            Error::BufferTooSmall => f.write_str("address output buffer too small"),
+            Error::Bech32(e) => e.fmt(f),
+        }
+    }
+}
+
+impl core::error::Error for Error {}
+
+impl From<bech32::Error> for Error {
+    fn from(e: bech32::Error) -> Self {
+        match e {
+            bech32::Error::BufferTooSmall => Error::BufferTooSmall,
+            e => Error::Bech32(e),
+        }
+    }
+}
+
+impl From<base58::Error> for Error {
+    fn from(_: base58::Error) -> Self {
+        // encoding only fails for lack of space
+        Error::BufferTooSmall
+    }
+}
+
+/// An upper bound on the length of any address [`encode_address_to_slice`]
+/// produces for a built-in format.
+pub const MAX_ADDRESS_LEN: usize = crate::cardano::MAX_CARDANO_ADDRESS_LEN;
+
+/// base58check versions of P2PKH and P2SH addresses for a network.
+fn base58_versions(network: &str) -> Option<(u8, u8)> {
+    Some(match network {
+        "litecoin" => (0x30, 0x32),
+        "namecoin" => (0x34, 0x0d),
+        "dogecoin" => (0x1e, 0x16),
+        "monacoin" => (0x32, 0x37),
+        "electraproto" => (0x37, 0x89),
+        "dash" => (0x4c, 0x10),
+        "bitcoin-testnet" => (0x6f, 0xc4),
+        "bitcoin" => (0x00, 0x05),
+        _ => return None,
+    })
+}
+
+/// The segwit human-readable part for a network.
+fn segwit_hrp(network: &str) -> Option<&'static str> {
+    Some(match network {
+        "litecoin" => "ltc",
+        "namecoin" => "nc",
+        "bitcoin" => "bc",
+        "bitcoin-testnet" => "tb",
+        "monacoin" => "mona",
+        "electraproto" => "ep",
+        _ => return None,
+    })
+}
+
+/// Writes `prefix` followed by the base58 of `data || dsha256(data)[..4]`.
+fn prefixed_base58check(prefix: &[u8], data: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+    let chk = dsha256(data);
+    let body = out.get_mut(prefix.len()..).ok_or(Error::BufferTooSmall)?;
+    let n =
+        base58::encode_iter_to_slice(data.iter().copied().chain(chk[..4].iter().copied()), body)?;
+    out[..prefix.len()].copy_from_slice(prefix);
+    Ok(prefix.len() + n)
+}
+
+/// Renders the human-readable address of an output script into `out`,
+/// returning the number of (ASCII) bytes written.
+///
+/// `format` is the script's format name (as produced by
+/// [`generate_script`](crate::script::generate_script); anything after a `:`
+/// is ignored, so `p2sh:p2wpkh` renders as `p2sh`), `script` its bytes, and
+/// `network` selects the encoding where a format is shared between chains
+/// (e.g. `bitcoin`, `litecoin`, `bitcoin-cash`, `cardano-testnet`).
+/// [`MAX_ADDRESS_LEN`] bytes always suffice for built-in formats.
+pub fn encode_address_to_slice(
+    format: &str,
+    script: &[u8],
+    network: &str,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    let base = format.split_once(':').map_or(format, |(b, _)| b);
+    match base {
+        "solana" => Ok(base58::encode_to_slice(script, out)?),
+        "cardano" => crate::cardano::cardano_address_from_raw_to_slice(script, network, out),
+        "eth" | "evm" => eip55_to_slice(script, out).ok_or(Error::BufferTooSmall),
+        "massa_pubkey" => prefixed_base58check(b"P", script, out),
+        "massa" => match script.split_first() {
+            Some((0, rest)) => prefixed_base58check(b"AU", rest, out),
+            Some((1, rest)) => prefixed_base58check(b"AS", rest, out),
+            _ => Err(Error::InvalidScript),
+        },
+        "p2pkh" | "p2pukh" | "p2sh" => {
+            let (p2sh, inner) = if base == "p2sh" {
+                (true, script.get(1..script.len().saturating_sub(1)))
+            } else {
+                (false, script.get(2..script.len().saturating_sub(2)))
+            };
+            let (hash, _) = inner
+                .and_then(parse_push_bytes)
+                .filter(|(hash, _)| hash.len() == 20)
+                .ok_or(Error::InvalidScript)?;
+            if matches!(network, "bitcoin-cash" | "bitcoincash") {
+                return Ok(bech32::cashaddr_encode_to_slice(
+                    "bitcoincash:",
+                    p2sh as u8,
+                    hash,
+                    out,
+                )?);
+            }
+            let (pkh, sh) = base58_versions(network).ok_or(Error::UnsupportedNetwork)?;
+            Ok(encode_base58_addr_to_slice(
+                if p2sh { sh } else { pkh },
+                hash,
+                out,
+            )?)
+        }
+        "p2wpkh" | "p2wsh" | "p2tr" => {
+            let (hash, _) = script
+                .get(1..)
+                .and_then(parse_push_bytes)
+                .ok_or(Error::InvalidScript)?;
+            let (version, hrp) = if base == "p2tr" {
+                let hrp = match network {
+                    "bitcoin" => "bc",
+                    "bitcoin-testnet" => "tb",
+                    _ => return Err(Error::UnsupportedNetwork),
+                };
+                (1, hrp)
+            } else {
+                (0, segwit_hrp(network).ok_or(Error::UnsupportedNetwork)?)
+            };
+            Ok(bech32::segwit_addr_encode_to_slice(
+                hrp, version, hash, out,
+            )?)
+        }
+        _ => Err(Error::UnsupportedFormat),
+    }
+}
 
 /// Writes the EIP-55 checksummed hex address (`0x...`) for `addr` (normally 20
 /// bytes) into `out`, returning the number of (ASCII) bytes written —
@@ -300,106 +463,27 @@ impl Out {
     /// Returns the human-readable address for this output. Flags provide network
     /// hints when multiple addresses are possible.
     pub fn address(&self, flags: &[&str]) -> Result<String, String> {
-        // combined flags = provided ++ self.flags
-        let mut combined: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
-        combined.extend(self.flags.iter().cloned());
-        let net = combined.first().map(|s| s.as_str()).unwrap_or("");
-
-        match self.base_name() {
-            "solana" => Ok(base58::encode(&self.raw)),
-            "cardano" => crate::cardano::cardano_address_from_out(&self.raw, net),
-            "eth" | "evm" => Ok(eip55(&self.raw)),
-            "massa_pubkey" => {
-                let h = dsha256(&self.raw);
-                let mut b = self.raw.clone();
-                b.extend_from_slice(&h[..4]);
-                Ok(format!("P{}", base58::encode(&b)))
+        // the first of the provided flags, then of the output's own flags
+        let net = flags
+            .first()
+            .copied()
+            .or_else(|| self.flags.first().map(String::as_str))
+            .unwrap_or("");
+        let mut buf = vec![0u8; MAX_ADDRESS_LEN.max(16 + 2 * self.raw.len())];
+        match encode_address_to_slice(&self.name, &self.raw, net, &mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(String::from_utf8(buf).expect("addresses are ASCII"))
             }
-            "massa" => {
-                let typ = self.raw[0];
-                let mut b = self.raw[1..].to_vec();
-                let h = dsha256(&b);
-                b.extend_from_slice(&h[..4]);
-                match typ {
-                    0 => Ok(format!("AU{}", base58::encode(&b))),
-                    1 => Ok(format!("AS{}", base58::encode(&b))),
-                    n => Err(format!("unsupported value for massa address type: {n}")),
-                }
-            }
-            "p2pkh" | "p2pukh" => {
-                let inner = &self.raw[2..self.raw.len() - 2];
-                let (buf, _) = parse_push_bytes(inner).ok_or("invalid script for address type")?;
-                match net {
-                    "bitcoin-cash" | "bitcoincash" => {
-                        bech32::cashaddr_encode("bitcoincash:", 0, buf).map_err(|e| e.to_string())
-                    }
-                    "litecoin" => Ok(encode_base58_addr(0x30, buf)),
-                    "namecoin" => Ok(encode_base58_addr(0x34, buf)),
-                    "dogecoin" => Ok(encode_base58_addr(0x1e, buf)),
-                    "monacoin" => Ok(encode_base58_addr(0x32, buf)),
-                    "electraproto" => Ok(encode_base58_addr(0x37, buf)),
-                    "dash" => Ok(encode_base58_addr(0x4c, buf)),
-                    "bitcoin-testnet" => Ok(encode_base58_addr(0x6f, buf)),
-                    "bitcoin" => Ok(encode_base58_addr(0x00, buf)),
-                    other => Err(format!("unsupported network {other:?} for p2pkh address")),
-                }
-            }
-            "p2sh" => {
-                let inner = &self.raw[1..self.raw.len() - 1];
-                let (buf, _) = parse_push_bytes(inner).ok_or("invalid script for address type")?;
-                match net {
-                    "bitcoin-cash" | "bitcoincash" => {
-                        bech32::cashaddr_encode("bitcoincash:", 1, buf).map_err(|e| e.to_string())
-                    }
-                    "litecoin" => Ok(encode_base58_addr(0x32, buf)),
-                    "namecoin" => Ok(encode_base58_addr(0x0d, buf)),
-                    "dogecoin" => Ok(encode_base58_addr(0x16, buf)),
-                    "monacoin" => Ok(encode_base58_addr(0x37, buf)),
-                    "electraproto" => Ok(encode_base58_addr(0x89, buf)),
-                    "dash" => Ok(encode_base58_addr(0x10, buf)),
-                    "bitcoin-testnet" => Ok(encode_base58_addr(0xc4, buf)),
-                    "bitcoin" => Ok(encode_base58_addr(0x05, buf)),
-                    other => Err(format!("unsupported network {other:?} for p2sh address")),
-                }
-            }
-            "p2wpkh" | "p2wsh" => {
-                let (buf, _) =
-                    parse_push_bytes(&self.raw[1..]).ok_or("invalid script for address type")?;
-                let hrp = match net {
-                    "litecoin" => "ltc",
-                    "namecoin" => "nc",
-                    "bitcoin" => "bc",
-                    "bitcoin-testnet" => "tb",
-                    "monacoin" => "mona",
-                    "electraproto" => "ep",
-                    _ => {
-                        return Err(format!(
-                            "could not transform outscript of format {}",
-                            self.name
-                        ));
-                    }
-                };
-                bech32::segwit_addr_encode(hrp, 0, buf).map_err(|e| e.to_string())
-            }
-            "p2tr" => {
-                let (buf, _) =
-                    parse_push_bytes(&self.raw[1..]).ok_or("invalid script for address type")?;
-                let hrp = match net {
-                    "bitcoin" => "bc",
-                    "bitcoin-testnet" => "tb",
-                    _ => {
-                        return Err(format!(
-                            "could not transform outscript of format {}",
-                            self.name
-                        ));
-                    }
-                };
-                bech32::segwit_addr_encode(hrp, 1, buf).map_err(|e| e.to_string())
-            }
-            _ => Err(format!(
+            Err(Error::UnsupportedFormat) => Err(format!(
                 "could not transform outscript of format {}",
                 self.name
             )),
+            Err(Error::UnsupportedNetwork) => Err(format!(
+                "unsupported network {net:?} for {} address",
+                self.name
+            )),
+            Err(e) => Err(format!("{} address: {e}", self.name)),
         }
     }
 }
@@ -418,6 +502,29 @@ mod tests {
         assert_eq!(eip55_to_slice(&addr, &mut out), Some(42));
         assert_eq!(&out, b"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed");
         assert_eq!(eip55_to_slice(&addr, &mut out[..41]), None);
+    }
+
+    #[test]
+    fn render_rejects_short_scripts() {
+        let mut out = [0u8; MAX_ADDRESS_LEN];
+        for fmt in ["p2pkh", "p2sh", "p2wpkh", "p2tr", "massa"] {
+            assert_eq!(
+                encode_address_to_slice(fmt, &[], "bitcoin", &mut out),
+                Err(Error::InvalidScript),
+                "{fmt}"
+            );
+            if fmt == "massa" {
+                continue; // any non-empty payload is renderable
+            }
+            for len in 1..4 {
+                let r = encode_address_to_slice(fmt, &[0u8; 3][..len], "bitcoin", &mut out);
+                assert!(r.is_err(), "{fmt} {len}");
+            }
+        }
+        assert_eq!(
+            encode_address_to_slice("p2pk", &[0u8; 35], "bitcoin", &mut out),
+            Err(Error::UnsupportedFormat)
+        );
     }
 
     #[test]
