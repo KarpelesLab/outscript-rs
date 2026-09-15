@@ -53,6 +53,7 @@ mod prelude {
 
 pub mod address;
 pub mod base58;
+pub mod base64;
 pub mod bech32;
 pub mod btcguess;
 pub mod btcraw;
@@ -64,6 +65,7 @@ pub mod evmraw;
 pub mod hash;
 pub mod inline;
 pub mod massa;
+pub mod psbt;
 pub mod pubkey;
 pub mod pushbytes;
 pub mod script;

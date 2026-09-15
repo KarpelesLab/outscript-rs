@@ -29,6 +29,8 @@ pub enum Error {
     PrevOutCount,
     /// The output buffer is too small.
     BufferTooSmall,
+    /// The sighash type is not one this module computes.
+    UnsupportedSighash,
 }
 
 impl core::fmt::Display for Error {
@@ -37,6 +39,7 @@ impl core::fmt::Display for Error {
             Error::InputIndex => "input index out of range",
             Error::PrevOutCount => "previous outputs must match the inputs one to one",
             Error::BufferTooSmall => "transaction output buffer too small",
+            Error::UnsupportedSighash => "unsupported sighash type",
         })
     }
 }
@@ -83,19 +86,28 @@ pub struct RawTx<'a> {
     pub locktime: u32,
 }
 
-fn put_varint<S: Sink>(s: &mut S, v: usize) {
+/// The P2PKH script used as the BIP-143 scriptCode of a P2WPKH spend.
+pub(crate) fn p2pkh_script_code(pk_hash: &[u8; 20]) -> [u8; 25] {
+    let mut s = [0u8; 25];
+    s[..3].copy_from_slice(&[0x76, 0xa9, 0x14]);
+    s[3..23].copy_from_slice(pk_hash);
+    s[23..].copy_from_slice(&[0x88, 0xac]);
+    s
+}
+
+fn put_varint<S: Sink + ?Sized>(s: &mut S, v: usize) {
     let (buf, len) = BtcVarInt(v as u64).to_array();
     s.put(&buf[..len]);
 }
 
-fn put_outpoint<S: Sink>(s: &mut S, input: &RawTxIn<'_>) {
+fn put_outpoint<S: Sink + ?Sized>(s: &mut S, input: &RawTxIn<'_>) {
     let mut txid = input.txid;
     txid.reverse();
     s.put(&txid);
     s.put(&input.vout.to_le_bytes());
 }
 
-fn put_output<S: Sink>(s: &mut S, output: &RawTxOut<'_>) {
+fn put_output<S: Sink + ?Sized>(s: &mut S, output: &RawTxOut<'_>) {
     s.put(&output.amount.to_le_bytes());
     put_varint(s, output.script.len());
     s.put(output.script);
@@ -120,30 +132,142 @@ fn sha256_with(f: impl FnOnce(&mut HashSink<Sha256>)) -> [u8; 32] {
     h.0.finalize()
 }
 
+/// A transaction as seen by the sighash algorithms: only outpoints,
+/// sequences, outputs, version and locktime matter. Implemented by [`RawTx`]
+/// and by the PSBT unsigned-transaction view.
+pub(crate) trait TxSource {
+    fn version(&self) -> u32;
+    fn locktime(&self) -> u32;
+    fn input_count(&self) -> usize;
+    /// Calls `f` with each input (scripts and witnesses are ignored).
+    fn for_each_input(&self, f: &mut dyn FnMut(&RawTxIn<'_>));
+    /// Calls `f` with each output.
+    fn for_each_output(&self, f: &mut dyn FnMut(&RawTxOut<'_>));
+}
+
+impl TxSource for RawTx<'_> {
+    fn version(&self) -> u32 {
+        self.version
+    }
+    fn locktime(&self) -> u32 {
+        self.locktime
+    }
+    fn input_count(&self) -> usize {
+        self.inputs.len()
+    }
+    fn for_each_input(&self, f: &mut dyn FnMut(&RawTxIn<'_>)) {
+        self.inputs.iter().for_each(f)
+    }
+    fn for_each_output(&self, f: &mut dyn FnMut(&RawTxOut<'_>)) {
+        self.outputs.iter().for_each(f)
+    }
+}
+
+fn output_count<T: TxSource + ?Sized>(tx: &T) -> usize {
+    let mut n = 0;
+    tx.for_each_output(&mut |_| n += 1);
+    n
+}
+
+/// The legacy sighash of input `index` of `tx` (see [`RawTx::legacy_sighash`]).
+pub(crate) fn legacy_sighash_of<T: TxSource + ?Sized>(
+    tx: &T,
+    index: usize,
+    script_code: &[u8],
+    sighash_type: u32,
+) -> Result<[u8; 32], Error> {
+    if index >= tx.input_count() {
+        return Err(Error::InputIndex);
+    }
+    Ok(dsha256_with(|s| {
+        s.put(&tx.version().to_le_bytes());
+        put_varint(s, tx.input_count());
+        let mut i = 0;
+        tx.for_each_input(&mut |input| {
+            let script = if i == index { script_code } else { &[] };
+            put_outpoint(s, input);
+            put_varint(s, script.len());
+            s.put(script);
+            s.put(&input.sequence.to_le_bytes());
+            i += 1;
+        });
+        put_varint(s, output_count(tx));
+        tx.for_each_output(&mut |o| put_output(s, o));
+        s.put(&tx.locktime().to_le_bytes());
+        s.put(&sighash_type.to_le_bytes());
+    }))
+}
+
+/// The BIP-143 midstate of `tx` (see [`RawTx::segwit_v0_midstate`]).
+pub(crate) fn segwit_v0_midstate_of<T: TxSource + ?Sized>(tx: &T) -> SegwitV0Midstate {
+    let mut prevouts = HashSink(Sha256::new());
+    let mut sequences = HashSink(Sha256::new());
+    tx.for_each_input(&mut |i| {
+        put_outpoint(&mut prevouts, i);
+        sequences.put(&i.sequence.to_le_bytes());
+    });
+    SegwitV0Midstate {
+        version: tx.version(),
+        locktime: tx.locktime(),
+        hash_prevouts: dsha256_finish(prevouts),
+        hash_sequence: dsha256_finish(sequences),
+        hash_outputs: dsha256_with(|s| tx.for_each_output(&mut |o| put_output(s, o))),
+    }
+}
+
+/// The BIP-341 midstate of `tx` given the outputs its inputs spend, in order
+/// (see [`RawTx::taproot_midstate`]).
+pub(crate) fn taproot_midstate_of<'p, T: TxSource + ?Sized>(
+    tx: &T,
+    prevouts: impl Iterator<Item = PrevOut<'p>>,
+) -> Result<TaprootMidstate, Error> {
+    let mut amounts = HashSink(Sha256::new());
+    let mut scripts = HashSink(Sha256::new());
+    let mut count = 0;
+    for p in prevouts {
+        amounts.put(&p.amount.to_le_bytes());
+        put_varint(&mut scripts, p.script.len());
+        scripts.put(p.script);
+        count += 1;
+    }
+    if count != tx.input_count() {
+        return Err(Error::PrevOutCount);
+    }
+    let mut outpoints = HashSink(Sha256::new());
+    let mut sequences = HashSink(Sha256::new());
+    tx.for_each_input(&mut |i| {
+        put_outpoint(&mut outpoints, i);
+        sequences.put(&i.sequence.to_le_bytes());
+    });
+    Ok(TaprootMidstate {
+        version: tx.version(),
+        locktime: tx.locktime(),
+        input_count: count,
+        sha_prevouts: outpoints.0.finalize(),
+        sha_amounts: amounts.0.finalize(),
+        sha_scriptpubkeys: scripts.0.finalize(),
+        sha_sequences: sequences.0.finalize(),
+        sha_outputs: sha256_with(|s| tx.for_each_output(&mut |o| put_output(s, o))),
+    })
+}
+
 impl<'a> RawTx<'a> {
     /// Reports whether any input carries witness data.
     pub fn has_witness(&self) -> bool {
         self.inputs.iter().any(|i| !i.witness.is_empty())
     }
 
-    /// Serializes the transaction, substituting `script_override` as the
-    /// scriptSig of every input (`None`: each input's own; `Some((n, s))`:
-    /// `s` for input `n`, empty for the others).
-    fn write<S: Sink>(&self, s: &mut S, witness: bool, script_override: Option<(usize, &[u8])>) {
+    /// Serializes the transaction, with witness data if `witness`.
+    fn write<S: Sink + ?Sized>(&self, s: &mut S, witness: bool) {
         s.put(&self.version.to_le_bytes());
         if witness {
             s.put(&[0x00, 0x01]);
         }
         put_varint(s, self.inputs.len());
-        for (i, input) in self.inputs.iter().enumerate() {
-            let script = match script_override {
-                None => input.script_sig,
-                Some((n, script)) if n == i => script,
-                Some(_) => &[],
-            };
+        for input in self.inputs {
             put_outpoint(s, input);
-            put_varint(s, script.len());
-            s.put(script);
+            put_varint(s, input.script_sig.len());
+            s.put(input.script_sig);
             s.put(&input.sequence.to_le_bytes());
         }
         put_varint(s, self.outputs.len());
@@ -162,10 +286,15 @@ impl<'a> RawTx<'a> {
         s.put(&self.locktime.to_le_bytes());
     }
 
+    /// Streams the serialization without witness data.
+    pub(crate) fn write_unsigned(&self, s: &mut dyn Sink) {
+        self.write(s, false)
+    }
+
     /// The serialized length (with witness data if any input has some).
     pub fn serialized_len(&self) -> usize {
         let mut c = Counter::default();
-        self.write(&mut c, self.has_witness(), None);
+        self.write(&mut c, self.has_witness());
         c.0
     }
 
@@ -173,14 +302,14 @@ impl<'a> RawTx<'a> {
     /// has some), returning the number of bytes written.
     pub fn serialize_to_slice(&self, out: &mut [u8]) -> Result<usize, Error> {
         let mut s = SliceSink::new(out);
-        self.write(&mut s, self.has_witness(), None);
+        self.write(&mut s, self.has_witness());
         s.finish().ok_or(Error::BufferTooSmall)
     }
 
     /// The transaction id (double SHA-256 of the non-witness serialization, in
     /// display byte order).
     pub fn txid(&self) -> [u8; 32] {
-        let mut h = dsha256_with(|s| self.write(s, false, None));
+        let mut h = dsha256_with(|s| self.write(s, false));
         h.reverse();
         h
     }
@@ -194,28 +323,12 @@ impl<'a> RawTx<'a> {
         script_code: &[u8],
         sighash_type: u32,
     ) -> Result<[u8; 32], Error> {
-        if index >= self.inputs.len() {
-            return Err(Error::InputIndex);
-        }
-        Ok(dsha256_with(|s| {
-            self.write(s, false, Some((index, script_code)));
-            s.put(&sighash_type.to_le_bytes());
-        }))
+        legacy_sighash_of(self, index, script_code, sighash_type)
     }
 
     /// Precomputes the BIP-143 hashes shared by every input's sighash.
     pub fn segwit_v0_midstate(&self) -> SegwitV0Midstate {
-        SegwitV0Midstate {
-            version: self.version,
-            locktime: self.locktime,
-            hash_prevouts: dsha256_with(|s| self.inputs.iter().for_each(|i| put_outpoint(s, i))),
-            hash_sequence: dsha256_with(|s| {
-                self.inputs
-                    .iter()
-                    .for_each(|i| s.put(&i.sequence.to_le_bytes()))
-            }),
-            hash_outputs: dsha256_with(|s| self.outputs.iter().for_each(|o| put_output(s, o))),
-        }
+        segwit_v0_midstate_of(self)
     }
 
     /// The BIP-143 (segwit v0) sighash of input `index`. Prefer
@@ -237,30 +350,7 @@ impl<'a> RawTx<'a> {
     /// Precomputes the BIP-341 hashes shared by every input's taproot sighash.
     /// `prevouts` are the outputs spent by each input, in order.
     pub fn taproot_midstate(&self, prevouts: &[PrevOut<'_>]) -> Result<TaprootMidstate, Error> {
-        if prevouts.len() != self.inputs.len() {
-            return Err(Error::PrevOutCount);
-        }
-        Ok(TaprootMidstate {
-            version: self.version,
-            locktime: self.locktime,
-            input_count: self.inputs.len(),
-            sha_prevouts: sha256_with(|s| self.inputs.iter().for_each(|i| put_outpoint(s, i))),
-            sha_amounts: sha256_with(|s| {
-                prevouts.iter().for_each(|p| s.put(&p.amount.to_le_bytes()))
-            }),
-            sha_scriptpubkeys: sha256_with(|s| {
-                prevouts.iter().for_each(|p| {
-                    put_varint(s, p.script.len());
-                    s.put(p.script);
-                })
-            }),
-            sha_sequences: sha256_with(|s| {
-                self.inputs
-                    .iter()
-                    .for_each(|i| s.put(&i.sequence.to_le_bytes()))
-            }),
-            sha_outputs: sha256_with(|s| self.outputs.iter().for_each(|o| put_output(s, o))),
-        })
+        taproot_midstate_of(self, prevouts.iter().copied())
     }
 }
 
@@ -316,10 +406,10 @@ pub struct TaprootMidstate {
 }
 
 impl TaprootMidstate {
-    fn common(&self, spend_type: u8, index: u32) -> [u8; 175] {
+    fn common(&self, hash_type: u8, spend_type: u8, index: u32) -> [u8; 175] {
         let mut buf = [0u8; 175];
         buf[0] = 0x00; // epoch
-        buf[1] = 0x00; // hash type: SIGHASH_DEFAULT
+        buf[1] = hash_type;
         buf[2..6].copy_from_slice(&self.version.to_le_bytes());
         buf[6..10].copy_from_slice(&self.locktime.to_le_bytes());
         buf[10..42].copy_from_slice(&self.sha_prevouts);
@@ -341,14 +431,28 @@ impl TaprootMidstate {
 
     /// The BIP-341 key-path `SIGHASH_DEFAULT` sighash of input `index`.
     pub fn key_spend_sighash(&self, index: usize) -> Result<[u8; 32], Error> {
-        let common = self.common(0x00, self.check(index)?);
+        self.key_spend_sighash_with_type(index, 0x00)
+    }
+
+    /// The BIP-341 key-path sighash of input `index` for `SIGHASH_DEFAULT`
+    /// (0x00) or `SIGHASH_ALL` (0x01), the two types committing to the whole
+    /// transaction. A `SIGHASH_ALL` signature carries the type as a 65th byte.
+    pub fn key_spend_sighash_with_type(
+        &self,
+        index: usize,
+        hash_type: u8,
+    ) -> Result<[u8; 32], Error> {
+        if hash_type > 0x01 {
+            return Err(Error::UnsupportedSighash);
+        }
+        let common = self.common(hash_type, 0x00, self.check(index)?);
         Ok(tagged_hash("TapSighash", &[&common]))
     }
 
     /// The BIP-342 script-path `SIGHASH_DEFAULT` sighash of input `index` for a
     /// tapscript leaf (leaf version 0xc0, no code separator).
     pub fn script_path_sighash(&self, index: usize, leaf_script: &[u8]) -> Result<[u8; 32], Error> {
-        let common = self.common(0x02, self.check(index)?);
+        let common = self.common(0x00, 0x02, self.check(index)?);
         let (len_buf, len_len) = BtcVarInt(leaf_script.len() as u64).to_array();
         let tapleaf_hash = tagged_hash("TapLeaf", &[&[0xc0], &len_buf[..len_len], leaf_script]);
         Ok(tagged_hash(

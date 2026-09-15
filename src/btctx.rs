@@ -632,14 +632,7 @@ impl BtcTxOutput {
 /// Cached per-transaction BIP-341 sighash components.
 pub type TaprootSighashParts = TaprootMidstate;
 
-/// The P2PKH script used as the BIP-143 scriptCode of a P2WPKH spend.
-pub(crate) fn p2pkh_script_code(pk_hash: &[u8; 20]) -> [u8; 25] {
-    let mut s = [0u8; 25];
-    s[..3].copy_from_slice(&[0x76, 0xa9, 0x14]);
-    s[3..23].copy_from_slice(pk_hash);
-    s[23..].copy_from_slice(&[0x88, 0xac]);
-    s
-}
+pub(crate) use crate::btcraw::p2pkh_script_code;
 
 impl BtcTx {
     fn taproot_sighash_parts_from_keys(
