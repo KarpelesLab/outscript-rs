@@ -1,10 +1,24 @@
 //! Block reward and cumulative-supply calculations across networks. Port of
 //! `reward.go`.
 
-use crate::prelude::*;
-
 use num_bigint::BigInt;
 use num_traits::Zero;
+
+/// Errors from reward calculations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// The network has no known reward schedule.
+    UnsupportedNetwork,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("unsupported network for block rewards")
+    }
+}
+
+impl core::error::Error for Error {}
 
 #[derive(Clone, Copy)]
 enum RewardModel {
@@ -43,8 +57,8 @@ fn chain_config(network: &str) -> Option<ChainRewardInfo> {
 }
 
 /// Returns the block reward at `block_height` for `network`.
-pub fn block_reward(network: &str, block_height: u64) -> Result<BigInt, String> {
-    let info = chain_config(network).ok_or_else(|| format!("unsupported network: {network}"))?;
+pub fn block_reward(network: &str, block_height: u64) -> Result<BigInt, Error> {
+    let info = chain_config(network).ok_or(Error::UnsupportedNetwork)?;
     Ok(match info.model {
         RewardModel::Halving => {
             halving_block_reward(info.initial_reward, info.halving_interval, block_height)
@@ -82,8 +96,8 @@ fn dash_block_reward(base_reward: i64, block_height: u64) -> BigInt {
 
 /// Returns the total minted coins from block 0 through `block_height`
 /// (inclusive) for `network`.
-pub fn cumulative_reward(network: &str, block_height: u64) -> Result<BigInt, String> {
-    let info = chain_config(network).ok_or_else(|| format!("unsupported network: {network}"))?;
+pub fn cumulative_reward(network: &str, block_height: u64) -> Result<BigInt, Error> {
+    let info = chain_config(network).ok_or(Error::UnsupportedNetwork)?;
     Ok(match info.model {
         RewardModel::Halving => {
             cumulative_halving(info.initial_reward, info.halving_interval, block_height)

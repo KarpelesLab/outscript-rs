@@ -246,18 +246,12 @@ impl Script {
 
     /// Returns the byte value for the specified format name, generating and
     /// caching it as needed.
-    pub fn generate(&self, name: &str) -> Result<Vec<u8>, String> {
+    pub fn generate(&self, name: &str) -> Result<Vec<u8>, Error> {
         if let Some(v) = self.cache.borrow().get(name) {
             return Ok(v.clone());
         }
 
-        let out: Vec<u8> = generate_script(&self.pubkey, name)
-            .map_err(|e| match e {
-                Error::UnknownFormat => format!("unsupported format {name}"),
-                Error::UnsupportedKey => format!("public key does not support {name}"),
-                e => format!("{name}: {e}"),
-            })?
-            .into();
+        let out: Vec<u8> = generate_script(&self.pubkey, name)?.into();
         self.cache
             .borrow_mut()
             .insert(name.to_string(), out.clone());
@@ -265,14 +259,14 @@ impl Script {
     }
 
     /// Returns an [`Out`] for the requested format.
-    pub fn out(&self, name: &str) -> Result<Out, String> {
+    pub fn out(&self, name: &str) -> Result<Out, Error> {
         let buf = self.generate(name)?;
         Ok(Out::make(name, buf, &[]))
     }
 
     /// Formats the key as an address using the given format and optional network
     /// hints.
-    pub fn address(&self, script: &str, flags: &[&str]) -> Result<String, String> {
+    pub fn address(&self, script: &str, flags: &[&str]) -> Result<String, crate::address::Error> {
         let out = self.out(script)?;
         out.address(flags)
     }
@@ -314,7 +308,7 @@ mod tests {
         ] {
             let s = Script::new(pk.clone());
             for name in ALL_FORMATS {
-                let via_defs: Result<Vec<u8>, String> = format_def(name)
+                let via_defs: Result<Vec<u8>, Error> = format_def(name)
                     .unwrap()
                     .iter()
                     .map(|piece| piece.bytes(&s))

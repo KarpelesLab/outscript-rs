@@ -4,7 +4,7 @@
 use crate::prelude::*;
 
 use crate::btcamount::BtcAmount;
-use crate::btctx::BtcTx;
+use crate::btctx::{BtcTx, Error};
 use crate::crypto::secp256k1::SecpPublicKey;
 use crate::hash::hash160;
 use crate::pushbytes::parse_push_bytes;
@@ -37,7 +37,7 @@ pub struct BtcInputSig {
 pub fn extract_btc_input_sig(
     script_sig: &[u8],
     witness: &[Vec<u8>],
-) -> Result<Vec<BtcInputSig>, String> {
+) -> Result<Vec<BtcInputSig>, Error> {
     if script_sig.is_empty() && !witness.is_empty() {
         return extract_witness_only(witness);
     }
@@ -47,7 +47,7 @@ pub fn extract_btc_input_sig(
     Ok(Vec::new())
 }
 
-fn extract_witness_only(witness: &[Vec<u8>]) -> Result<Vec<BtcInputSig>, String> {
+fn extract_witness_only(witness: &[Vec<u8>]) -> Result<Vec<BtcInputSig>, Error> {
     // Annex (BIP-341) not supported.
     if witness.len() >= 2 {
         let last = &witness[witness.len() - 1];
@@ -79,7 +79,7 @@ fn extract_witness_only(witness: &[Vec<u8>]) -> Result<Vec<BtcInputSig>, String>
     }
 }
 
-fn extract_scriptsig_only(script_sig: &[u8]) -> Result<Vec<BtcInputSig>, String> {
+fn extract_scriptsig_only(script_sig: &[u8]) -> Result<Vec<BtcInputSig>, Error> {
     if script_sig[0] == 0x00
         && let Some(out) = parse_p2sh_multisig(script_sig)
     {
@@ -125,7 +125,7 @@ fn parse_taproot_sig(sig: &[u8], scheme: &str) -> Option<BtcInputSig> {
     })
 }
 
-fn parse_p2tr_script_path(witness: &[Vec<u8>]) -> Result<Vec<BtcInputSig>, String> {
+fn parse_p2tr_script_path(witness: &[Vec<u8>]) -> Result<Vec<BtcInputSig>, Error> {
     if witness.len() < 3 {
         return Ok(Vec::new());
     }
@@ -219,35 +219,32 @@ fn parse_ecdsa_sig(
     sig_with_flag: &[u8],
     pubkey: Option<Vec<u8>>,
     scheme: &str,
-) -> Result<BtcInputSig, String> {
+) -> Result<BtcInputSig, Error> {
     if sig_with_flag.len() < 9 {
-        return Err(format!(
-            "signature too short: {} bytes",
-            sig_with_flag.len()
-        ));
+        return Err(Error::InvalidSignature);
     }
     let flag = sig_with_flag[sig_with_flag.len() - 1] as u32;
     let der = &sig_with_flag[..sig_with_flag.len() - 1];
     if der.len() < 8 || der[0] != 0x30 {
-        return Err("not a DER signature".into());
+        return Err(Error::InvalidSignature);
     }
     if der[1] as usize != der.len() - 2 {
-        return Err("DER length mismatch".into());
+        return Err(Error::InvalidSignature);
     }
     if der[2] != 0x02 {
-        return Err("expected INTEGER for r".into());
+        return Err(Error::InvalidSignature);
     }
     let r_len = der[3] as usize;
     if 4 + r_len + 2 > der.len() {
-        return Err("DER r overrun".into());
+        return Err(Error::InvalidSignature);
     }
     let r = &der[4..4 + r_len];
     if der[4 + r_len] != 0x02 {
-        return Err("expected INTEGER for s".into());
+        return Err(Error::InvalidSignature);
     }
     let s_len = der[4 + r_len + 1] as usize;
     if 4 + r_len + 2 + s_len != der.len() {
-        return Err("DER s overrun".into());
+        return Err(Error::InvalidSignature);
     }
     let s = &der[4 + r_len + 2..4 + r_len + 2 + s_len];
 
@@ -261,14 +258,14 @@ fn parse_ecdsa_sig(
     })
 }
 
-fn normalize_32(b: &[u8]) -> Result<Vec<u8>, String> {
+fn normalize_32(b: &[u8]) -> Result<Vec<u8>, Error> {
     let mut start = 0;
     while start < b.len() && b[start] == 0x00 {
         start += 1;
     }
     let trimmed = &b[start..];
     if trimmed.len() > 32 {
-        return Err(format!("value longer than 32 bytes ({})", trimmed.len()));
+        return Err(Error::InvalidSignature);
     }
     let mut out = vec![0u8; 32];
     out[32 - trimmed.len()..].copy_from_slice(trimmed);
@@ -309,21 +306,18 @@ impl BtcTx {
         sig: &BtcInputSig,
         prev_script: &[u8],
         amount: BtcAmount,
-    ) -> Result<[u8; 32], String> {
+    ) -> Result<[u8; 32], Error> {
         if n >= self.inputs.len() {
-            return Err(format!("input index {n} out of range"));
+            return Err(Error::InputIndex);
         }
         if sig.sighash_flag != 1 {
-            return Err(format!(
-                "unsupported sighash flag 0x{:x} (only SIGHASH_ALL=1 supported)",
-                sig.sighash_flag
-            ));
+            return Err(Error::UnsupportedSighash);
         }
         match sig.scheme.as_str() {
             "p2pkh" => self.legacy_sighash(n, prev_script, sig.sighash_flag),
             "p2sh-multisig" => {
                 if sig.redeem_script.is_empty() {
-                    return Err("p2sh-multisig requires RedeemScript".into());
+                    return Err(Error::MissingScript);
                 }
                 self.legacy_sighash(n, &sig.redeem_script, sig.sighash_flag)
             }
@@ -337,7 +331,7 @@ impl BtcTx {
                     sig.sighash_flag,
                 ))
             }
-            other => Err(format!("unsupported scheme: {other}")),
+            _ => Err(Error::UnsupportedScheme),
         }
     }
 
@@ -350,29 +344,24 @@ impl BtcTx {
         sig: &BtcInputSig,
         prev_scripts: &[Vec<u8>],
         amounts: &[BtcAmount],
-    ) -> Result<[u8; 32], String> {
+    ) -> Result<[u8; 32], Error> {
         if n >= self.inputs.len() {
-            return Err(format!("input index {n} out of range"));
+            return Err(Error::InputIndex);
         }
         if sig.sighash_flag != 0 {
-            return Err(format!(
-                "taproot: only SIGHASH_DEFAULT (0) supported, got 0x{:x}",
-                sig.sighash_flag
-            ));
+            return Err(Error::UnsupportedSighash);
         }
         let amounts_u: Vec<u64> = amounts.iter().map(|a| a.0).collect();
         let parts = self.taproot_sighash_parts_raw(prev_scripts, &amounts_u)?;
         match sig.scheme.as_str() {
-            "p2tr-keypath" => parts.key_spend_sighash(n).map_err(|e| e.to_string()),
+            "p2tr-keypath" => Ok(parts.key_spend_sighash(n)?),
             "p2tr-scriptpath" => {
                 if sig.leaf_script.is_empty() {
-                    return Err("p2tr-scriptpath requires LeafScript".into());
+                    return Err(Error::MissingScript);
                 }
-                parts
-                    .script_path_sighash(n, &sig.leaf_script)
-                    .map_err(|e| e.to_string())
+                Ok(parts.script_path_sighash(n, &sig.leaf_script)?)
             }
-            other => Err(format!("not a taproot scheme: {other}")),
+            _ => Err(Error::UnsupportedScheme),
         }
     }
 }

@@ -299,8 +299,9 @@ fn p2tr_external_signer() {
         fn ecdsa_public_key(&self) -> Option<SecpPublicKey> {
             None
         }
-        fn sign_taproot(&self, sighash: &[u8; 32]) -> Result<[u8; 64], String> {
-            bip340_sign(&self.tweaked_secret, sighash, &[0u8; 32]).map_err(|e| e.to_string())
+        fn sign_taproot(&self, sighash: &[u8; 32]) -> Result<[u8; 64], crate::crypto::SignerError> {
+            bip340_sign(&self.tweaked_secret, sighash, &[0u8; 32])
+                .map_err(|_| crate::crypto::SignerError)
         }
     }
 

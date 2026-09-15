@@ -39,6 +39,8 @@ pub enum Error {
     /// The base58 version byte, witness version or address type is not
     /// supported.
     UnsupportedVersion(u8),
+    /// The output script could not be generated.
+    Script(crate::script::Error),
 }
 
 impl core::fmt::Display for Error {
@@ -54,6 +56,7 @@ impl core::fmt::Display for Error {
             Error::BadChecksum => f.write_str("bad address checksum"),
             Error::NetworkMismatch => f.write_str("address is for a different network"),
             Error::UnsupportedVersion(v) => write!(f, "unsupported address version {v:#x}"),
+            Error::Script(e) => e.fmt(f),
         }
     }
 }
@@ -66,6 +69,12 @@ impl From<bech32::Error> for Error {
             bech32::Error::BufferTooSmall => Error::BufferTooSmall,
             e => Error::Bech32(e),
         }
+    }
+}
+
+impl From<crate::script::Error> for Error {
+    fn from(e: crate::script::Error) -> Self {
+        Error::Script(e)
     }
 }
 
@@ -497,34 +506,22 @@ fn decode_base58_versioned(
 
 /// Parses an EVM (`0x...`) address.
 #[cfg(feature = "alloc")]
-pub fn parse_evm_address(address: &str) -> Result<Out, String> {
-    decode_evm_address(address)
-        .map(Out::from)
-        .map_err(|e| format!("failed to parse ethereum address: {e}"))
+pub fn parse_evm_address(address: &str) -> Result<Out, Error> {
+    decode_evm_address(address).map(Out::from)
 }
 
 /// Parses a Bitcoin-family address for the given network. The special network
 /// `"auto"` attempts to detect the network from the address.
 #[cfg(feature = "alloc")]
-pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, String> {
-    decode_bitcoin_based_address(network, address)
-        .map(Out::from)
-        .map_err(|e| match e {
-            Error::NetworkMismatch => {
-                format!("{address} is not a {network} address")
-            }
-            Error::UnsupportedNetwork => {
-                format!("unsupported network {network:?} for address {address}")
-            }
-            e => format!("failed to parse address {address}: {e}"),
-        })
+pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, Error> {
+    decode_bitcoin_based_address(network, address).map(Out::from)
 }
 
 #[cfg(feature = "alloc")]
 impl Out {
     /// Returns the human-readable address for this output. Flags provide network
     /// hints when multiple addresses are possible.
-    pub fn address(&self, flags: &[&str]) -> Result<String, String> {
+    pub fn address(&self, flags: &[&str]) -> Result<String, Error> {
         // the first of the provided flags, then of the output's own flags
         let net = flags
             .first()
@@ -532,21 +529,9 @@ impl Out {
             .or_else(|| self.flags.first().map(String::as_str))
             .unwrap_or("");
         let mut buf = vec![0u8; MAX_ADDRESS_LEN.max(16 + 2 * self.raw.len())];
-        match encode_address_to_slice(&self.name, &self.raw, net, &mut buf) {
-            Ok(n) => {
-                buf.truncate(n);
-                Ok(String::from_utf8(buf).expect("addresses are ASCII"))
-            }
-            Err(Error::UnsupportedFormat) => Err(format!(
-                "could not transform outscript of format {}",
-                self.name
-            )),
-            Err(Error::UnsupportedNetwork) => Err(format!(
-                "unsupported network {net:?} for {} address",
-                self.name
-            )),
-            Err(e) => Err(format!("{} address: {e}", self.name)),
-        }
+        let n = encode_address_to_slice(&self.name, &self.raw, net, &mut buf)?;
+        buf.truncate(n);
+        Ok(String::from_utf8(buf).expect("addresses are ASCII"))
     }
 }
 

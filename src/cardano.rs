@@ -136,19 +136,16 @@ pub fn cardano_address_from_raw_to_slice(
 }
 
 #[cfg(feature = "alloc")]
-fn to_string_with(f: impl FnOnce(&mut [u8]) -> Result<usize, Error>) -> Result<String, String> {
+fn to_string_with(f: impl FnOnce(&mut [u8]) -> Result<usize, Error>) -> Result<String, Error> {
     let mut buf = [0u8; MAX_CARDANO_ADDRESS_LEN];
-    let n = f(&mut buf).map_err(|e| format!("cardano: {e}"))?;
+    let n = f(&mut buf)?;
     Ok(String::from_utf8(buf[..n].to_vec()).expect("bech32 output is ASCII"))
 }
 
 /// Builds a type-6 enterprise address (payment credential only) from a 28-byte
 /// payment key hash.
 #[cfg(feature = "alloc")]
-pub fn cardano_enterprise_address(
-    payment_key_hash: &[u8],
-    network: &str,
-) -> Result<String, String> {
+pub fn cardano_enterprise_address(payment_key_hash: &[u8], network: &str) -> Result<String, Error> {
     to_string_with(|out| cardano_enterprise_address_to_slice(payment_key_hash, network, out))
 }
 
@@ -159,7 +156,7 @@ pub fn cardano_base_address(
     payment_key_hash: &[u8],
     stake_key_hash: &[u8],
     network: &str,
-) -> Result<String, String> {
+) -> Result<String, Error> {
     to_string_with(|out| {
         cardano_base_address_to_slice(payment_key_hash, stake_key_hash, network, out)
     })
@@ -168,7 +165,7 @@ pub fn cardano_base_address(
 /// Builds a type-14 reward (stake/account) address from a 28-byte stake key
 /// hash.
 #[cfg(feature = "alloc")]
-pub fn cardano_reward_address(stake_key_hash: &[u8], network: &str) -> Result<String, String> {
+pub fn cardano_reward_address(stake_key_hash: &[u8], network: &str) -> Result<String, Error> {
     to_string_with(|out| cardano_reward_address_to_slice(stake_key_hash, network, out))
 }
 
@@ -233,16 +230,14 @@ pub fn decode_cardano_address(address: &str) -> Result<DecodedAddress, Error> {
 /// payload (header byte followed by credentials) is preserved so the address can
 /// be re-encoded via [`Out::address`].
 #[cfg(feature = "alloc")]
-pub fn parse_cardano_address(address: &str) -> Result<Out, String> {
-    decode_cardano_address(address)
-        .map(Out::from)
-        .map_err(|e| format!("failed to parse cardano address: {e}"))
+pub fn parse_cardano_address(address: &str) -> Result<Out, Error> {
+    decode_cardano_address(address).map(Out::from)
 }
 
 #[cfg(feature = "alloc")]
 /// Renders a Cardano address for a parsed or generated [`Out`] whose raw payload
 /// is "header byte + credentials". The network flag overrides the header's
 /// network nibble so the same `Out` can produce mainnet or testnet forms.
-pub fn cardano_address_from_out(raw: &[u8], network: &str) -> Result<String, String> {
+pub fn cardano_address_from_out(raw: &[u8], network: &str) -> Result<String, Error> {
     to_string_with(|out| cardano_address_from_raw_to_slice(raw, network, out))
 }

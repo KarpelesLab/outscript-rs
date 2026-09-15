@@ -14,17 +14,7 @@ use crate::pushbytes::parse_push_bytes;
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
 
-/// The error a [`PsbtSigner`] reports when it cannot produce a signature.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SignerError;
-
-impl core::fmt::Display for SignerError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("signer failed")
-    }
-}
-
-impl core::error::Error for SignerError {}
+pub use crate::crypto::SignerError;
 
 /// A key that can sign PSBT inputs: a [`SecpPrivateKey`], or an external
 /// signer (hardware wallet, HSM, remote service).

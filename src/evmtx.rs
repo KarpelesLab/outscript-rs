@@ -14,6 +14,54 @@ pub use crate::evmraw::EvmTxType;
 use crate::hash::keccak256_once;
 use crate::rlp::{self, RlpItem};
 
+/// Errors from EVM transaction operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// RLP encoding or decoding failed.
+    Rlp(rlp::Error),
+    /// ABI encoding failed.
+    Abi(crate::evmabi::Error),
+    /// The transaction type is not supported.
+    UnsupportedType,
+    /// The encoding is not a single RLP list.
+    InvalidEncoding,
+    /// The RLP list has the wrong number of fields for its type.
+    InvalidFieldCount,
+    /// The transaction is not signed.
+    NotSigned,
+    /// The signature's `v` value is invalid.
+    InvalidV,
+    /// A signature component is negative or longer than 32 bytes.
+    InvalidSignature,
+    /// Sender public-key recovery failed.
+    Recovery,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::Rlp(e) => e.fmt(f),
+            Error::Abi(e) => e.fmt(f),
+            Error::UnsupportedType => f.write_str("unsupported EVM transaction type"),
+            Error::InvalidEncoding => f.write_str("invalid EVM transaction encoding"),
+            Error::InvalidFieldCount => f.write_str("wrong number of transaction fields"),
+            Error::NotSigned => f.write_str("transaction is not signed"),
+            Error::InvalidV => f.write_str("invalid signature v value"),
+            Error::InvalidSignature => f.write_str("invalid signature component"),
+            Error::Recovery => f.write_str("sender recovery failed"),
+        }
+    }
+}
+
+impl core::error::Error for Error {}
+
+impl From<crate::evmabi::Error> for Error {
+    fn from(e: crate::evmabi::Error) -> Self {
+        Error::Abi(e)
+    }
+}
+
 /// An EVM transaction.
 #[derive(Debug, Clone)]
 pub struct EvmTx {
@@ -65,14 +113,14 @@ impl Default for EvmTx {
     }
 }
 
-fn to_item(to: &str) -> Result<RlpItem, String> {
-    RlpItem::hex_str(to).map_err(|e| e.to_string())
+fn to_item(to: &str) -> Result<RlpItem, Error> {
+    RlpItem::hex_str(to).map_err(Error::Rlp)
 }
 
 impl EvmTx {
     /// Returns the RLP fields for the transaction (excluding signature fields).
-    pub fn rlp_fields(&self) -> Result<Vec<RlpItem>, String> {
-        let bi = |v: &BigInt| RlpItem::bigint(v).map_err(|e| e.to_string());
+    pub fn rlp_fields(&self) -> Result<Vec<RlpItem>, Error> {
+        let bi = |v: &BigInt| RlpItem::bigint(v).map_err(Error::Rlp);
         Ok(match self.tx_type {
             EvmTxType::Legacy => vec![
                 RlpItem::uint(self.nonce),
@@ -103,12 +151,12 @@ impl EvmTx {
                 RlpItem::Bytes(self.data.clone()),
                 RlpItem::List(vec![]),
             ],
-            EvmTxType::Eip4844 => return Err("EIP-4844 encoding not supported".into()),
+            EvmTxType::Eip4844 => return Err(Error::UnsupportedType),
         })
     }
 
     /// Returns the bytes signed to produce the signature.
-    pub fn sign_bytes(&self) -> Result<Vec<u8>, String> {
+    pub fn sign_bytes(&self) -> Result<Vec<u8>, Error> {
         match self.tx_type {
             EvmTxType::Legacy => {
                 let mut f = self.rlp_fields()?;
@@ -129,11 +177,11 @@ impl EvmTx {
     }
 
     /// Serializes the transaction.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         if !self.signed {
             return self.sign_bytes();
         }
-        let bi = |v: &BigInt| RlpItem::bigint(v).map_err(|e| e.to_string());
+        let bi = |v: &BigInt| RlpItem::bigint(v).map_err(Error::Rlp);
         let mut f = self.rlp_fields()?;
         f.push(bi(&self.y)?);
         f.push(bi(&self.r)?);
@@ -149,29 +197,27 @@ impl EvmTx {
     }
 
     /// Parses a transaction from its binary encoding.
-    pub fn parse_transaction(buf: &[u8]) -> Result<EvmTx, String> {
+    pub fn parse_transaction(buf: &[u8]) -> Result<EvmTx, Error> {
         if buf.is_empty() {
-            return Err("unexpected EOF".into());
+            return Err(Error::Rlp(rlp::Error::UnexpectedEof));
         }
         let mut tx = EvmTx::default();
         if buf[0] >= 0x80 {
             // legacy
-            let dec = rlp::decode(buf).map_err(|e| e.to_string())?;
+            let dec = rlp::decode(buf).map_err(Error::Rlp)?;
             if dec.len() != 1 {
-                return Err("invalid rlp data for legacy transaction".into());
+                return Err(Error::InvalidEncoding);
             }
-            let list = dec[0].as_list().ok_or("expected list")?;
+            let list = dec[0].as_list().ok_or(Error::InvalidEncoding)?;
             let ln = list.len();
             if ln != 6 && ln != 9 {
-                return Err(format!(
-                    "legacy transaction must have 6 or 9 fields, got {ln}"
-                ));
+                return Err(Error::InvalidFieldCount);
             }
             let b = |i: usize| -> &[u8] { list[i].as_bytes().unwrap_or(&[]) };
             tx.tx_type = EvmTxType::Legacy;
-            tx.nonce = rlp::decode_uint64_checked(b(0)).map_err(|e| e.to_string())?;
+            tx.nonce = rlp::decode_uint64_checked(b(0)).map_err(Error::Rlp)?;
             tx.gas_fee_cap = BigInt::from_bytes_be(Sign::Plus, b(1));
-            tx.gas = rlp::decode_uint64_checked(b(2)).map_err(|e| e.to_string())?;
+            tx.gas = rlp::decode_uint64_checked(b(2)).map_err(Error::Rlp)?;
             tx.to = format!("0x{}", hex::encode(b(3)));
             tx.value = BigInt::from_bytes_be(Sign::Plus, b(4));
             tx.data = b(5).to_vec();
@@ -194,22 +240,22 @@ impl EvmTx {
         let payload = &buf[1..];
         match buf[0] {
             1 | 2 => {
-                let dec = rlp::decode(payload).map_err(|e| e.to_string())?;
+                let dec = rlp::decode(payload).map_err(Error::Rlp)?;
                 if dec.len() != 1 {
-                    return Err("invalid rlp data for typed transaction".into());
+                    return Err(Error::InvalidEncoding);
                 }
-                let list = dec[0].as_list().ok_or("expected list")?;
+                let list = dec[0].as_list().ok_or(Error::InvalidEncoding)?;
                 let b = |i: usize| -> &[u8] { list[i].as_bytes().unwrap_or(&[]) };
                 if buf[0] == 1 {
                     let ln = list.len();
                     if ln != 8 && ln != 11 {
-                        return Err(format!("EIP-2930 must have 8 or 11 fields, got {ln}"));
+                        return Err(Error::InvalidFieldCount);
                     }
                     tx.tx_type = EvmTxType::Eip2930;
-                    tx.chain_id = rlp::decode_uint64_checked(b(0)).map_err(|e| e.to_string())?;
-                    tx.nonce = rlp::decode_uint64_checked(b(1)).map_err(|e| e.to_string())?;
+                    tx.chain_id = rlp::decode_uint64_checked(b(0)).map_err(Error::Rlp)?;
+                    tx.nonce = rlp::decode_uint64_checked(b(1)).map_err(Error::Rlp)?;
                     tx.gas_fee_cap = BigInt::from_bytes_be(Sign::Plus, b(2));
-                    tx.gas = rlp::decode_uint64_checked(b(3)).map_err(|e| e.to_string())?;
+                    tx.gas = rlp::decode_uint64_checked(b(3)).map_err(Error::Rlp)?;
                     tx.to = format!("0x{}", hex::encode(b(4)));
                     tx.value = BigInt::from_bytes_be(Sign::Plus, b(5));
                     tx.data = b(6).to_vec();
@@ -222,14 +268,14 @@ impl EvmTx {
                 } else {
                     let ln = list.len();
                     if ln != 9 && ln != 12 {
-                        return Err(format!("EIP-1559 must have 9 or 12 fields, got {ln}"));
+                        return Err(Error::InvalidFieldCount);
                     }
                     tx.tx_type = EvmTxType::Eip1559;
-                    tx.chain_id = rlp::decode_uint64_checked(b(0)).map_err(|e| e.to_string())?;
-                    tx.nonce = rlp::decode_uint64_checked(b(1)).map_err(|e| e.to_string())?;
+                    tx.chain_id = rlp::decode_uint64_checked(b(0)).map_err(Error::Rlp)?;
+                    tx.nonce = rlp::decode_uint64_checked(b(1)).map_err(Error::Rlp)?;
                     tx.gas_tip_cap = BigInt::from_bytes_be(Sign::Plus, b(2));
                     tx.gas_fee_cap = BigInt::from_bytes_be(Sign::Plus, b(3));
-                    tx.gas = rlp::decode_uint64_checked(b(4)).map_err(|e| e.to_string())?;
+                    tx.gas = rlp::decode_uint64_checked(b(4)).map_err(Error::Rlp)?;
                     tx.to = format!("0x{}", hex::encode(b(5)));
                     tx.value = BigInt::from_bytes_be(Sign::Plus, b(6));
                     tx.data = b(7).to_vec();
@@ -242,24 +288,24 @@ impl EvmTx {
                 }
                 Ok(tx)
             }
-            _ => Err("not supported".into()),
+            _ => Err(Error::UnsupportedType),
         }
     }
 
     /// Parses from bytes (alias for `parse_transaction`).
-    pub fn from_bytes(buf: &[u8]) -> Result<EvmTx, String> {
+    pub fn from_bytes(buf: &[u8]) -> Result<EvmTx, Error> {
         Self::parse_transaction(buf)
     }
 
     /// Returns `(r, s, recovery_id)` for the signed transaction, normalizing the
     /// legacy EIP-155 `v` and setting `chain_id`.
-    fn signature_parts(&self) -> Result<([u8; 32], [u8; 32], u8), String> {
+    fn signature_parts(&self) -> Result<([u8; 32], [u8; 32], u8), Error> {
         if !self.signed {
-            return Err("cannot obtain signature of an unsigned transaction".into());
+            return Err(Error::NotSigned);
         }
         let r = bigint_to_32(&self.r)?;
         let s = bigint_to_32(&self.s)?;
-        let mut v = self.y.to_u64().ok_or("invalid v")?;
+        let mut v = self.y.to_u64().ok_or(Error::InvalidV)?;
         if self.tx_type == EvmTxType::Legacy {
             if v >= 35 {
                 // EIP-155: v = chainId*2 + 35 + recid; recid = 1 - (v & 1).
@@ -271,33 +317,33 @@ impl EvmTx {
                 v = match v {
                     27 | 28 => v - 27,
                     0 | 1 => v,
-                    _ => return Err("invalid pre-EIP-155 signature v value".into()),
+                    _ => return Err(Error::InvalidV),
                 };
             }
         }
         if v > 3 {
-            return Err("invalid recovery id".into());
+            return Err(Error::InvalidV);
         }
         Ok((r, s, v as u8))
     }
 
     /// Recovers the sender's public key.
-    pub fn sender_pubkey(&self) -> Result<crate::crypto::secp256k1::SecpPublicKey, String> {
+    pub fn sender_pubkey(&self) -> Result<crate::crypto::secp256k1::SecpPublicKey, Error> {
         let (r, s, recid) = self.signature_parts()?;
         let buf = self.sign_bytes()?;
         let digest = keccak256_once(&buf);
-        recover_public_key(&r, &s, recid, &digest).map_err(|e| e.to_string())
+        recover_public_key(&r, &s, recid, &digest).map_err(|_| Error::Recovery)
     }
 
     /// Recovers the EIP-55 checksummed sender address.
-    pub fn sender_address(&self) -> Result<String, String> {
+    pub fn sender_address(&self) -> Result<String, Error> {
         let pubkey = self.sender_pubkey()?;
         let addr = crate::hash::ether_hash(&pubkey.serialize_uncompressed());
         Ok(eip55(&addr))
     }
 
     /// Signs the transaction with the given key.
-    pub fn sign(&mut self, key: &SecpPrivateKey) -> Result<(), String> {
+    pub fn sign(&mut self, key: &SecpPrivateKey) -> Result<(), Error> {
         let buf = self.sign_bytes()?;
         let digest = keccak256_once(&buf);
         let (r, s, recid) = key.sign_recoverable(&digest);
@@ -318,25 +364,25 @@ impl EvmTx {
     }
 
     /// Returns the keccak-256 hash of the signed transaction's encoding.
-    pub fn hash(&self) -> Result<[u8; 32], String> {
+    pub fn hash(&self) -> Result<[u8; 32], Error> {
         let data = self.to_bytes()?;
         Ok(keccak256_once(&data))
     }
 
     /// Sets the transaction's calldata to the ABI-encoded method call.
-    pub fn call(&mut self, method: &str, params: &[AbiValue]) -> Result<(), String> {
+    pub fn call(&mut self, method: &str, params: &[AbiValue]) -> Result<(), Error> {
         self.data = evm_call(method, params)?;
         Ok(())
     }
 }
 
-fn bigint_to_32(v: &BigInt) -> Result<[u8; 32], String> {
+fn bigint_to_32(v: &BigInt) -> Result<[u8; 32], Error> {
     let (sign, bytes) = v.to_bytes_be();
     if sign == Sign::Minus {
-        return Err("negative signature component".into());
+        return Err(Error::InvalidSignature);
     }
     if bytes.len() > 32 {
-        return Err("signature component exceeds 32 bytes".into());
+        return Err(Error::InvalidSignature);
     }
     let mut out = [0u8; 32];
     out[32 - bytes.len()..].copy_from_slice(&bytes);
@@ -540,18 +586,18 @@ fn hex0x_big(v: &BigInt) -> String {
     format!("0x{v:x}")
 }
 
-fn parse_u64_auto(s: &str) -> Result<u64, String> {
+fn parse_u64_auto(s: &str) -> Result<u64, core::num::ParseIntError> {
     if let Some(h) = s.strip_prefix("0x") {
-        u64::from_str_radix(h, 16).map_err(|e| e.to_string())
+        u64::from_str_radix(h, 16)
     } else {
-        s.parse::<u64>().map_err(|e| e.to_string())
+        s.parse::<u64>()
     }
 }
-fn parse_big_auto(s: &str) -> Result<BigInt, String> {
+fn parse_big_auto(s: &str) -> Result<BigInt, num_bigint::ParseBigIntError> {
     if let Some(h) = s.strip_prefix("0x") {
-        BigInt::from_str_radix(h, 16).map_err(|e| e.to_string())
+        BigInt::from_str_radix(h, 16)
     } else {
-        BigInt::from_str_radix(s, 10).map_err(|e| e.to_string())
+        BigInt::from_str_radix(s, 10)
     }
 }
 

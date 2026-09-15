@@ -32,7 +32,7 @@ pub type Format = Vec<Insertable>;
 
 impl Insertable {
     /// Evaluates this insertable against `script`, producing its bytes.
-    pub fn bytes(&self, script: &Script) -> Result<Vec<u8>, String> {
+    pub fn bytes(&self, script: &Script) -> Result<Vec<u8>, crate::script::Error> {
         match self {
             Insertable::Bytes(b) => Ok(b.clone()),
             Insertable::Lookup(name) => script.generate(name),
@@ -46,16 +46,13 @@ impl Insertable {
             }
             Insertable::TaprootTweak(inner) => {
                 let v = inner.bytes(script)?;
-                if v.len() != 33 {
-                    return Err(format!(
-                        "taproot tweak expects 33-byte compressed pubkey, got {}",
-                        v.len()
-                    ));
-                }
-                let mut x_only = [0u8; 32];
-                x_only.copy_from_slice(&v[1..]);
-                let (tweaked, _) =
-                    crate::crypto::secp256k1::taproot_tweak(&x_only).map_err(|e| e.to_string())?;
+                let x_only: [u8; 32] = v
+                    .get(1..)
+                    .filter(|_| v.len() == 33)
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or(crate::script::Error::InvalidKey)?;
+                let (tweaked, _) = crate::crypto::secp256k1::taproot_tweak(&x_only)
+                    .map_err(|_| crate::script::Error::InvalidKey)?;
                 Ok(tweaked.to_vec())
             }
         }

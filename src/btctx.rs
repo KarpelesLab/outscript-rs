@@ -15,6 +15,8 @@ use crate::address::parse_bitcoin_based_address;
 use crate::btcamount::BtcAmount;
 use crate::btcraw::{PrevOut, RawTx, RawTxIn, RawTxOut, SegwitV0Midstate, TaprootMidstate};
 use crate::btcvarint::BtcVarInt;
+use crate::crypto::SignerError;
+use crate::crypto::secp256k1::DerSignature;
 use crate::crypto::secp256k1::SecpPublicKey;
 use crate::hash::{dsha256, hash160, sha256_once};
 use crate::pubkey::PubKey;
@@ -31,14 +33,14 @@ pub trait Signer {
         None
     }
     /// Produces a DER-encoded low-S ECDSA signature over the 32-byte digest.
-    fn sign_ecdsa_der(&self, _digest: &[u8; 32]) -> Result<Vec<u8>, String> {
-        Err("ECDSA signing not supported by this signer".into())
+    fn sign_ecdsa_der(&self, _digest: &[u8; 32]) -> Result<DerSignature, SignerError> {
+        Err(SignerError)
     }
     /// Produces a 64-byte BIP-340 Schnorr signature over the 32-byte taproot
     /// sighash. For a raw key this applies the BIP-341 key-path tweak; external
     /// signers are expected to already hold the tweaked key.
-    fn sign_taproot(&self, _sighash: &[u8; 32]) -> Result<[u8; 64], String> {
-        Err("taproot signing not supported by this signer".into())
+    fn sign_taproot(&self, _sighash: &[u8; 32]) -> Result<[u8; 64], SignerError> {
+        Err(SignerError)
     }
 }
 
@@ -46,11 +48,11 @@ impl Signer for crate::crypto::secp256k1::SecpPrivateKey {
     fn ecdsa_public_key(&self) -> Option<SecpPublicKey> {
         Some(self.public_key())
     }
-    fn sign_ecdsa_der(&self, digest: &[u8; 32]) -> Result<Vec<u8>, String> {
-        Ok(self.sign_der(digest).into())
+    fn sign_ecdsa_der(&self, digest: &[u8; 32]) -> Result<DerSignature, SignerError> {
+        Ok(self.sign_der(digest))
     }
-    fn sign_taproot(&self, sighash: &[u8; 32]) -> Result<[u8; 64], String> {
-        self.sign_taproot(sighash).map_err(|e| e.to_string())
+    fn sign_taproot(&self, sighash: &[u8; 32]) -> Result<[u8; 64], SignerError> {
+        self.sign_taproot(sighash).map_err(|_| SignerError)
     }
 }
 
@@ -130,18 +132,119 @@ impl<'a> BtcTxSign<'a> {
     }
 }
 
-fn signer_pubkey_script(key: &dyn Signer, name: &str) -> Result<Vec<u8>, String> {
-    let pk = key
-        .ecdsa_public_key()
-        .ok_or("signer does not expose an ECDSA public key")?;
-    Script::new(PubKey::Secp256k1(pk)).generate(name)
+fn signer_pubkey_script(key: &dyn Signer, name: &str) -> Result<Vec<u8>, Error> {
+    let pk = key.ecdsa_public_key().ok_or(Error::NoPublicKey)?;
+    Ok(Script::new(PubKey::Secp256k1(pk)).generate(name)?)
+}
+
+/// Errors from Bitcoin transaction operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// The number of signing entries does not match the number of inputs.
+    KeyCount,
+    /// A signing entry has no key.
+    MissingKey,
+    /// The signer does not expose an ECDSA public key.
+    NoPublicKey,
+    /// The signer failed.
+    Signer,
+    /// The spend scheme is not supported.
+    UnsupportedScheme,
+    /// The sighash type is not supported for this spend.
+    UnsupportedSighash,
+    /// No standard witness script matches the key and the input's
+    /// scriptPubKey.
+    NoMatchingWitnessScript,
+    /// A taproot sighash needs the previous scriptPubKey of this input.
+    MissingPrevScript(usize),
+    /// The previous outputs do not match the inputs one to one.
+    PrevOutCount,
+    /// A spend needs a redeem or leaf script that was not provided.
+    MissingScript,
+    /// The input index is out of range.
+    InputIndex,
+    /// A signature is not a valid DER encoding.
+    InvalidSignature,
+    /// A script could not be generated.
+    Script(crate::script::Error),
+    /// An address could not be parsed.
+    Address(crate::address::Error),
+    /// A PSBT operation failed.
+    Psbt(crate::psbt::Error),
+    /// The transaction data ended unexpectedly.
+    UnexpectedEof,
+    /// The transaction declares too many inputs.
+    TooManyInputs,
+    /// The transaction declares too many outputs.
+    TooManyOutputs,
+    /// A script or witness item is larger than allowed.
+    BufferTooLarge,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::KeyCount => f.write_str("signing needs one entry per input"),
+            Error::MissingKey => f.write_str("signing requires a key"),
+            Error::NoPublicKey => f.write_str("signer does not expose an ECDSA public key"),
+            Error::Signer => f.write_str("signer failed"),
+            Error::UnsupportedScheme => f.write_str("unsupported spend scheme"),
+            Error::UnsupportedSighash => f.write_str("unsupported sighash type"),
+            Error::NoMatchingWitnessScript => {
+                f.write_str("no standard witness script matches the input")
+            }
+            Error::MissingPrevScript(i) => write!(f, "input {i} is missing its previous script"),
+            Error::PrevOutCount => f.write_str("previous outputs must match the inputs"),
+            Error::MissingScript => f.write_str("missing redeem or leaf script"),
+            Error::InputIndex => f.write_str("input index out of range"),
+            Error::InvalidSignature => f.write_str("invalid DER signature"),
+            Error::Script(e) => e.fmt(f),
+            Error::Address(e) => e.fmt(f),
+            Error::Psbt(e) => e.fmt(f),
+            Error::UnexpectedEof => f.write_str("unexpected end of transaction data"),
+            Error::TooManyInputs => f.write_str("invalid transaction: too many inputs"),
+            Error::TooManyOutputs => f.write_str("invalid transaction: too many outputs"),
+            Error::BufferTooLarge => f.write_str("buffer larger than maximum allowed length"),
+        }
+    }
+}
+
+impl core::error::Error for Error {}
+
+impl From<crate::script::Error> for Error {
+    fn from(e: crate::script::Error) -> Self {
+        Error::Script(e)
+    }
+}
+
+impl From<crate::address::Error> for Error {
+    fn from(e: crate::address::Error) -> Self {
+        Error::Address(e)
+    }
+}
+
+impl From<SignerError> for Error {
+    fn from(_: SignerError) -> Self {
+        Error::Signer
+    }
+}
+
+impl From<crate::btcraw::Error> for Error {
+    fn from(e: crate::btcraw::Error) -> Self {
+        match e {
+            crate::btcraw::Error::PrevOutCount => Error::PrevOutCount,
+            crate::btcraw::Error::UnsupportedSighash => Error::UnsupportedSighash,
+            _ => Error::InputIndex,
+        }
+    }
 }
 
 impl BtcTx {
     /// Signs the transaction. Requires one signing entry per input.
-    pub fn sign(&mut self, keys: &[BtcTxSign]) -> Result<(), String> {
+    pub fn sign(&mut self, keys: &[BtcTxSign]) -> Result<(), Error> {
         if self.inputs.is_empty() || self.inputs.len() != keys.len() {
-            return Err("Sign requires as many keys as there are inputs".into());
+            return Err(Error::KeyCount);
         }
 
         let mut midstate: Option<SegwitV0Midstate> = None;
@@ -152,13 +255,13 @@ impl BtcTx {
             if k.scheme != "p2tr" && sighash == 0 {
                 sighash = 1; // SIGHASH_ALL
             }
-            let key = k.key.ok_or("signing requires a key")?;
+            let key = k.key.ok_or(Error::MissingKey)?;
 
             match k.scheme.as_str() {
                 "p2pk" => {
                     let script_code = signer_pubkey_script(key, "p2pk")?;
                     let digest = self.legacy_sighash(n, &script_code, sighash)?;
-                    let mut sig = key.sign_ecdsa_der(&digest)?;
+                    let mut sig: Vec<u8> = key.sign_ecdsa_der(&digest)?.into();
                     sig.push((sighash & 0xff) as u8);
                     self.inputs[n].script = push_bytes(&sig);
                 }
@@ -171,7 +274,7 @@ impl BtcTx {
                     }
                     let script_code = signer_pubkey_script(key, &k.scheme)?;
                     let digest = self.legacy_sighash(n, &script_code, sighash)?;
-                    let mut sig = key.sign_ecdsa_der(&digest)?;
+                    let mut sig: Vec<u8> = key.sign_ecdsa_der(&digest)?.into();
                     sig.push((sighash & 0xff) as u8);
                     let pubkey = if k.scheme == "p2pkh" {
                         signer_pubkey_script(key, "pubkey:comp")?
@@ -197,7 +300,7 @@ impl BtcTx {
                     let parts = taproot_parts.as_ref().unwrap();
                     self.p2tr_sign(n, k, parts)?;
                 }
-                other => return Err(format!("unsupported sign scheme: {other}")),
+                _ => return Err(Error::UnsupportedScheme),
             }
         }
         Ok(())
@@ -209,8 +312,8 @@ impl BtcTx {
         k: &BtcTxSign,
         sighash: u32,
         mid: &SegwitV0Midstate,
-    ) -> Result<(), String> {
-        let key = k.key.ok_or("signing requires a key")?;
+    ) -> Result<(), Error> {
+        let key = k.key.ok_or(Error::MissingKey)?;
         let pubkey = if k.scheme == "p2pukh" {
             signer_pubkey_script(key, "pubkey:uncomp")?
         } else {
@@ -219,7 +322,7 @@ impl BtcTx {
         let pk_hash = hash160(&pubkey);
         let script_code = p2pkh_script_code(&pk_hash);
         let digest = mid.sighash(&self.inputs[n].raw(), &script_code, k.amount.0, sighash);
-        let mut sig = key.sign_ecdsa_der(&digest)?;
+        let mut sig: Vec<u8> = key.sign_ecdsa_der(&digest)?.into();
         sig.push((sighash & 0xff) as u8);
 
         match k.scheme.as_str() {
@@ -249,21 +352,20 @@ impl BtcTx {
         k: &BtcTxSign,
         sighash: u32,
         mid: &SegwitV0Midstate,
-    ) -> Result<(), String> {
-        let key = k.key.ok_or("signing requires a key")?;
-        let (inner_scheme, witness_script) = if k.scheme == "p2wsh" {
+    ) -> Result<(), Error> {
+        let key = k.key.ok_or(Error::MissingKey)?;
+        let (inner_scheme, witness_script): (&str, Vec<u8>) = if k.scheme == "p2wsh" {
             self.detect_p2wsh_inner(n, key)?
         } else {
-            let inner = k.scheme["p2wsh:".len()..].to_string();
-            let ws = signer_pubkey_script(key, &inner)?;
-            (inner, ws)
+            let inner = &k.scheme["p2wsh:".len()..];
+            (inner, signer_pubkey_script(key, inner)?)
         };
 
         let digest = mid.sighash(&self.inputs[n].raw(), &witness_script, k.amount.0, sighash);
-        let mut sig = key.sign_ecdsa_der(&digest)?;
+        let mut sig: Vec<u8> = key.sign_ecdsa_der(&digest)?.into();
         sig.push((sighash & 0xff) as u8);
 
-        match inner_scheme.as_str() {
+        match inner_scheme {
             "p2pk" | "p2puk" => {
                 self.inputs[n].witnesses = vec![sig, witness_script];
             }
@@ -275,17 +377,19 @@ impl BtcTx {
                 let pubkey = signer_pubkey_script(key, "pubkey:uncomp")?;
                 self.inputs[n].witnesses = vec![sig, pubkey, witness_script];
             }
-            other => return Err(format!("p2wsh: unsupported inner scheme {other:?}")),
+            _ => return Err(Error::UnsupportedScheme),
         }
         self.inputs[n].script = Vec::new();
         Ok(())
     }
 
-    fn detect_p2wsh_inner(&self, n: usize, key: &dyn Signer) -> Result<(String, Vec<u8>), String> {
+    fn detect_p2wsh_inner(
+        &self,
+        n: usize,
+        key: &dyn Signer,
+    ) -> Result<(&'static str, Vec<u8>), Error> {
         let candidates = ["p2pkh", "p2pk", "p2pukh", "p2puk"];
-        let pk = key
-            .ecdsa_public_key()
-            .ok_or("signer does not expose an ECDSA public key")?;
+        let pk = key.ecdsa_public_key().ok_or(Error::NoPublicKey)?;
         let s = Script::new(PubKey::Secp256k1(pk));
 
         let sc = &self.inputs[n].script;
@@ -305,17 +409,13 @@ impl BtcTx {
             match target_hash {
                 Some(t) => {
                     if sha256_once(&ws) == t {
-                        return Ok((inner.to_string(), ws));
+                        return Ok((inner, ws));
                     }
                 }
-                None => return Ok((inner.to_string(), ws)),
+                None => return Ok((inner, ws)),
             }
         }
-        if target_hash.is_some() {
-            Err("p2wsh: none of the standard script types match the input scriptPubKey".into())
-        } else {
-            Err("p2wsh: unable to generate any witness script from the provided key".into())
-        }
+        Err(Error::NoMatchingWitnessScript)
     }
 
     /// Runs `f` on a borrowed [`RawTx`] view of this transaction. Scripts and
@@ -341,16 +441,16 @@ impl BtcTx {
     /// Creates a BIP-174 PSBT for this transaction, which must not carry any
     /// scriptSig or witness yet. Add UTXO and script information with the
     /// [`Psbt`](crate::psbt::Psbt) updater methods before signing.
-    pub fn to_psbt(&self) -> Result<Vec<u8>, String> {
+    pub fn to_psbt(&self) -> Result<Vec<u8>, Error> {
         if self
             .inputs
             .iter()
             .any(|i| !i.script.is_empty() || !i.witnesses.is_empty())
         {
-            return Err("psbt: transaction inputs must be unsigned".into());
+            return Err(Error::Psbt(crate::psbt::Error::InvalidUnsignedTx));
         }
         self.with_raw(crate::psbt::Psbt::create_to_vec)
-            .map_err(|e| format!("psbt: {e}"))
+            .map_err(Error::Psbt)
     }
 
     /// The BIP-143 hashes shared by every input.
@@ -382,7 +482,7 @@ impl BtcTx {
     }
 
     /// Adds an output for the given address, auto-detecting the network.
-    pub fn add_output(&mut self, address: &str, amount: u64) -> Result<(), String> {
+    pub fn add_output(&mut self, address: &str, amount: u64) -> Result<(), Error> {
         self.add_net_output("auto", address, amount)
     }
 
@@ -392,7 +492,7 @@ impl BtcTx {
         network: &str,
         address: &str,
         amount: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         let addr = parse_bitcoin_based_address(network, address)?;
         let n = self.outputs.len();
         self.outputs.push(BtcTxOutput {
@@ -459,10 +559,10 @@ impl BtcTx {
     }
 
     /// Parses a transaction from bytes.
-    pub fn from_bytes(buf: &[u8]) -> Result<BtcTx, String> {
+    pub fn from_bytes(buf: &[u8]) -> Result<BtcTx, Error> {
         let mut tx = BtcTx::default();
         tx.read_source(&mut SliceSource(buf))
-            .map_err(|e| e.to_string())?;
+            .map_err(ReadError::into_error)?;
         Ok(tx)
     }
 
@@ -567,7 +667,7 @@ impl BtcTxInput {
 
     /// Fills the input with placeholder data of the expected signature size for
     /// the given scheme (used for fee estimation).
-    pub fn prefill(&mut self, scheme: &str) -> Result<(), String> {
+    pub fn prefill(&mut self, scheme: &str) -> Result<(), Error> {
         // worst-case sizes used for fee estimation
         let empty_sig = vec![0u8; 72];
         let comp_key = vec![0u8; 33];
@@ -616,7 +716,7 @@ impl BtcTxInput {
                 self.script = Vec::new();
                 self.witnesses = vec![vec![0u8; 64]];
             }
-            other => return Err(format!("unsupported sign scheme: {other}")),
+            _ => return Err(Error::UnsupportedScheme),
         }
         Ok(())
     }
@@ -653,16 +753,14 @@ impl BtcTx {
     fn taproot_sighash_parts_from_keys(
         &self,
         keys: &[BtcTxSign],
-    ) -> Result<TaprootSighashParts, String> {
+    ) -> Result<TaprootSighashParts, Error> {
         if keys.len() != self.inputs.len() {
-            return Err("taproot: keys length does not match number of inputs".into());
+            return Err(Error::KeyCount);
         }
         let mut prevouts = Vec::with_capacity(keys.len());
         for (i, k) in keys.iter().enumerate() {
             if k.prev_script.is_empty() {
-                return Err(format!(
-                    "taproot: input {i} missing PrevScript (required when any input uses p2tr)"
-                ));
+                return Err(Error::MissingPrevScript(i));
             }
             prevouts.push(PrevOut {
                 amount: k.amount.0,
@@ -670,26 +768,26 @@ impl BtcTx {
             });
         }
         self.with_raw(|raw| raw.taproot_midstate(&prevouts))
-            .map_err(|e| format!("taproot: {e}"))
+            .map_err(Error::from)
     }
 
     pub(crate) fn taproot_sighash_parts_raw(
         &self,
         prev_scripts: &[Vec<u8>],
         amounts: &[u64],
-    ) -> Result<TaprootSighashParts, String> {
+    ) -> Result<TaprootSighashParts, Error> {
         if prev_scripts.len() != self.inputs.len() || amounts.len() != self.inputs.len() {
-            return Err("taproot: prevScripts/amounts must match input count".into());
+            return Err(Error::PrevOutCount);
         }
         let mut prevouts = Vec::with_capacity(prev_scripts.len());
         for (i, (script, &amount)) in prev_scripts.iter().zip(amounts).enumerate() {
             if script.is_empty() {
-                return Err(format!("taproot: input {i} missing prev script"));
+                return Err(Error::MissingPrevScript(i));
             }
             prevouts.push(PrevOut { amount, script });
         }
         self.with_raw(|raw| raw.taproot_midstate(&prevouts))
-            .map_err(|e| format!("taproot: {e}"))
+            .map_err(Error::from)
     }
 
     /// Pre-segwit legacy sighash: clear inputs, substitute `script_code` at
@@ -700,16 +798,15 @@ impl BtcTx {
         n: usize,
         script_code: &[u8],
         flag: u32,
-    ) -> Result<[u8; 32], String> {
-        self.with_raw(|raw| raw.legacy_sighash(n, script_code, flag))
-            .map_err(|e| e.to_string())
+    ) -> Result<[u8; 32], Error> {
+        Ok(self.with_raw(|raw| raw.legacy_sighash(n, script_code, flag))?)
     }
 
     /// Computes the BIP-341 key-path SIGHASH_DEFAULT digest for input `idx`.
     /// Each entry in `keys` must have its `prev_script` and `amount` set.
-    pub fn taproot_sighash(&self, keys: &[BtcTxSign], idx: usize) -> Result<[u8; 32], String> {
+    pub fn taproot_sighash(&self, keys: &[BtcTxSign], idx: usize) -> Result<[u8; 32], Error> {
         let parts = self.taproot_sighash_parts_from_keys(keys)?;
-        parts.key_spend_sighash(idx).map_err(|e| e.to_string())
+        Ok(parts.key_spend_sighash(idx)?)
     }
 
     fn p2tr_sign(
@@ -717,15 +814,12 @@ impl BtcTx {
         n: usize,
         k: &BtcTxSign,
         parts: &TaprootSighashParts,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         if k.sighash != 0 && k.sighash != 1 {
-            return Err(format!(
-                "taproot: SigHash 0x{:x} not supported (only SIGHASH_DEFAULT)",
-                k.sighash
-            ));
+            return Err(Error::UnsupportedSighash);
         }
-        let sighash = parts.key_spend_sighash(n).map_err(|e| e.to_string())?;
-        let key = k.key.ok_or("signing requires a key")?;
+        let sighash = parts.key_spend_sighash(n)?;
+        let key = k.key.ok_or(Error::MissingKey)?;
         let sig = key.sign_taproot(&sighash)?;
         self.inputs[n].witnesses = vec![sig.to_vec()];
         self.inputs[n].script = Vec::new();
@@ -759,8 +853,19 @@ impl core::fmt::Display for ReadError {
     }
 }
 
-#[cfg(feature = "std")]
 impl ReadError {
+    fn into_error(self) -> Error {
+        match self {
+            ReadError::Eof => Error::UnexpectedEof,
+            ReadError::TooManyInputs => Error::TooManyInputs,
+            ReadError::TooManyOutputs => Error::TooManyOutputs,
+            ReadError::BufferTooLarge => Error::BufferTooLarge,
+            #[cfg(feature = "std")]
+            ReadError::Io(_) => Error::UnexpectedEof,
+        }
+    }
+
+    #[cfg(feature = "std")]
     fn into_io(self) -> io::Error {
         match self {
             ReadError::Io(e) => e,

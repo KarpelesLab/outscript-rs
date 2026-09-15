@@ -25,16 +25,11 @@ pub enum PubKey {
 impl PubKey {
     /// Returns the public-key bytes for the requested internal format name
     /// (`pubkey:comp`, `pubkey:uncomp`, `pubkey:ed25519`).
-    pub fn bytes_for(&self, typ: &str) -> Result<Vec<u8>, String> {
-        match (typ, self) {
-            ("pubkey:ed25519", PubKey::Ed25519(k)) => Ok(k.to_vec()),
-            ("pubkey:comp", PubKey::Secp256k1(k)) => Ok(k.serialize_compressed().to_vec()),
-            ("pubkey:uncomp", PubKey::Secp256k1(k)) => Ok(k.serialize_uncompressed().to_vec()),
-            ("pubkey:ed25519" | "pubkey:comp" | "pubkey:uncomp", _) => {
-                Err(format!("public key does not support {typ} export"))
-            }
-            _ => Err(format!("unknown public key format {typ}")),
+    pub fn bytes_for(&self, typ: &str) -> Result<Vec<u8>, crate::script::Error> {
+        if !matches!(typ, "pubkey:ed25519" | "pubkey:comp" | "pubkey:uncomp") {
+            return Err(crate::script::Error::UnknownFormat);
         }
+        crate::script::generate_script(self, typ).map(Vec::from)
     }
 }
 

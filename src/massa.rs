@@ -1,8 +1,5 @@
 //! Massa address parsing (port of `massa.go`).
 
-#[cfg(feature = "alloc")]
-use crate::prelude::*;
-
 use crate::address::{DecodedAddress, Error};
 use crate::base58;
 use crate::hash::dsha256;
@@ -37,10 +34,8 @@ pub fn decode_massa_address(address: &str) -> Result<DecodedAddress, Error> {
 
 /// Parses a Massa address ("AU" for user accounts, "AS" for smart contracts).
 #[cfg(feature = "alloc")]
-pub fn parse_massa_address(address: &str) -> Result<Out, String> {
-    decode_massa_address(address)
-        .map(Out::from)
-        .map_err(|e| format!("failed to parse massa address: {e}"))
+pub fn parse_massa_address(address: &str) -> Result<Out, Error> {
+    decode_massa_address(address).map(Out::from)
 }
 
 #[cfg(test)]

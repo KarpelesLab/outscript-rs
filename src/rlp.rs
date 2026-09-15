@@ -17,7 +17,7 @@ pub enum RlpItem {
 }
 
 /// Errors from RLP operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
     /// Unexpected end of input.
@@ -31,8 +31,10 @@ pub enum Error {
     NegativeValue,
     /// A string value lacked the required `0x` prefix.
     StringPrefix,
-    /// Generic message.
-    Other(String),
+    /// A `0x` string is not valid hex.
+    InvalidHex,
+    /// An integer field is longer than 8 bytes.
+    IntegerTooLong,
 }
 
 impl core::fmt::Display for Error {
@@ -43,7 +45,8 @@ impl core::fmt::Display for Error {
             Error::NonCanonicalValue => f.write_str("non-canonical value"),
             Error::NegativeValue => f.write_str("cannot encode negative value"),
             Error::StringPrefix => f.write_str("string must start with 0x"),
-            Error::Other(s) => f.write_str(s),
+            Error::InvalidHex => f.write_str("invalid hex string"),
+            Error::IntegerTooLong => f.write_str("integer field longer than 8 bytes"),
         }
     }
 }
@@ -72,10 +75,7 @@ pub fn decode_uint64(buf: &[u8]) -> u64 {
 /// exceeds 8 bytes. Use this when decoding fields from untrusted transactions.
 pub fn decode_uint64_checked(buf: &[u8]) -> Result<u64, Error> {
     if buf.len() > 8 {
-        return Err(Error::Other(format!(
-            "invalid uint64 field: length {} exceeds 8 bytes",
-            buf.len()
-        )));
+        return Err(Error::IntegerTooLong);
     }
     Ok(decode_uint64(buf))
 }
@@ -124,7 +124,7 @@ impl RlpItem {
         } else {
             body
         };
-        let buf = hex::decode(body).map_err(|e| Error::Other(e.to_string()))?;
+        let buf = hex::decode(body).map_err(|_| Error::InvalidHex)?;
         Ok(RlpItem::Bytes(buf))
     }
 

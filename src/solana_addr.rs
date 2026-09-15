@@ -1,8 +1,5 @@
 //! Solana address parsing (port of `solana.go`).
 
-#[cfg(feature = "alloc")]
-use crate::prelude::*;
-
 use crate::address::{DecodedAddress, Error};
 use crate::base58;
 #[cfg(feature = "alloc")]
@@ -26,8 +23,6 @@ pub fn decode_solana_address(address: &str) -> Result<DecodedAddress, Error> {
 
 /// Parses a Solana base58-encoded address (32 bytes when decoded).
 #[cfg(feature = "alloc")]
-pub fn parse_solana_address(address: &str) -> Result<Out, String> {
-    decode_solana_address(address)
-        .map(Out::from)
-        .map_err(|e| format!("failed to parse solana address: {e}"))
+pub fn parse_solana_address(address: &str) -> Result<Out, Error> {
+    decode_solana_address(address).map(Out::from)
 }

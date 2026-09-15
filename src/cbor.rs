@@ -39,6 +39,47 @@ pub enum Cbor {
     Raw(Vec<u8>),
 }
 
+/// Errors from CBOR decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// The data ended in the middle of an item.
+    UnexpectedEof,
+    /// A head used a reserved additional-information value (28-30).
+    ReservedAdditionalInfo(u8),
+    /// An indefinite-length item where only definite lengths are supported.
+    UnsupportedIndefiniteLength,
+    /// A simple value or float outside the supported subset.
+    UnsupportedSimpleValue(u64),
+    /// A major type outside the supported subset.
+    UnsupportedMajorType(u8),
+    /// A break code outside an indefinite-length container.
+    UnexpectedBreak,
+    /// A chunk of an indefinite-length string has the wrong type.
+    InvalidChunk,
+    /// The data is not a definite-length array.
+    ExpectedArray,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::UnexpectedEof => f.write_str("unexpected end of CBOR data"),
+            Error::ReservedAdditionalInfo(v) => write!(f, "reserved CBOR additional info {v}"),
+            Error::UnsupportedIndefiniteLength => {
+                f.write_str("unsupported indefinite-length CBOR item")
+            }
+            Error::UnsupportedSimpleValue(v) => write!(f, "unsupported CBOR simple value {v}"),
+            Error::UnsupportedMajorType(m) => write!(f, "unsupported CBOR major type {m}"),
+            Error::UnexpectedBreak => f.write_str("unexpected CBOR break"),
+            Error::InvalidChunk => f.write_str("invalid chunk in indefinite-length CBOR string"),
+            Error::ExpectedArray => f.write_str("expected a definite-length CBOR array"),
+        }
+    }
+}
+
+impl core::error::Error for Error {}
+
 fn write_head(out: &mut Vec<u8>, major: u8, value: u64) {
     let mt = major << 5;
     if value < 24 {
@@ -103,7 +144,7 @@ impl Cbor {
     /// bytes consumed. Only the subset emitted by [`Cbor::encode`] is supported
     /// (unsigned ints, byte strings, arrays, maps, bool and null); other types
     /// produce an error.
-    pub fn decode(data: &[u8]) -> Result<(Cbor, usize), String> {
+    pub fn decode(data: &[u8]) -> Result<(Cbor, usize), Error> {
         let mut pos = 0;
         let v = decode_value(data, &mut pos)?;
         Ok((v, pos))
@@ -143,9 +184,9 @@ impl Cbor {
 }
 
 /// Reads the major type and argument of a CBOR head, advancing `pos`.
-fn read_head(data: &[u8], pos: &mut usize) -> Result<(u8, u64, bool), String> {
+fn read_head(data: &[u8], pos: &mut usize) -> Result<(u8, u64, bool), Error> {
     if *pos >= data.len() {
-        return Err("unexpected end of CBOR data".into());
+        return Err(Error::UnexpectedEof);
     }
     let ib = data[*pos];
     *pos += 1;
@@ -158,14 +199,14 @@ fn read_head(data: &[u8], pos: &mut usize) -> Result<(u8, u64, bool), String> {
         26 => (read_uint(data, pos, 4)?, false),
         27 => (read_uint(data, pos, 8)?, false),
         31 => (0, true),
-        _ => return Err(format!("reserved CBOR additional info {info}")),
+        _ => return Err(Error::ReservedAdditionalInfo(info)),
     };
     Ok((major, arg, indefinite))
 }
 
-fn read_uint(data: &[u8], pos: &mut usize, n: usize) -> Result<u64, String> {
+fn read_uint(data: &[u8], pos: &mut usize, n: usize) -> Result<u64, Error> {
     if *pos + n > data.len() {
-        return Err("unexpected end of CBOR data".into());
+        return Err(Error::UnexpectedEof);
     }
     let mut v = 0u64;
     for &b in &data[*pos..*pos + n] {
@@ -175,22 +216,22 @@ fn read_uint(data: &[u8], pos: &mut usize, n: usize) -> Result<u64, String> {
     Ok(v)
 }
 
-fn decode_value(data: &[u8], pos: &mut usize) -> Result<Cbor, String> {
+fn decode_value(data: &[u8], pos: &mut usize) -> Result<Cbor, Error> {
     let (major, arg, indefinite) = read_head(data, pos)?;
     match major {
         0 => {
             if indefinite {
-                return Err("integers cannot be indefinite-length".into());
+                return Err(Error::UnsupportedIndefiniteLength);
             }
             Ok(Cbor::Uint(arg))
         }
         2 => {
             if indefinite {
-                return Err("indefinite-length byte strings are not supported".into());
+                return Err(Error::UnsupportedIndefiniteLength);
             }
             let n = arg as usize;
             if *pos + n > data.len() {
-                return Err("unexpected end of CBOR byte string".into());
+                return Err(Error::UnexpectedEof);
             }
             let b = data[*pos..*pos + n].to_vec();
             *pos += n;
@@ -198,7 +239,7 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Result<Cbor, String> {
         }
         4 => {
             if indefinite {
-                return Err("indefinite-length arrays are not supported here".into());
+                return Err(Error::UnsupportedIndefiniteLength);
             }
             let mut items = Vec::with_capacity(arg as usize);
             for _ in 0..arg {
@@ -208,7 +249,7 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Result<Cbor, String> {
         }
         5 => {
             if indefinite {
-                return Err("indefinite-length maps are not supported here".into());
+                return Err(Error::UnsupportedIndefiniteLength);
             }
             let mut entries = Vec::with_capacity(arg as usize);
             for _ in 0..arg {
@@ -222,9 +263,9 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Result<Cbor, String> {
             20 => Ok(Cbor::Bool(false)),
             21 => Ok(Cbor::Bool(true)),
             22 | 23 => Ok(Cbor::Null),
-            _ => Err(format!("unsupported CBOR simple/float value {arg}")),
+            _ => Err(Error::UnsupportedSimpleValue(arg)),
         },
-        _ => Err(format!("unsupported CBOR major type {major}")),
+        _ => Err(Error::UnsupportedMajorType(major)),
     }
 }
 
@@ -232,9 +273,9 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Result<Cbor, String> {
 /// including tags and indefinite-length strings, arrays and maps. Used to carve
 /// real transactions into their raw top-level elements without fully decoding
 /// the (Plutus-laden) contents.
-pub fn scan_item(data: &[u8], pos: &mut usize) -> Result<(), String> {
+pub fn scan_item(data: &[u8], pos: &mut usize) -> Result<(), Error> {
     if *pos >= data.len() {
-        return Err("unexpected end of CBOR data".into());
+        return Err(Error::UnexpectedEof);
     }
     let ib = data[*pos];
     let major = ib >> 5;
@@ -251,7 +292,7 @@ pub fn scan_item(data: &[u8], pos: &mut usize) -> Result<(), String> {
             } else {
                 let n = arg as usize;
                 if *pos + n > data.len() {
-                    return Err("unexpected end of CBOR string".into());
+                    return Err(Error::UnexpectedEof);
                 }
                 *pos += n;
                 Ok(())
@@ -285,20 +326,20 @@ pub fn scan_item(data: &[u8], pos: &mut usize) -> Result<(), String> {
             // simple values / floats; floats carry payload in the head argument,
             // which read_head already consumed. info 24 (simple) also consumed.
             if info == 31 {
-                return Err("unexpected CBOR break".into());
+                return Err(Error::UnexpectedBreak);
             }
             Ok(())
         }
-        _ => Err(format!("invalid CBOR major type {major}")),
+        _ => Err(Error::UnsupportedMajorType(major)),
     }
 }
 
 /// Scans the definite-length chunks of an indefinite-length string until the
 /// break code (0xff). `major` is the expected chunk major type (2 or 3).
-fn scan_indefinite_chunks(data: &[u8], pos: &mut usize, major: u8) -> Result<(), String> {
+fn scan_indefinite_chunks(data: &[u8], pos: &mut usize, major: u8) -> Result<(), Error> {
     loop {
         if *pos >= data.len() {
-            return Err("unexpected end of indefinite CBOR string".into());
+            return Err(Error::UnexpectedEof);
         }
         if data[*pos] == 0xff {
             *pos += 1;
@@ -306,11 +347,11 @@ fn scan_indefinite_chunks(data: &[u8], pos: &mut usize, major: u8) -> Result<(),
         }
         let (m, arg, indef) = read_head(data, pos)?;
         if m != major || indef {
-            return Err("invalid chunk in indefinite-length string".into());
+            return Err(Error::InvalidChunk);
         }
         let n = arg as usize;
         if *pos + n > data.len() {
-            return Err("unexpected end of CBOR string chunk".into());
+            return Err(Error::UnexpectedEof);
         }
         *pos += n;
     }
@@ -318,10 +359,10 @@ fn scan_indefinite_chunks(data: &[u8], pos: &mut usize, major: u8) -> Result<(),
 
 /// Scans items until a break code, where each logical entry consumes
 /// `items_per_entry` data items (1 for arrays, 2 for maps).
-fn scan_until_break(data: &[u8], pos: &mut usize, items_per_entry: usize) -> Result<(), String> {
+fn scan_until_break(data: &[u8], pos: &mut usize, items_per_entry: usize) -> Result<(), Error> {
     loop {
         if *pos >= data.len() {
-            return Err("unexpected end of indefinite CBOR container".into());
+            return Err(Error::UnexpectedEof);
         }
         if data[*pos] == 0xff {
             *pos += 1;
@@ -335,11 +376,11 @@ fn scan_until_break(data: &[u8], pos: &mut usize, items_per_entry: usize) -> Res
 
 /// Splits a top-level CBOR array into the raw byte slices of its elements.
 /// Errors if `data` is not a definite-length array.
-pub fn split_array_items(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+pub fn split_array_items(data: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     let mut pos = 0;
     let (major, arg, indefinite) = read_head(data, &mut pos)?;
     if major != 4 || indefinite {
-        return Err("expected a definite-length CBOR array".into());
+        return Err(Error::ExpectedArray);
     }
     let mut items = Vec::with_capacity(arg as usize);
     for _ in 0..arg {
