@@ -1,5 +1,7 @@
 //! Massa address parsing (port of `massa.go`).
 
+use crate::prelude::*;
+
 use crate::base58;
 use crate::hash::dsha256;
 use crate::out::Out;

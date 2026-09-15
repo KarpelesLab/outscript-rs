@@ -1,8 +1,10 @@
 //! The [`Script`] engine: holds a public key and generates output scripts for
 //! various named formats, caching results.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::prelude::*;
+
+use alloc::collections::BTreeMap;
+use core::cell::RefCell;
 
 use crate::hash::{blake2b224_vec, blake3_vec, ether_hash_vec, sha256_vec};
 use crate::insertable::{Format, b, ihash, ihash160, lookup, push, ttweak};
@@ -105,7 +107,7 @@ pub fn formats_per_network(network: &str) -> Option<&'static [&'static str]> {
 /// Holds a public key and caches generated output scripts for various formats.
 pub struct Script {
     pubkey: PubKey,
-    cache: RefCell<HashMap<String, Vec<u8>>>,
+    cache: RefCell<BTreeMap<String, Vec<u8>>>,
 }
 
 impl Script {
@@ -113,7 +115,7 @@ impl Script {
     pub fn new(pubkey: impl Into<PubKey>) -> Script {
         Script {
             pubkey: pubkey.into(),
-            cache: RefCell::new(HashMap::new()),
+            cache: RefCell::new(BTreeMap::new()),
         }
     }
 

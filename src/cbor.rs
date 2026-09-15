@@ -11,6 +11,8 @@
 //! data item — including indefinite-length strings/arrays/maps and tags — so
 //! real on-chain transactions can be split into their raw top-level elements.
 
+use crate::prelude::*;
+
 /// A CBOR data item, limited to the variants outscript needs to build and parse
 /// Cardano transactions.
 ///

@@ -1,6 +1,8 @@
 //! Composable `Insertable` operations that define how an output script is
 //! derived from a public key.
 
+use crate::prelude::*;
+
 use crate::hash::{HashFn, hash_chain, ripemd160_vec, sha256_vec};
 use crate::pushbytes::push_bytes;
 use crate::script::Script;

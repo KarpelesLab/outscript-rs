@@ -6,19 +6,43 @@ rust-version = "1.89"
 description = "Generate output scripts, parse/encode addresses, and build/sign transactions across multiple cryptocurrency networks (Bitcoin, EVM, Solana, Massa, ...)."
 repository = "https://github.com/KarpelesLab/outscript-rs"
 license = "MIT"
-keywords = ["bitcoin", "ethereum", "solana", "cryptocurrency", "transaction"]
-categories = ["cryptography::cryptocurrencies"]
+keywords = ["bitcoin", "ethereum", "solana", "cryptocurrency", "no_std"]
+categories = ["cryptography::cryptocurrencies", "no-std", "no-std::no-alloc"]
 
 [lib]
 name = "outscript"
 
+[features]
+# `std` is the default and implies `alloc`. Build with `--no-default-features`
+# for a `no_std` + no-alloc core (hashing, keys/signing, and slice-based address
+# codecs); add `--features alloc` for everything else on `no_std` targets.
+default = ["std"]
+std = [
+    "alloc",
+    "purecrypto/std",
+    "serde/std",
+    "serde_json/std",
+    "hex/std",
+    "num-bigint/std",
+    "num-traits/std",
+]
+alloc = [
+    "dep:serde",
+    "dep:serde_json",
+    "dep:hex",
+    "dep:num-bigint",
+    "dep:num-traits",
+    "purecrypto/alloc",
+]
+
 [dependencies]
-purecrypto = { version = "0.8.6", features = ["hazmat-secp256k1", "hazmat-edwards25519"] }
-num-bigint = "0.4"
-num-traits = "0.2"
-num-integer = "0.1"
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
-hex = "0.4"
+purecrypto = { version = "0.8.6", default-features = false, features = ["hash", "kdf", "hazmat-secp256k1", "hazmat-edwards25519"] }
+num-bigint = { version = "0.4", default-features = false, optional = true }
+num-traits = { version = "0.2", default-features = false, optional = true }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
+serde_json = { version = "1", default-features = false, features = ["alloc", "raw_value"], optional = true }
+hex = { version = "0.4", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
+hex = "0.4"
+serde_json = "1"

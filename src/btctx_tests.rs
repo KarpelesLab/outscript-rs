@@ -431,3 +431,37 @@ fn compute_tweaked_secret(k: &SecpPrivateKey) -> [u8; 32] {
     out[32 - db.len()..].copy_from_slice(&db);
     out
 }
+
+#[test]
+fn parse_rejects_truncated_and_oversized_counts() {
+    // version, segwit marker/flag, 1 input with empty script, 0 outputs
+    let mut buf = hex::decode("010000000001").unwrap();
+    buf.push(1); // input count
+    buf.extend_from_slice(&[0u8; 36]); // txid + vout
+    buf.push(0); // empty scriptSig
+    buf.extend_from_slice(&[0xff; 4]); // sequence
+    buf.push(0); // output count
+    // a witness count of u64::MAX must fail on EOF, not attempt the allocation
+    buf.push(0xff);
+    buf.extend_from_slice(&[0xff; 8]);
+    assert!(BtcTx::from_bytes(&buf).is_err());
+
+    for len in 0..buf.len() {
+        assert!(BtcTx::from_bytes(&buf[..len]).is_err());
+    }
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn read_from_matches_from_bytes() {
+    let hex_s = "0100000001c19529a54ae15c67526cc5e20e535973c2d56ef35ff51bace5444388331c4813000000000000000000010000000000000000016a00000000";
+    let raw = hex::decode(hex_s).unwrap();
+    let mut tx = BtcTx::default();
+    let n = tx.read_from(&mut &raw[..]).unwrap();
+    assert_eq!(n as usize, raw.len());
+    assert_eq!(tx.bytes(), raw);
+    assert_eq!(BtcTx::from_bytes(&raw).unwrap().bytes(), raw);
+
+    let err = BtcTx::default().read_from(&mut &raw[..10]).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+}

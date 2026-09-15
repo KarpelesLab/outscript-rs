@@ -215,6 +215,44 @@ let reward = outscript::block_reward("bitcoin", 840_000).unwrap();      // 3.125
 let total  = outscript::cumulative_reward("bitcoin", 840_000).unwrap(); // total minted
 ```
 
+## `no_std` and no-alloc
+
+The crate is `#![no_std]`. Its Cargo features form three tiers:
+
+| Features | Available |
+|----------|-----------|
+| `std` (default) | everything, plus `std::io` adapters (`BtcTx::read_from`, `BtcVarInt::read_from`/`write_to`) |
+| `alloc` | everything else: `Out`/`Script`, address parsing, all transaction types, RLP/CBOR, JSON |
+| none | a heap-free core: hashing, secp256k1 ECDSA/Schnorr/taproot, Ed25519, Cardano BIP32-Ed25519 keys, and caller-buffer codecs |
+
+```toml
+# heap-free core only
+outscript = { version = "0.1", default-features = false }
+# full API on no_std targets with an allocator
+outscript = { version = "0.1", default-features = false, features = ["alloc"] }
+```
+
+The no-alloc codecs write into buffers you provide:
+
+```rust
+use outscript::{bech32, crypto::secp256k1::SecpPrivateKey, eip55_to_slice, hash};
+
+let key = SecpPrivateKey::from_bytes(&secret).unwrap();
+let pubkey = key.public_key();
+
+// bc1q... (P2WPKH)
+let mut addr = [0u8; 90];
+let n = bech32::segwit_addr_encode_to_slice("bc", 0, &hash::hash160(&pubkey.serialize_compressed()), &mut addr).unwrap();
+
+// 0x... (EIP-55)
+let mut eth = [0u8; 42];
+eip55_to_slice(&hash::ether_hash(&pubkey.serialize_uncompressed()), &mut eth).unwrap();
+
+// DER signature stored inline, no heap
+let sig = key.sign_der(&digest);
+let der: &[u8] = &sig;
+```
+
 ## Architecture
 
 - **Format / Insertable** — a sequence of operations (literal bytes, lookups,

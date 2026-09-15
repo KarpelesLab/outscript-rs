@@ -3,6 +3,8 @@
 //! Port of `github.com/KarpelesLab/rlp` (the subset used by the EVM transaction
 //! code), including its canonical-form decode checks.
 
+use crate::prelude::*;
+
 use num_bigint::{BigInt, Sign};
 
 /// An RLP item: either a byte string (leaf) or a list of items.

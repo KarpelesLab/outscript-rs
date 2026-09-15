@@ -1,6 +1,8 @@
 //! Heuristics to recover a public-key hash (and possibly the pubkey) from a
 //! Bitcoin output or input script (port of `btcguess.go`).
 
+use crate::prelude::*;
+
 use crate::hash::hash160;
 use crate::pushbytes::parse_push_bytes;
 

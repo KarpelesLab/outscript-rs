@@ -1,6 +1,8 @@
 //! Parsing/extraction of signatures from Bitcoin input scripts and recomputing
 //! the sighash they committed to. Port of `btctxparse.go`.
 
+use crate::prelude::*;
+
 use crate::btcamount::BtcAmount;
 use crate::btctx::BtcTx;
 use crate::crypto::secp256k1::SecpPublicKey;

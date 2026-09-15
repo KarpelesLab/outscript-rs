@@ -3,6 +3,8 @@
 //! A small enum over the key types outscript understands, used to extract the
 //! raw bytes for a requested public-key format.
 
+use crate::prelude::*;
+
 use crate::crypto::secp256k1::SecpPublicKey;
 
 /// A public key understood by outscript: either secp256k1 or Ed25519.

@@ -11,6 +11,9 @@
 //!
 //! Port of `cardano.go`.
 
+use crate::prelude::*;
+
+use crate::bech32::{self, Variant};
 use crate::hash::blake2b224;
 use crate::out::Out;
 
@@ -55,8 +58,11 @@ fn cardano_encode_address(payload: &[u8]) -> Result<String, String> {
         return Err("empty cardano address payload".into());
     }
     let hrp = cardano_hrp(payload[0] >> 4, payload[0] & 0x0f);
-    let data = convert_bits(payload, 8, 5, true).ok_or("invalid bit conversion")?;
-    Ok(bech32_encode(&hrp, &data))
+    let mut buf = vec![0u8; hrp.len() + 1 + (payload.len() * 8).div_ceil(5) + 6];
+    let n = bech32::encode_to_slice(&hrp, payload, Variant::Bech32, &mut buf)
+        .map_err(|e| e.to_string())?;
+    buf.truncate(n);
+    Ok(String::from_utf8(buf).expect("bech32 output is ASCII"))
 }
 
 /// Builds a type-6 enterprise address (payment credential only) from a 28-byte
@@ -129,14 +135,18 @@ pub fn cardano_reward_address(stake_key_hash: &[u8], network: &str) -> Result<St
 /// payload (header byte followed by credentials) is preserved so the address can
 /// be re-encoded via [`Out::address`].
 pub fn parse_cardano_address(address: &str) -> Result<Out, String> {
-    let (hrp, data) =
-        bech32_decode(address).map_err(|e| format!("failed to decode cardano address: {e}"))?;
+    let mut payload = vec![0u8; address.len()];
+    let (hrp, n, variant) = bech32::decode_to_slice(address, &mut payload)
+        .map_err(|e| format!("failed to decode cardano address: {e}"))?;
+    if variant != Variant::Bech32 {
+        return Err("failed to decode cardano address: invalid bech32 checksum".into());
+    }
+    payload.truncate(n);
+    let hrp = hrp.to_ascii_lowercase();
     match hrp.as_str() {
         "addr" | "addr_test" | "stake" | "stake_test" => {}
         other => return Err(format!("unsupported cardano address prefix {other:?}")),
     }
-    let payload =
-        convert_bits(&data, 5, 8, false).ok_or("failed to decode cardano address payload")?;
     if payload.is_empty() {
         return Err("empty cardano address payload".into());
     }
@@ -201,126 +211,4 @@ pub fn cardano_address_from_out(raw: &[u8], network: &str) -> Result<String, Str
     let mut payload = raw.to_vec();
     payload[0] = (payload[0] & 0xf0) | net;
     cardano_encode_address(&payload)
-}
-
-// ----- Bech32 (BIP-173) -----
-//
-// A self-contained Bech32 codec. Unlike the shared `bech32` module, this has no
-// 90-character limit, which Cardano base addresses (per CIP-19) routinely
-// exceed.
-
-const CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-
-fn bech32_polymod(values: &[u8]) -> u32 {
-    const GEN: [u32; 5] = [
-        0x3b6a_57b2,
-        0x2650_8e6d,
-        0x1ea1_19fa,
-        0x3d42_33dd,
-        0x2a14_62b3,
-    ];
-    let mut chk: u32 = 1;
-    for &v in values {
-        let top = chk >> 25;
-        chk = ((chk & 0x1ff_ffff) << 5) ^ (v as u32);
-        for (i, g) in GEN.iter().enumerate() {
-            if (top >> i) & 1 == 1 {
-                chk ^= g;
-            }
-        }
-    }
-    chk
-}
-
-fn bech32_hrp_expand(hrp: &str) -> Vec<u8> {
-    let bytes = hrp.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() * 2 + 1);
-    for &c in bytes {
-        out.push(c >> 5);
-    }
-    out.push(0);
-    for &c in bytes {
-        out.push(c & 0x1f);
-    }
-    out
-}
-
-fn bech32_create_checksum(hrp: &str, data: &[u8]) -> Vec<u8> {
-    let mut values = bech32_hrp_expand(hrp);
-    values.extend_from_slice(data);
-    values.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-    let polymod = bech32_polymod(&values) ^ 1;
-    (0..6)
-        .map(|i| ((polymod >> (5 * (5 - i))) & 0x1f) as u8)
-        .collect()
-}
-
-fn bech32_encode(hrp: &str, data: &[u8]) -> String {
-    let checksum = bech32_create_checksum(hrp, data);
-    let mut s = String::with_capacity(hrp.len() + 1 + data.len() + 6);
-    s.push_str(hrp);
-    s.push('1');
-    for &b in data.iter().chain(checksum.iter()) {
-        s.push(CHARSET[b as usize] as char);
-    }
-    s
-}
-
-fn bech32_decode(s: &str) -> Result<(String, Vec<u8>), String> {
-    let lower = s.to_ascii_lowercase();
-    let upper = s.to_ascii_uppercase();
-    if s != lower && s != upper {
-        return Err("bech32 string must not be mixed-case".into());
-    }
-    let s = lower;
-    let pos = s.rfind('1').ok_or("invalid bech32 separator position")?;
-    if pos < 1 || pos + 7 > s.len() {
-        return Err("invalid bech32 separator position".into());
-    }
-    let hrp = s[..pos].to_string();
-    let mut data = Vec::with_capacity(s.len() - pos - 1);
-    for c in s[pos + 1..].bytes() {
-        match CHARSET.iter().position(|&x| x == c) {
-            Some(idx) => data.push(idx as u8),
-            None => return Err(format!("invalid bech32 character {:?}", c as char)),
-        }
-    }
-    let mut values = bech32_hrp_expand(&hrp);
-    values.extend_from_slice(&data);
-    if bech32_polymod(&values) != 1 {
-        return Err("invalid bech32 checksum".into());
-    }
-    let len = data.len() - 6;
-    data.truncate(len);
-    Ok((hrp, data))
-}
-
-/// Regroups data between bit widths (8↔5) for Bech32, following the reference
-/// convertbits routine from BIP-173.
-fn convert_bits(data: &[u8], from: u32, to: u32, pad: bool) -> Option<Vec<u8>> {
-    let mut acc: u32 = 0;
-    let mut bits: u32 = 0;
-    let maxv: u32 = (1 << to) - 1;
-    let max_acc: u32 = (1 << (from + to - 1)) - 1;
-    let mut out = Vec::with_capacity(data.len() * from as usize / to as usize + 1);
-    for &value in data {
-        let v = value as u32;
-        if (v >> from) != 0 {
-            return None;
-        }
-        acc = ((acc << from) | v) & max_acc;
-        bits += from;
-        while bits >= to {
-            bits -= to;
-            out.push(((acc >> bits) & maxv) as u8);
-        }
-    }
-    if pad {
-        if bits > 0 {
-            out.push(((acc << (to - bits)) & maxv) as u8);
-        }
-    } else if bits >= from || ((acc << (to - bits)) & maxv) != 0 {
-        return None;
-    }
-    Some(out)
 }

@@ -1,5 +1,7 @@
 //! EVM ABI encoding (port of `evmabi.go`).
 
+use crate::prelude::*;
+
 use num_bigint::{BigInt, Sign};
 
 use crate::hash::keccak256_once;
@@ -215,7 +217,7 @@ impl AbiBuffer {
             let mut in_ = s.data.clone();
             let x = in_.len() % 32;
             if x != 0 {
-                in_.extend(std::iter::repeat_n(0u8, 32 - x));
+                in_.extend(core::iter::repeat_n(0u8, 32 - x));
             }
             let pos = res.len() as u64;
             let mut pos_buf = [0u8; 32];

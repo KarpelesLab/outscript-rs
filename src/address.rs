@@ -1,46 +1,88 @@
 //! Address parsing and encoding across Bitcoin-family, EVM, Massa and Solana
 //! networks (port of `address.go`, `eip55.go`).
 
+use purecrypto::hash::{Digest, Sha256};
+
 use crate::base58;
+use crate::hash::{keccak256_once, sha256_once};
+
+#[cfg(feature = "alloc")]
 use crate::bech32;
-use crate::hash::{dsha256, keccak256_once};
+#[cfg(feature = "alloc")]
+use crate::hash::dsha256;
+#[cfg(feature = "alloc")]
 use crate::out::Out;
+#[cfg(feature = "alloc")]
+use crate::prelude::*;
+#[cfg(feature = "alloc")]
 use crate::pushbytes::{parse_push_bytes, push_bytes};
 
-/// Computes the EIP-55 checksummed hex address (`0x...`) for a 20-byte address.
-pub fn eip55(addr: &[u8]) -> String {
-    let hexstr = hex::encode(addr);
-    let a = hexstr.as_bytes();
-    let hash = keccak256_once(a);
-    let mut out = String::with_capacity(2 + a.len());
-    out.push('0');
-    out.push('x');
-    for (i, &c) in a.iter().enumerate() {
+/// Writes the EIP-55 checksummed hex address (`0x...`) for `addr` (normally 20
+/// bytes) into `out`, returning the number of (ASCII) bytes written —
+/// `2 + 2 * addr.len()` — or `None` if `out` is too small.
+pub fn eip55_to_slice(addr: &[u8], out: &mut [u8]) -> Option<usize> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let len = 2 + addr.len() * 2;
+    let out = out.get_mut(..len)?;
+    out[0] = b'0';
+    out[1] = b'x';
+    for (i, &b) in addr.iter().enumerate() {
+        out[2 + 2 * i] = HEX[(b >> 4) as usize];
+        out[3 + 2 * i] = HEX[(b & 0xf) as usize];
+    }
+    // The checksum hashes the lower-case hex digits.
+    let hash = keccak256_once(&out[2..]);
+    for (i, c) in out[2..].iter_mut().enumerate() {
         let hash_byte = hash[i / 2];
         let nibble = if i % 2 == 0 {
             hash_byte >> 4
         } else {
             hash_byte & 0xf
         };
-        if c > b'9' && nibble > 7 {
-            out.push((c - 32) as char);
-        } else {
-            out.push(c as char);
+        if *c > b'9' && nibble > 7 {
+            *c -= 32;
         }
     }
-    out
+    Some(len)
+}
+
+/// Computes the EIP-55 checksummed hex address (`0x...`) for a 20-byte address.
+#[cfg(feature = "alloc")]
+pub fn eip55(addr: &[u8]) -> String {
+    let mut buf = vec![0u8; 2 + addr.len() * 2];
+    eip55_to_slice(addr, &mut buf).expect("buffer sized for the address");
+    String::from_utf8(buf).expect("hex output is ASCII")
+}
+
+/// Writes a base58check address built from a version byte and payload into
+/// `out`, returning the number of (ASCII) bytes written.
+/// [`base58::encoded_len_bound`]`(payload.len() + 5)` bytes always suffice
+/// (35 for a standard 20-byte hash).
+pub fn encode_base58_addr_to_slice(
+    version: u8,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Result<usize, base58::Error> {
+    let mut h = Sha256::new();
+    h.update(&[version]);
+    h.update(payload);
+    let chk = sha256_once(&h.finalize());
+    let data = core::iter::once(version)
+        .chain(payload.iter().copied())
+        .chain(chk[..4].iter().copied());
+    base58::encode_iter_to_slice(data, out)
 }
 
 /// Builds a base58check address from a version byte and payload.
+#[cfg(feature = "alloc")]
 pub fn encode_base58_addr(version: u8, buf: &[u8]) -> String {
-    let mut data = Vec::with_capacity(1 + buf.len() + 4);
-    data.push(version);
-    data.extend_from_slice(buf);
-    let h = dsha256(&data);
-    data.extend_from_slice(&h[..4]);
-    base58::encode(&data)
+    let mut out = vec![0u8; base58::encoded_len_bound(buf.len() + 5)];
+    let n = encode_base58_addr_to_slice(version, buf, &mut out).expect("buffer sized by bound");
+    out.truncate(n);
+    String::from_utf8(out).expect("base58 output is ASCII")
 }
 
+#[cfg(feature = "alloc")]
 /// Parses an EVM (`0x...`) address.
 pub fn parse_evm_address(address: &str) -> Result<Out, String> {
     if address.len() != 42 || !address.starts_with("0x") {
@@ -54,6 +96,7 @@ pub fn parse_evm_address(address: &str) -> Result<Out, String> {
     Ok(Out::make("eth", data, &["evm"]))
 }
 
+#[cfg(feature = "alloc")]
 fn p2pkh_script(hash: &[u8]) -> Vec<u8> {
     let mut s = vec![0x76, 0xa9];
     s.extend_from_slice(&push_bytes(hash));
@@ -61,6 +104,7 @@ fn p2pkh_script(hash: &[u8]) -> Vec<u8> {
     s
 }
 
+#[cfg(feature = "alloc")]
 fn p2sh_script(hash: &[u8]) -> Vec<u8> {
     let mut s = vec![0xa9];
     s.extend_from_slice(&push_bytes(hash));
@@ -68,6 +112,7 @@ fn p2sh_script(hash: &[u8]) -> Vec<u8> {
     s
 }
 
+#[cfg(feature = "alloc")]
 /// Parses a Bitcoin-family address for the given network. The special network
 /// `"auto"` attempts to detect the network from the address.
 pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, String> {
@@ -153,6 +198,7 @@ pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, 
     Err(format!("unsupported address {address}"))
 }
 
+#[cfg(feature = "alloc")]
 fn cashaddr_out(typ: u8, buf: &[u8]) -> Result<Out, String> {
     match typ {
         0 => Ok(Out::make("p2pkh", p2pkh_script(buf), &["bitcoin-cash"])),
@@ -161,6 +207,7 @@ fn cashaddr_out(typ: u8, buf: &[u8]) -> Result<Out, String> {
     }
 }
 
+#[cfg(feature = "alloc")]
 fn parse_base58_versioned(network: &str, buf: &[u8]) -> Result<Out, String> {
     let version = buf[0];
     let payload = &buf[1..];
@@ -248,6 +295,7 @@ fn parse_base58_versioned(network: &str, buf: &[u8]) -> Result<Out, String> {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl Out {
     /// Returns the human-readable address for this output. Flags provide network
     /// hints when multiple addresses are possible.
@@ -353,5 +401,41 @@ impl Out {
                 self.name
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eip55_slice() {
+        let addr = [
+            0x5a, 0xae, 0xb6, 0x05, 0x3f, 0x3e, 0x94, 0xc9, 0xb9, 0xa0, 0x9f, 0x33, 0x66, 0x94,
+            0x35, 0xe7, 0xef, 0x1b, 0xea, 0xed,
+        ];
+        let mut out = [0u8; 42];
+        assert_eq!(eip55_to_slice(&addr, &mut out), Some(42));
+        assert_eq!(&out, b"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed");
+        assert_eq!(eip55_to_slice(&addr, &mut out[..41]), None);
+    }
+
+    #[test]
+    fn base58_addr_slice() {
+        // decoding must give back version + hash + dsha256 checksum
+        let hash = [
+            0xb5, 0xbd, 0x07, 0x9c, 0x4d, 0x57, 0xcc, 0x7f, 0xc2, 0x8e, 0xcf, 0x8a, 0x6e, 0xba,
+            0xf9, 0x65, 0x6e, 0x6b, 0x4c, 0x5c,
+        ];
+        let mut out = [0u8; 35];
+        let n = encode_base58_addr_to_slice(0x00, &hash, &mut out).unwrap();
+        let mut dec = [0u8; 25];
+        assert_eq!(
+            base58::decode_to_slice(core::str::from_utf8(&out[..n]).unwrap(), &mut dec),
+            Ok(25)
+        );
+        assert_eq!(dec[0], 0x00);
+        assert_eq!(&dec[1..21], &hash);
+        assert_eq!(&dec[21..], &crate::hash::dsha256(&dec[..21])[..4]);
     }
 }

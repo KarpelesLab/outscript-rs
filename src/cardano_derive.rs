@@ -15,11 +15,46 @@
 //!
 //! Port of `cardano_extkey.go` and `cardano_derive.go`.
 
-use purecrypto::hash::{HmacSha512, Sha512, sha512};
+use purecrypto::hash::{Digest, HmacSha512, Sha512};
 use purecrypto::kdf::pbkdf2;
 
+#[cfg(feature = "alloc")]
 use crate::cardanotx::CardanoSigner;
 use crate::crypto::ed25519;
+#[cfg(feature = "alloc")]
+use crate::prelude::*;
+
+/// Errors from Cardano key construction and derivation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// A key, chain code or xprv had the wrong length.
+    InvalidLength,
+    /// Derivation requires a chain code, but the key was created without one.
+    NoChainCode,
+    /// A hardened child cannot be derived from a public key.
+    HardenedFromPublic,
+    /// The public key is not a valid Ed25519 point.
+    InvalidPoint,
+    /// The master-key entropy was empty.
+    EmptyEntropy,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Error::InvalidLength => "cardano: invalid key length",
+            Error::NoChainCode => "cardano: extended key has no chain code; cannot derive",
+            Error::HardenedFromPublic => {
+                "cardano: cannot derive a hardened child from a public key"
+            }
+            Error::InvalidPoint => "cardano: invalid parent public key point",
+            Error::EmptyEntropy => "cardano: empty entropy",
+        })
+    }
+}
+
+impl core::error::Error for Error {}
 
 /// The offset that marks a BIP32 derivation index as hardened. A hardened child
 /// can only be derived from a private key.
@@ -50,12 +85,9 @@ impl CardanoExtendedKey {
     /// signing only, or the full 96-byte xprv (secret followed by a 32-byte
     /// chain code), which additionally enables BIP32-Ed25519 child derivation —
     /// the form exported by `cardano-address` / cardano-serialization-lib.
-    pub fn new(xprv: &[u8]) -> Result<CardanoExtendedKey, String> {
+    pub fn new(xprv: &[u8]) -> Result<CardanoExtendedKey, Error> {
         if xprv.len() != 64 && xprv.len() != 96 {
-            return Err(format!(
-                "cardano xprv must be 64 or 96 bytes, got {}",
-                xprv.len()
-            ));
+            return Err(Error::InvalidLength);
         }
         let mut scalar = [0u8; 32];
         let mut nonce = [0u8; 32];
@@ -89,6 +121,7 @@ impl CardanoExtendedKey {
 
     /// Returns the xprv: the 64-byte expanded secret (scalar followed by nonce),
     /// plus the 32-byte chain code when present (96 bytes total).
+    #[cfg(feature = "alloc")]
     pub fn bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(96);
         out.extend_from_slice(&self.scalar);
@@ -114,17 +147,10 @@ impl CardanoExtendedKey {
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
         let a = ed25519::scalar_reduce_wide(&extend64(&self.scalar));
 
-        let mut r_input = Vec::with_capacity(32 + message.len());
-        r_input.extend_from_slice(&self.nonce);
-        r_input.extend_from_slice(message);
-        let r = ed25519::scalar_reduce_wide(&sha512(&r_input));
+        let r = ed25519::scalar_reduce_wide(&sha512_parts(&[&self.nonce, message]));
         let r_point = ed25519::scalar_mul_base(&r);
 
-        let mut k_input = Vec::with_capacity(64 + message.len());
-        k_input.extend_from_slice(&r_point);
-        k_input.extend_from_slice(&self.pub_key);
-        k_input.extend_from_slice(message);
-        let hram = ed25519::scalar_reduce_wide(&sha512(&k_input));
+        let hram = ed25519::scalar_reduce_wide(&sha512_parts(&[&r_point, &self.pub_key, message]));
 
         let s = ed25519::scalar_mul_add(&hram, &a, &r);
 
@@ -137,9 +163,9 @@ impl CardanoExtendedKey {
     /// Derives the BIP32-Ed25519 (scheme V2) child of this key at `index`.
     /// Indices `>= `[`CARDANO_HARDENED`] derive a hardened child. The key must
     /// carry a chain code.
-    pub fn derive_child(&self, index: u32) -> Result<CardanoExtendedKey, String> {
+    pub fn derive_child(&self, index: u32) -> Result<CardanoExtendedKey, Error> {
         if !self.has_chain {
-            return Err("cardano: extended key has no chain code; cannot derive".into());
+            return Err(Error::NoChainCode);
         }
         let seri = le32(index);
         let (zout, iout) = if index >= CARDANO_HARDENED {
@@ -183,12 +209,10 @@ impl CardanoExtendedKey {
 
     /// Derives a chain of children in sequence, e.g. the CIP-1852 payment-key
     /// path `[harden(1852), harden(1815), harden(0), 0, 0]`.
-    pub fn derive_path(&self, indices: &[u32]) -> Result<CardanoExtendedKey, String> {
+    pub fn derive_path(&self, indices: &[u32]) -> Result<CardanoExtendedKey, Error> {
         let mut cur = self.clone();
-        for (i, &idx) in indices.iter().enumerate() {
-            cur = cur
-                .derive_child(idx)
-                .map_err(|e| format!("cardano: deriving index {idx} (step {i}): {e}"))?;
+        for &idx in indices {
+            cur = cur.derive_child(idx)?;
         }
         Ok(cur)
     }
@@ -206,6 +230,7 @@ impl CardanoExtendedKey {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl CardanoSigner for CardanoExtendedKey {
     fn cardano_public_key(&self) -> Vec<u8> {
         self.pub_key.to_vec()
@@ -227,18 +252,9 @@ pub struct CardanoExtendedPubKey {
 impl CardanoExtendedPubKey {
     /// Builds an extended public key from a 32-byte public key and 32-byte chain
     /// code.
-    pub fn new(pub_key: &[u8], chain_code: &[u8]) -> Result<CardanoExtendedPubKey, String> {
-        if pub_key.len() != 32 {
-            return Err(format!(
-                "cardano public key must be 32 bytes, got {}",
-                pub_key.len()
-            ));
-        }
-        if chain_code.len() != 32 {
-            return Err(format!(
-                "cardano chain code must be 32 bytes, got {}",
-                chain_code.len()
-            ));
+    pub fn new(pub_key: &[u8], chain_code: &[u8]) -> Result<CardanoExtendedPubKey, Error> {
+        if pub_key.len() != 32 || chain_code.len() != 32 {
+            return Err(Error::InvalidLength);
         }
         let mut pk = [0u8; 32];
         let mut cc = [0u8; 32];
@@ -262,9 +278,9 @@ impl CardanoExtendedPubKey {
 
     /// Derives a soft (non-hardened) child extended public key. Hardened
     /// derivation is impossible without the private key and returns an error.
-    pub fn derive_child(&self, index: u32) -> Result<CardanoExtendedPubKey, String> {
+    pub fn derive_child(&self, index: u32) -> Result<CardanoExtendedPubKey, Error> {
         if index >= CARDANO_HARDENED {
-            return Err("cardano: cannot derive a hardened child from a public key".into());
+            return Err(Error::HardenedFromPublic);
         }
         let seri = le32(index);
         let zout = hmac_sha512(&self.chain_code, &[&[0x02], &self.pub_key[..], &seri]);
@@ -274,8 +290,7 @@ impl CardanoExtendedPubKey {
         zl.copy_from_slice(&zout[..32]);
         // child public point = A + (8·trunc28(zl))·B
         let tweak = add28_mul8(&[0u8; 32], &zl);
-        let pub_key = ed25519::point_add_base(&self.pub_key, &tweak)
-            .ok_or("cardano: invalid parent public key point")?;
+        let pub_key = ed25519::point_add_base(&self.pub_key, &tweak).ok_or(Error::InvalidPoint)?;
         let mut chain_code = [0u8; 32];
         chain_code.copy_from_slice(&iout[32..64]);
         Ok(CardanoExtendedPubKey {
@@ -285,12 +300,10 @@ impl CardanoExtendedPubKey {
     }
 
     /// Derives a chain of soft children in sequence.
-    pub fn derive_path(&self, indices: &[u32]) -> Result<CardanoExtendedPubKey, String> {
+    pub fn derive_path(&self, indices: &[u32]) -> Result<CardanoExtendedPubKey, Error> {
         let mut cur = self.clone();
-        for (i, &idx) in indices.iter().enumerate() {
-            cur = cur
-                .derive_child(idx)
-                .map_err(|e| format!("cardano: deriving index {idx} (step {i}): {e}"))?;
+        for &idx in indices {
+            cur = cur.derive_child(idx)?;
         }
         Ok(cur)
     }
@@ -304,9 +317,9 @@ impl CardanoExtendedPubKey {
 pub fn cardano_icarus_master_key(
     entropy: &[u8],
     password: &[u8],
-) -> Result<CardanoExtendedKey, String> {
+) -> Result<CardanoExtendedKey, Error> {
     if entropy.is_empty() {
-        return Err("cardano: empty entropy".into());
+        return Err(Error::EmptyEntropy);
     }
     let mut xprv = [0u8; 96];
     pbkdf2::<Sha512>(password, entropy, 4096, &mut xprv);
@@ -330,6 +343,15 @@ fn extend64(bytes: &[u8; 32]) -> [u8; 64] {
 /// Serializes a derivation index as little-endian (BIP32-Ed25519 V2).
 fn le32(i: u32) -> [u8; 4] {
     i.to_le_bytes()
+}
+
+/// SHA-512 of the concatenation of `parts`.
+fn sha512_parts(parts: &[&[u8]]) -> [u8; 64] {
+    let mut h = Sha512::new();
+    for p in parts {
+        h.update(p);
+    }
+    h.finalize()
 }
 
 /// HMAC-SHA512 of the concatenation of `parts`, keyed by `key`.

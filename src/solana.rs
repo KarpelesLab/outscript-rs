@@ -1,15 +1,16 @@
 //! Solana keys, instructions, transactions (legacy + v0), program-derived
 //! addresses. Port of `solanatx.go`, `solana_instructions.go`, `solana_pda.go`.
 
-use std::collections::HashMap;
-use std::sync::LazyLock;
+use crate::prelude::*;
+
+use alloc::collections::BTreeMap;
 
 use crate::base58;
 use crate::crypto::ed25519;
 use purecrypto::hash::{Digest, Sha256};
 
 /// A 32-byte Solana public key / account address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct SolanaKey(pub [u8; 32]);
 
 impl SolanaKey {
@@ -42,14 +43,13 @@ impl core::fmt::Display for SolanaKey {
     }
 }
 
-/// Defines a well-known program/sysvar address, decoded once and cached.
+/// Defines a well-known program/sysvar address, decoded at compile time.
 macro_rules! well_known_key {
     ($func:ident, $addr:literal, $doc:literal) => {
         #[doc = $doc]
         pub fn $func() -> SolanaKey {
-            static KEY: LazyLock<SolanaKey> =
-                LazyLock::new(|| SolanaKey::parse($addr).expect("valid well-known key"));
-            *KEY
+            const KEY: SolanaKey = SolanaKey(base58::decode_32_const($addr));
+            KEY
         }
     };
 }
@@ -345,13 +345,13 @@ struct AccountInfo {
 }
 
 /// Result of account compilation: ordered keys, key->index map, message header.
-type CompiledAccounts = (Vec<SolanaKey>, HashMap<SolanaKey, u8>, SolanaMessageHeader);
+type CompiledAccounts = (Vec<SolanaKey>, BTreeMap<SolanaKey, u8>, SolanaMessageHeader);
 
 fn compile_accounts(
     fee_payer: SolanaKey,
     instructions: &[SolanaInstruction],
 ) -> Result<CompiledAccounts, String> {
-    let mut seen: HashMap<SolanaKey, AccountInfo> = HashMap::new();
+    let mut seen: BTreeMap<SolanaKey, AccountInfo> = BTreeMap::new();
     seen.insert(
         fee_payer,
         AccountInfo {
@@ -414,7 +414,7 @@ fn compile_accounts(
         ));
     }
 
-    let mut index = HashMap::with_capacity(all.len());
+    let mut index = BTreeMap::new();
     for (i, k) in all.iter().enumerate() {
         index.insert(*k, i as u8);
     }
@@ -428,7 +428,7 @@ fn compile_accounts(
 
 fn compile_instructions(
     instructions: &[SolanaInstruction],
-    index: &HashMap<SolanaKey, u8>,
+    index: &BTreeMap<SolanaKey, u8>,
 ) -> Vec<SolanaCompiledInstruction> {
     instructions
         .iter()
@@ -578,7 +578,7 @@ impl SolanaTx {
         let mut buf = encode_compact_u16(self.signatures.len());
         for sig in &self.signatures {
             if sig.is_empty() {
-                buf.extend(std::iter::repeat_n(0u8, 64));
+                buf.extend(core::iter::repeat_n(0u8, 64));
             } else if sig.len() != 64 {
                 return Err(format!("invalid signature length: {}", sig.len()));
             } else {

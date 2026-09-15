@@ -42,6 +42,44 @@ jobs:
       - name: Test
         run: cargo test
 
+  no-std:
+    name: no_std (${{ matrix.features.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - { name: no-alloc, flags: --no-default-features }
+          - { name: alloc, flags: --no-default-features --features alloc }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          # a bare-metal target has no `std`, so any std use fails to link
+          targets: thumbv7em-none-eabi
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: no-std-${{ matrix.features.name }}
+
+      - name: Build for bare metal
+        run: cargo build --target thumbv7em-none-eabi ${{ matrix.features.flags }}
+
+      - name: Clippy (warnings denied)
+        run: cargo clippy --all-targets ${{ matrix.features.flags }} -- -D warnings
+
+      - name: Test
+        run: cargo test ${{ matrix.features.flags }}
+
+      - name: Docs (warnings denied)
+        env:
+          RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
+        run: cargo doc --no-deps ${{ matrix.features.flags }}
+
   msrv:
     name: MSRV (1.89)
     runs-on: ubuntu-latest
@@ -58,6 +96,9 @@ jobs:
 
       - name: Build
         run: cargo build --all-targets
+
+      - name: Build (no_std, no alloc)
+        run: cargo build --no-default-features
 
   docs:
     name: Docs build (warnings denied)

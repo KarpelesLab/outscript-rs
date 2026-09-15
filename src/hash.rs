@@ -6,6 +6,10 @@
 
 use purecrypto::hash::{Blake2bMac, Blake3, blake2b256, keccak256, ripemd160, sha256};
 
+#[cfg(feature = "alloc")]
+use crate::prelude::*;
+
+#[cfg(feature = "alloc")]
 /// A single hash step usable in a [`hash_chain`]: maps input bytes to output
 /// bytes.
 ///
@@ -14,32 +18,39 @@ use purecrypto::hash::{Blake2bMac, Blake3, blake2b256, keccak256, ripemd160, sha
 /// helpers below ([`sha256_vec`], [`ripemd160_vec`], …) or a user-defined one.
 pub type HashFn = fn(&[u8]) -> Vec<u8>;
 
+#[cfg(feature = "alloc")]
 /// SHA-256, as a chainable [`HashFn`].
 pub fn sha256_vec(data: &[u8]) -> Vec<u8> {
     sha256(data).to_vec()
 }
+#[cfg(feature = "alloc")]
 /// RIPEMD-160, as a chainable [`HashFn`].
 pub fn ripemd160_vec(data: &[u8]) -> Vec<u8> {
     ripemd160(data).to_vec()
 }
+#[cfg(feature = "alloc")]
 /// Keccak-256 (Ethereum legacy keccak, not SHA3-256), as a chainable [`HashFn`].
 pub fn keccak256_vec(data: &[u8]) -> Vec<u8> {
     keccak256(data).to_vec()
 }
+#[cfg(feature = "alloc")]
 /// BLAKE3 with 32-byte output (used for Massa), as a chainable [`HashFn`].
 pub fn blake3_vec(data: &[u8]) -> Vec<u8> {
     Blake3::hash(data).to_vec()
 }
+#[cfg(feature = "alloc")]
 /// BLAKE2b-224 (used for Cardano key credentials), as a chainable [`HashFn`].
 pub fn blake2b224_vec(data: &[u8]) -> Vec<u8> {
     blake2b224(data).to_vec()
 }
+#[cfg(feature = "alloc")]
 /// The Ethereum public-key hash (keccak-256 over the body with the SEC1 prefix
 /// byte stripped, last 20 bytes), as a chainable [`HashFn`]. Terminal in a chain.
 pub fn ether_hash_vec(data: &[u8]) -> Vec<u8> {
     ether_hash(data).to_vec()
 }
 
+#[cfg(feature = "alloc")]
 /// Applies a sequence of hash functions, chaining the output of one into the
 /// input of the next.
 pub fn hash_chain(data: &[u8], fns: &[HashFn]) -> Vec<u8> {
@@ -127,6 +138,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn test_hash_chain_matches_helpers() {
         let data = b"the quick brown fox";

@@ -1,5 +1,7 @@
 //! Solana address parsing (port of `solana.go`).
 
+use crate::prelude::*;
+
 use crate::base58;
 use crate::out::Out;
 

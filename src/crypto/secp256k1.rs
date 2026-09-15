@@ -6,28 +6,23 @@
 //! normalization, and recovery-code semantics, so signatures are reproducible
 //! and interoperable with other conforming implementations.
 
-use num_bigint::BigUint;
-use num_traits::Num;
 use purecrypto::ec::secp256k1::{AffinePoint, ProjectivePoint, Scalar};
-use purecrypto::hash::{HmacSha256, sha256};
+use purecrypto::hash::{Digest, HmacSha256, Sha256, sha256};
 
-/// secp256k1 group order n.
-fn n_biguint() -> BigUint {
-    BigUint::from_str_radix(
-        "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
-        16,
-    )
-    .unwrap()
-}
+#[cfg(feature = "alloc")]
+use crate::prelude::*;
 
-/// secp256k1 field prime p.
-fn p_biguint() -> BigUint {
-    BigUint::from_str_radix(
-        "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
-        16,
-    )
-    .unwrap()
-}
+/// secp256k1 group order n (big-endian).
+const ORDER: [u8; 32] = [
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
+];
+
+/// secp256k1 field prime p (big-endian).
+const FIELD_PRIME: [u8; 32] = [
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xfc, 0x2f,
+];
 
 /// (n-1)/2, the low-S threshold (big-endian 32 bytes).
 const HALF_ORDER: [u8; 32] = [
@@ -68,20 +63,20 @@ impl core::error::Error for Error {}
 // ---------------------------------------------------------------------------
 
 fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut data = Vec::new();
+    let mut mac = HmacSha256::new(key);
     for p in parts {
-        data.extend_from_slice(p);
+        mac.update(p);
     }
-    HmacSha256::mac(key, &data)
+    mac.finalize()
 }
 
 /// RFC6979 deterministic nonce generation (HMAC-SHA256), matching
 /// `KarpelesLab/secp256k1`'s `NonceRFC6979` with `extra`/`version` unset.
 /// `extra_iterations` selects the (extra_iterations+1)-th valid candidate.
 fn generate_k(priv_be: &[u8; 32], hash: &[u8; 32], extra_iterations: u32) -> Scalar {
-    let mut key = Vec::with_capacity(64);
-    key.extend_from_slice(priv_be);
-    key.extend_from_slice(hash);
+    let mut key = [0u8; 64];
+    key[..32].copy_from_slice(priv_be);
+    key[32..].copy_from_slice(hash);
 
     let mut v = [1u8; 32];
     let mut k = [0u8; 32];
@@ -238,7 +233,7 @@ impl SecpPrivateKey {
 
     /// RFC6979 ECDSA signing of a 32-byte digest, returning a DER-encoded
     /// signature with low-S (as used for Bitcoin).
-    pub fn sign_der(&self, hash: &[u8; 32]) -> Vec<u8> {
+    pub fn sign_der(&self, hash: &[u8; 32]) -> DerSignature {
         let (r, s, _) = self.sign_recoverable(hash);
         der_encode(&r, &s)
     }
@@ -271,7 +266,53 @@ impl SecpPrivateKey {
 // DER encoding
 // ---------------------------------------------------------------------------
 
-fn canon_int(value_be: &[u8; 32]) -> Vec<u8> {
+/// A DER-encoded ECDSA signature (at most 72 bytes), stored inline.
+///
+/// Dereferences to the encoded bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DerSignature {
+    buf: [u8; 72],
+    len: u8,
+}
+
+impl DerSignature {
+    /// The encoded signature bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+}
+
+impl core::ops::Deref for DerSignature {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl AsRef<[u8]> for DerSignature {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl core::fmt::Debug for DerSignature {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DerSignature(")?;
+        for b in self.as_bytes() {
+            write!(f, "{b:02x}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl From<DerSignature> for Vec<u8> {
+    fn from(sig: DerSignature) -> Vec<u8> {
+        sig.as_bytes().to_vec()
+    }
+}
+
+fn canon_int(value_be: &[u8; 32]) -> ([u8; 33], usize) {
     // Prepend a 0x00 then strip leading 0x00 bytes while the next byte's high
     // bit is clear (keeps the DER integer positive and minimally encoded).
     let mut buf = [0u8; 33];
@@ -280,24 +321,30 @@ fn canon_int(value_be: &[u8; 32]) -> Vec<u8> {
     while start < 32 && buf[start] == 0x00 && buf[start + 1] & 0x80 == 0 {
         start += 1;
     }
-    buf[start..].to_vec()
+    (buf, start)
 }
 
-fn der_encode(r_be: &[u8; 32], s_be: &[u8; 32]) -> Vec<u8> {
-    let r = canon_int(r_be);
-    let s = canon_int(s_be);
+fn der_encode(r_be: &[u8; 32], s_be: &[u8; 32]) -> DerSignature {
+    let (r_buf, r_start) = canon_int(r_be);
+    let (s_buf, s_start) = canon_int(s_be);
+    let r = &r_buf[r_start..];
+    let s = &s_buf[s_start..];
     // total length of the whole signature (mirrors Go: 6 + len(r) + len(s)).
     let total = 6 + r.len() + s.len();
-    let mut out = Vec::with_capacity(total);
-    out.push(0x30);
-    out.push((total - 2) as u8);
-    out.push(0x02);
-    out.push(r.len() as u8);
-    out.extend_from_slice(&r);
-    out.push(0x02);
-    out.push(s.len() as u8);
-    out.extend_from_slice(&s);
-    out
+    let mut buf = [0u8; 72];
+    buf[0] = 0x30;
+    buf[1] = (total - 2) as u8;
+    buf[2] = 0x02;
+    buf[3] = r.len() as u8;
+    buf[4..4 + r.len()].copy_from_slice(r);
+    let s_off = 4 + r.len();
+    buf[s_off] = 0x02;
+    buf[s_off + 1] = s.len() as u8;
+    buf[s_off + 2..total].copy_from_slice(s);
+    DerSignature {
+        buf,
+        len: total as u8,
+    }
 }
 
 /// Parses a DER-encoded ECDSA signature into 32-byte big-endian `(r, s)`.
@@ -365,24 +412,16 @@ pub fn recover_public_key(
     }
 
     // Determine the x coordinate of R (possibly r + n).
-    let n = n_biguint();
-    let p = p_biguint();
-    let r_int = BigUint::from_bytes_be(r_be);
-    let x_int = if recid & 0x02 != 0 {
-        let x = &r_int + &n;
-        if x >= p {
+    let x_bytes = if recid & 0x02 != 0 {
+        // r + n must not overflow 256 bits and must stay below p.
+        let (x, carry) = add_be(r_be, &ORDER);
+        if carry || x[..] >= FIELD_PRIME[..] {
             return Err(Error::Recovery);
         }
         x
     } else {
-        r_int
+        *r_be
     };
-    let mut x_bytes = [0u8; 32];
-    let xb = x_int.to_bytes_be();
-    if xb.len() > 32 {
-        return Err(Error::Recovery);
-    }
-    x_bytes[32 - xb.len()..].copy_from_slice(&xb);
 
     // Lift x to a point with the requested y parity using SEC1 decompression.
     let mut compressed = [0u8; 33];
@@ -402,6 +441,18 @@ pub fn recover_public_key(
     Ok(SecpPublicKey { point })
 }
 
+/// Big-endian 256-bit addition, returning the sum and the carry-out.
+fn add_be(a: &[u8; 32], b: &[u8; 32]) -> ([u8; 32], bool) {
+    let mut out = [0u8; 32];
+    let mut carry = 0u16;
+    for i in (0..32).rev() {
+        let v = a[i] as u16 + b[i] as u16 + carry;
+        out[i] = v as u8;
+        carry = v >> 8;
+    }
+    (out, carry != 0)
+}
+
 // ---------------------------------------------------------------------------
 // BIP-340 Schnorr / BIP-341 taproot
 // ---------------------------------------------------------------------------
@@ -409,13 +460,13 @@ pub fn recover_public_key(
 /// Computes a BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data).
 pub fn tagged_hash(tag: &str, parts: &[&[u8]]) -> [u8; 32] {
     let th = sha256(tag.as_bytes());
-    let mut data = Vec::with_capacity(64 + parts.iter().map(|p| p.len()).sum::<usize>());
-    data.extend_from_slice(&th);
-    data.extend_from_slice(&th);
+    let mut h = Sha256::new();
+    h.update(&th);
+    h.update(&th);
     for p in parts {
-        data.extend_from_slice(p);
+        h.update(p);
     }
-    sha256(&data)
+    h.finalize()
 }
 
 fn taproot_tweak_full(internal_xonly: &[u8; 32]) -> Result<([u8; 32], u8, [u8; 32]), Error> {
@@ -543,6 +594,23 @@ pub fn bip340_verify(xonly_pub: &[u8; 32], msg: &[u8; 32], sig: &[u8; 64]) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_with_overflowed_r() {
+        // recid bit 1 set means R.x = r + n; r + n >= p must be rejected
+        // rather than wrapping. r = p - n is the smallest such value.
+        let r = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x45, 0x51, 0x23, 0x19, 0x50, 0xb7, 0x5f, 0xc4, 0x40, 0x2d, 0xa1, 0x72,
+            0x2f, 0xc9, 0xba, 0xee,
+        ];
+        assert_eq!(add_be(&r, &ORDER), (FIELD_PRIME, false));
+        let s = [0x01u8; 32];
+        let msg = [0u8; 32];
+        assert!(recover_public_key(&r, &s, 2, &msg).is_err());
+        let (sum, carry) = add_be(&[0u8; 32], &ORDER);
+        assert_eq!((sum, carry), (ORDER, false));
+    }
 
     fn h(s: &str) -> Vec<u8> {
         hex::decode(s).unwrap()

@@ -1,8 +1,13 @@
 //! Bitcoin amount type (satoshis) with Go-compatible JSON.
 
+#[cfg(feature = "alloc")]
+use crate::prelude::*;
+#[cfg(feature = "alloc")]
+use core::fmt;
+#[cfg(feature = "alloc")]
 use serde::de::{self, Visitor};
+#[cfg(feature = "alloc")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::fmt;
 
 /// A Bitcoin amount in satoshis (1 BTC = 100,000,000 satoshis).
 ///
@@ -12,6 +17,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct BtcAmount(pub u64);
 
+#[cfg(feature = "alloc")]
 impl BtcAmount {
     /// Formats the amount as a decimal string with exactly 8 decimal places.
     pub fn to_decimal_string(self) -> String {
@@ -34,7 +40,7 @@ impl BtcAmount {
             None => {
                 let v: u64 = s
                     .parse()
-                    .map_err(|e: std::num::ParseIntError| e.to_string())?;
+                    .map_err(|e: core::num::ParseIntError| e.to_string())?;
                 Ok(BtcAmount(
                     v.checked_mul(100_000_000).ok_or("amount overflows u64")?,
                 ))
@@ -48,7 +54,7 @@ impl BtcAmount {
                 let without_dot = s.replacen('.', "", 1);
                 let mut v: u64 = without_dot
                     .parse()
-                    .map_err(|e: std::num::ParseIntError| e.to_string())?;
+                    .map_err(|e: core::num::ParseIntError| e.to_string())?;
                 for _ in dec_count..8 {
                     v = v.checked_mul(10).ok_or("amount overflows u64")?;
                 }
@@ -70,6 +76,7 @@ impl From<BtcAmount> for u64 {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl Serialize for BtcAmount {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         // Emit an unquoted JSON number with 8 decimal places, matching Go.
@@ -79,8 +86,10 @@ impl Serialize for BtcAmount {
     }
 }
 
+#[cfg(feature = "alloc")]
 struct BtcAmountVisitor;
 
+#[cfg(feature = "alloc")]
 impl Visitor<'_> for BtcAmountVisitor {
     type Value = BtcAmount;
 
@@ -114,13 +123,14 @@ impl Visitor<'_> for BtcAmountVisitor {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl<'de> Deserialize<'de> for BtcAmount {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         deserializer.deserialize_any(BtcAmountVisitor)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
 

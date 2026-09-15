@@ -2,7 +2,10 @@
 //! BIP-341/340), serialization and parsing. Port of `btctx.go` and
 //! `btctx_p2tr.go`.
 
-use std::io::{self, Cursor, Read};
+use crate::prelude::*;
+
+#[cfg(feature = "std")]
+use std::io::{self, Read};
 
 use serde::de;
 use serde::ser::SerializeStruct;
@@ -43,7 +46,7 @@ impl Signer for crate::crypto::secp256k1::SecpPrivateKey {
         Some(self.public_key())
     }
     fn sign_ecdsa_der(&self, digest: &[u8; 32]) -> Result<Vec<u8>, String> {
-        Ok(self.sign_der(digest))
+        Ok(self.sign_der(digest).into())
     }
     fn sign_taproot(&self, sighash: &[u8; 32]) -> Result<[u8; 64], String> {
         self.sign_taproot(sighash).map_err(|e| e.to_string())
@@ -465,55 +468,57 @@ impl BtcTx {
     /// Parses a transaction from bytes.
     pub fn from_bytes(buf: &[u8]) -> Result<BtcTx, String> {
         let mut tx = BtcTx::default();
-        let mut cur = Cursor::new(buf);
-        tx.read_from(&mut cur).map_err(|e| e.to_string())?;
+        tx.read_source(&mut SliceSource(buf))
+            .map_err(|e| e.to_string())?;
         Ok(tx)
     }
 
     /// Reads a transaction from `r`, returning the number of bytes consumed.
+    #[cfg(feature = "std")]
     pub fn read_from<R: Read>(&mut self, r: &mut R) -> io::Result<u64> {
+        self.read_source(&mut IoSource(r))
+            .map_err(ReadError::into_io)
+    }
+
+    fn read_source<S: ByteSource>(&mut self, r: &mut S) -> Result<u64, ReadError> {
         let mut n = 0u64;
         self.version = read_u32le(r, &mut n)?;
-        let (incnt, c) = BtcVarInt::read_from(r)?;
-        n += c;
-        let mut in_cnt = incnt.0;
+        let mut in_cnt = read_varint(r, &mut n)?;
         let mut segwit = false;
         if in_cnt == 0 {
             segwit = true;
             read_u8(r, &mut n)?; // flag
-            let (real, c2) = BtcVarInt::read_from(r)?;
-            n += c2;
-            in_cnt = real.0;
+            in_cnt = read_varint(r, &mut n)?;
         }
         if in_cnt > 10000 {
-            return Err(io::Error::other("invalid transaction: too many inputs"));
+            return Err(ReadError::TooManyInputs);
         }
         self.inputs = Vec::with_capacity(in_cnt as usize);
         for _ in 0..in_cnt {
             let mut inp = BtcTxInput::default();
-            inp.read_from(r, &mut n)?;
+            inp.read_source(r, &mut n)?;
             self.inputs.push(inp);
         }
-        let (outcnt, c3) = BtcVarInt::read_from(r)?;
-        n += c3;
-        if outcnt.0 > 65536 {
-            return Err(io::Error::other("invalid transaction: too many outputs"));
+        let out_cnt = read_varint(r, &mut n)?;
+        if out_cnt > 65536 {
+            return Err(ReadError::TooManyOutputs);
         }
-        self.outputs = Vec::with_capacity(outcnt.0 as usize);
-        for idx in 0..outcnt.0 {
+        self.outputs = Vec::with_capacity(out_cnt as usize);
+        for idx in 0..out_cnt {
             let mut o = BtcTxOutput {
                 n: idx as usize,
                 ..Default::default()
             };
-            o.read_from(r, &mut n)?;
+            o.read_source(r, &mut n)?;
             self.outputs.push(o);
         }
         if segwit {
             for inp in &mut self.inputs {
-                let (wc, c4) = BtcVarInt::read_from(r)?;
-                n += c4;
-                let mut ws = Vec::with_capacity(wc.0 as usize);
-                for _ in 0..wc.0 {
+                let wc = read_varint(r, &mut n)?;
+                // Each witness item takes at least one byte, so cap the
+                // up-front allocation.
+                let mut ws = Vec::with_capacity(wc.min(10000) as usize);
+                for _ in 0..wc {
                     ws.push(read_var_buf(r, &mut n)?);
                 }
                 inp.witnesses = ws;
@@ -556,7 +561,7 @@ impl BtcTxInput {
         (a, self.sequence.to_le_bytes().to_vec())
     }
 
-    fn read_from<R: Read>(&mut self, r: &mut R, n: &mut u64) -> io::Result<()> {
+    fn read_source<S: ByteSource>(&mut self, r: &mut S, n: &mut u64) -> Result<(), ReadError> {
         read_full(r, &mut self.txid, n)?;
         self.txid.reverse();
         self.vout = read_u32le(r, n)?;
@@ -635,7 +640,7 @@ impl BtcTxOutput {
         buf
     }
 
-    fn read_from<R: Read>(&mut self, r: &mut R, n: &mut u64) -> io::Result<()> {
+    fn read_source<S: ByteSource>(&mut self, r: &mut S, n: &mut u64) -> Result<(), ReadError> {
         self.amount = BtcAmount(read_u64le(r, n)?);
         self.script = read_var_buf(r, n)?;
         Ok(())
@@ -807,41 +812,113 @@ impl BtcTx {
 
 // --- read helpers ---
 
-fn read_u8<R: Read>(r: &mut R, n: &mut u64) -> io::Result<u8> {
+/// Errors from parsing a serialized transaction.
+#[derive(Debug)]
+enum ReadError {
+    Eof,
+    TooManyInputs,
+    TooManyOutputs,
+    BufferTooLarge,
+    #[cfg(feature = "std")]
+    Io(io::Error),
+}
+
+impl core::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ReadError::Eof => f.write_str("unexpected end of transaction data"),
+            ReadError::TooManyInputs => f.write_str("invalid transaction: too many inputs"),
+            ReadError::TooManyOutputs => f.write_str("invalid transaction: too many outputs"),
+            ReadError::BufferTooLarge => f.write_str("buffer larger than maximum allowed length"),
+            #[cfg(feature = "std")]
+            ReadError::Io(e) => e.fmt(f),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl ReadError {
+    fn into_io(self) -> io::Error {
+        match self {
+            ReadError::Io(e) => e,
+            ReadError::Eof => io::Error::from(io::ErrorKind::UnexpectedEof),
+            other => io::Error::other(other.to_string()),
+        }
+    }
+}
+
+/// A source of bytes for transaction parsing: a slice, or (with `std`) any
+/// [`Read`].
+trait ByteSource {
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ReadError>;
+}
+
+struct SliceSource<'a>(&'a [u8]);
+
+impl ByteSource for SliceSource<'_> {
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ReadError> {
+        if self.0.len() < buf.len() {
+            return Err(ReadError::Eof);
+        }
+        let (head, rest) = self.0.split_at(buf.len());
+        buf.copy_from_slice(head);
+        self.0 = rest;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "std")]
+struct IoSource<'r, R>(&'r mut R);
+
+#[cfg(feature = "std")]
+impl<R: Read> ByteSource for IoSource<'_, R> {
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ReadError> {
+        self.0.read_exact(buf).map_err(ReadError::Io)
+    }
+}
+
+fn read_u8<S: ByteSource>(r: &mut S, n: &mut u64) -> Result<u8, ReadError> {
     let mut b = [0u8; 1];
-    r.read_exact(&mut b)?;
-    *n += 1;
+    read_full(r, &mut b, n)?;
     Ok(b[0])
 }
-fn read_u32le<R: Read>(r: &mut R, n: &mut u64) -> io::Result<u32> {
+fn read_u32le<S: ByteSource>(r: &mut S, n: &mut u64) -> Result<u32, ReadError> {
     let mut b = [0u8; 4];
-    r.read_exact(&mut b)?;
-    *n += 4;
+    read_full(r, &mut b, n)?;
     Ok(u32::from_le_bytes(b))
 }
-fn read_u64le<R: Read>(r: &mut R, n: &mut u64) -> io::Result<u64> {
+fn read_u64le<S: ByteSource>(r: &mut S, n: &mut u64) -> Result<u64, ReadError> {
     let mut b = [0u8; 8];
-    r.read_exact(&mut b)?;
-    *n += 8;
+    read_full(r, &mut b, n)?;
     Ok(u64::from_le_bytes(b))
 }
-fn read_full<R: Read>(r: &mut R, buf: &mut [u8], n: &mut u64) -> io::Result<()> {
+fn read_full<S: ByteSource>(r: &mut S, buf: &mut [u8], n: &mut u64) -> Result<(), ReadError> {
     r.read_exact(buf)?;
     *n += buf.len() as u64;
     Ok(())
 }
-fn read_var_buf<R: Read>(r: &mut R, n: &mut u64) -> io::Result<Vec<u8>> {
-    let (ln, c) = BtcVarInt::read_from(r)?;
-    *n += c;
-    if ln.0 == 0 {
+fn read_varint<S: ByteSource>(r: &mut S, n: &mut u64) -> Result<u64, ReadError> {
+    let mut buf = [0u8; 9];
+    read_full(r, &mut buf[..1], n)?;
+    let extra = match buf[0] {
+        0xfd => 2,
+        0xfe => 4,
+        0xff => 8,
+        _ => 0,
+    };
+    read_full(r, &mut buf[1..1 + extra], n)?;
+    let (v, _) = BtcVarInt::decode(&buf).expect("buffer holds a full varint");
+    Ok(v.0)
+}
+fn read_var_buf<S: ByteSource>(r: &mut S, n: &mut u64) -> Result<Vec<u8>, ReadError> {
+    let ln = read_varint(r, n)?;
+    if ln == 0 {
         return Ok(Vec::new());
     }
-    if ln.0 > 100000 {
-        return Err(io::Error::other(
-            "buffer larger than maximum allowed length",
-        ));
+    if ln > 100000 {
+        return Err(ReadError::BufferTooLarge);
     }
-    let mut buf = vec![0u8; ln.0 as usize];
+    let mut buf = vec![0u8; ln as usize];
     read_full(r, &mut buf, n)?;
     Ok(buf)
 }

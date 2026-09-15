@@ -1,6 +1,8 @@
 //! The [`Out`] type: a generated output script with format name and network
 //! flags, plus script-recognition helpers (`guess_out`, `get_outs`).
 
+use crate::prelude::*;
+
 use serde::Serialize;
 
 use crate::hash::hash160;

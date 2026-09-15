@@ -1,6 +1,8 @@
 //! EVM transactions: legacy, EIP-2930, EIP-1559, EIP-4844. Build, sign,
 //! serialize, parse and recover sender. Port of `evmtx.go`.
 
+use crate::prelude::*;
+
 use num_bigint::{BigInt, Sign};
 use num_traits::{Num, ToPrimitive};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

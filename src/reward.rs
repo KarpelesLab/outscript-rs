@@ -1,6 +1,8 @@
 //! Block reward and cumulative-supply calculations across networks. Port of
 //! `reward.go`.
 
+use crate::prelude::*;
+
 use num_bigint::BigInt;
 use num_traits::Zero;
 
