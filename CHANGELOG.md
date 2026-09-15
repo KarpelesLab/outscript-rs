@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/KarpelesLab/outscript-rs/compare/v0.1.2...v0.1.3) - 2026-09-15
+
+### Other
+
+- Heap-free EVM transaction signing (evmraw)
+- Heap-free Bitcoin transaction signing (btcraw)
+- Heap-free Solana keys/PDA, amounts, script guessing and ABI helpers
+- Heap-free address decoding
+- Heap-free script generation and address rendering
+- Support no_std and no-alloc builds (breaking)
+- Raise MSRV to 1.89 (required by purecrypto 0.8.6)
+- Bump purecrypto to 0.8.6
+
 ## [0.1.2](https://github.com/KarpelesLab/outscript-rs/compare/v0.1.1...v0.1.2) - 2026-06-27
 
 ### Other
