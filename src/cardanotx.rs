@@ -18,60 +18,14 @@
 //!
 //! Port of `cardanotx.go`.
 
+pub use crate::Error;
+
 use crate::prelude::*;
 
 use crate::cbor::{Cbor, split_array_items};
 use crate::crypto::SignerError;
 use crate::crypto::ed25519;
 use crate::hash::blake2b_256;
-
-/// Errors from Cardano transaction operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// The transaction has no inputs.
-    NoInputs,
-    /// The transaction has no outputs.
-    NoOutputs,
-    /// An input txid is not 32 bytes.
-    InvalidTxidLength,
-    /// An output has an empty address.
-    EmptyAddress,
-    /// Duplicate native-asset amounts overflow `u64` when summed.
-    AssetAmountOverflow,
-    /// A verification key is not 32 bytes.
-    InvalidKeyLength,
-    /// A signature is not 64 bytes.
-    InvalidSignatureLength,
-    /// The signer failed.
-    Signer,
-    /// The signature of this witness does not verify.
-    VerificationFailed(usize),
-    /// CBOR decoding failed.
-    Cbor(crate::cbor::Error),
-    /// The CBOR does not have the shape of a supported Cardano transaction.
-    InvalidStructure,
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::NoInputs => f.write_str("cardano transaction has no inputs"),
-            Error::NoOutputs => f.write_str("cardano transaction has no outputs"),
-            Error::InvalidTxidLength => f.write_str("cardano input txid must be 32 bytes"),
-            Error::EmptyAddress => f.write_str("cardano output has empty address"),
-            Error::AssetAmountOverflow => f.write_str("cardano asset amount overflow"),
-            Error::InvalidKeyLength => f.write_str("cardano vkey must be 32 bytes"),
-            Error::InvalidSignatureLength => f.write_str("cardano signature must be 64 bytes"),
-            Error::Signer => f.write_str("signer failed"),
-            Error::VerificationFailed(i) => write!(f, "witness {i} signature verification failed"),
-            Error::Cbor(e) => e.fmt(f),
-            Error::InvalidStructure => f.write_str("unsupported cardano transaction structure"),
-        }
-    }
-}
-
-impl core::error::Error for Error {}
 
 /// References an unspent transaction output being spent.
 #[derive(Debug, Clone)]
@@ -178,9 +132,7 @@ fn multiasset_map(assets: &[CardanoAsset]) -> Result<Cbor, Error> {
         };
         match names.iter_mut().find(|(n, _)| *n == a.asset_name) {
             Some((_, amount)) => {
-                *amount = amount
-                    .checked_add(a.amount)
-                    .ok_or(Error::AssetAmountOverflow)?;
+                *amount = amount.checked_add(a.amount).ok_or(Error::Overflow)?;
             }
             None => names.push((a.asset_name.clone(), a.amount)),
         }
@@ -224,7 +176,7 @@ impl CardanoTx {
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
             if input.txid.len() != 32 {
-                return Err(Error::InvalidTxidLength);
+                return Err(Error::InvalidLength);
             }
             inputs.push(Cbor::Array(vec![
                 Cbor::Bytes(input.txid.clone()),
@@ -303,10 +255,10 @@ impl CardanoTx {
     /// signature over [`CardanoTx::sign_bytes`]). For external/hardware signers.
     pub fn add_witness(&mut self, vkey: &[u8], signature: &[u8]) -> Result<(), Error> {
         if vkey.len() != 32 {
-            return Err(Error::InvalidKeyLength);
+            return Err(Error::InvalidLength);
         }
         if signature.len() != 64 {
-            return Err(Error::InvalidSignatureLength);
+            return Err(Error::InvalidLength);
         }
         self.witnesses.push(CardanoVkeyWitness {
             vkey: vkey.to_vec(),
@@ -321,17 +273,17 @@ impl CardanoTx {
         let digest = self.sign_bytes()?;
         for (i, w) in self.witnesses.iter().enumerate() {
             if w.vkey.len() != 32 {
-                return Err(Error::InvalidKeyLength);
+                return Err(Error::InvalidLength);
             }
             if w.signature.len() != 64 {
-                return Err(Error::InvalidSignatureLength);
+                return Err(Error::InvalidLength);
             }
             let mut pk = [0u8; 32];
             pk.copy_from_slice(&w.vkey);
             let mut sig = [0u8; 64];
             sig.copy_from_slice(&w.signature);
             if !ed25519::verify(&pk, &digest, &sig) {
-                return Err(Error::VerificationFailed(i));
+                return Err(Error::SignatureVerification(i));
             }
         }
         Ok(())
@@ -374,13 +326,13 @@ impl CardanoTx {
     /// by [`CardanoTx::to_bytes`]: ADA/native-asset outputs in the legacy
     /// (alonzo) array form and Ed25519 vkey witnesses.
     pub fn from_bytes(data: &[u8]) -> Result<CardanoTx, Error> {
-        let raw = split_array_items(data).map_err(Error::Cbor)?;
+        let raw = split_array_items(data).map_err(Error::from)?;
         if raw.len() < 2 {
-            return Err(Error::InvalidStructure);
+            return Err(Error::InvalidData);
         }
 
-        let body = Cbor::decode(&raw[0]).map_err(Error::Cbor)?.0;
-        let body = body.as_map().ok_or(Error::InvalidStructure)?;
+        let body = Cbor::decode(&raw[0]).map_err(Error::from)?.0;
+        let body = body.as_map().ok_or(Error::InvalidData)?;
         let get = |key: u64| {
             body.iter()
                 .find(|(k, _)| k.as_uint() == Some(key))
@@ -390,53 +342,44 @@ impl CardanoTx {
         let mut tx = CardanoTx::default();
 
         if let Some(inputs) = get(0) {
-            let inputs = inputs.as_array().ok_or(Error::InvalidStructure)?;
+            let inputs = inputs.as_array().ok_or(Error::InvalidData)?;
             for input in inputs {
-                let fields = input.as_array().ok_or(Error::InvalidStructure)?;
+                let fields = input.as_array().ok_or(Error::InvalidData)?;
                 if fields.len() != 2 {
-                    return Err(Error::InvalidStructure);
+                    return Err(Error::InvalidData);
                 }
-                let txid = fields[0]
-                    .as_bytes()
-                    .ok_or(Error::InvalidStructure)?
-                    .to_vec();
-                let index = fields[1].as_uint().ok_or(Error::InvalidStructure)?;
+                let txid = fields[0].as_bytes().ok_or(Error::InvalidData)?.to_vec();
+                let index = fields[1].as_uint().ok_or(Error::InvalidData)?;
                 tx.inputs.push(CardanoInput { txid, index });
             }
         }
 
         if let Some(outputs) = get(1) {
-            let outputs = outputs.as_array().ok_or(Error::InvalidStructure)?;
+            let outputs = outputs.as_array().ok_or(Error::InvalidData)?;
             for raw_out in outputs {
                 tx.outputs.push(decode_output(raw_out)?);
             }
         }
 
         if let Some(fee) = get(2) {
-            tx.fee = fee.as_uint().ok_or(Error::InvalidStructure)?;
+            tx.fee = fee.as_uint().ok_or(Error::InvalidData)?;
         }
         if let Some(ttl) = get(3) {
-            tx.ttl = ttl.as_uint().ok_or(Error::InvalidStructure)?;
+            tx.ttl = ttl.as_uint().ok_or(Error::InvalidData)?;
         }
 
-        let ws = Cbor::decode(&raw[1]).map_err(Error::Cbor)?.0;
+        let ws = Cbor::decode(&raw[1]).map_err(Error::from)?.0;
         if let Some(entries) = ws.as_map()
             && let Some((_, vkeys)) = entries.iter().find(|(k, _)| k.as_uint() == Some(0))
         {
-            let vkeys = vkeys.as_array().ok_or(Error::InvalidStructure)?;
+            let vkeys = vkeys.as_array().ok_or(Error::InvalidData)?;
             for vk in vkeys {
-                let fields = vk.as_array().ok_or(Error::InvalidStructure)?;
+                let fields = vk.as_array().ok_or(Error::InvalidData)?;
                 if fields.len() != 2 {
-                    return Err(Error::InvalidStructure);
+                    return Err(Error::InvalidData);
                 }
-                let vkey = fields[0]
-                    .as_bytes()
-                    .ok_or(Error::InvalidStructure)?
-                    .to_vec();
-                let signature = fields[1]
-                    .as_bytes()
-                    .ok_or(Error::InvalidStructure)?
-                    .to_vec();
+                let vkey = fields[0].as_bytes().ok_or(Error::InvalidData)?.to_vec();
+                let signature = fields[1].as_bytes().ok_or(Error::InvalidData)?.to_vec();
                 tx.witnesses.push(CardanoVkeyWitness { vkey, signature });
             }
         }
@@ -448,14 +391,11 @@ impl CardanoTx {
 /// Decodes a single transaction output in the legacy (alonzo) array form
 /// `[address, value, ? datum_hash]`.
 fn decode_output(raw: &Cbor) -> Result<CardanoOutput, Error> {
-    let fields = raw.as_array().ok_or(Error::InvalidStructure)?;
+    let fields = raw.as_array().ok_or(Error::InvalidData)?;
     if fields.len() < 2 {
-        return Err(Error::InvalidStructure);
+        return Err(Error::InvalidData);
     }
-    let address = fields[0]
-        .as_bytes()
-        .ok_or(Error::InvalidStructure)?
-        .to_vec();
+    let address = fields[0].as_bytes().ok_or(Error::InvalidData)?.to_vec();
 
     // value is either a bare coin (uint) or [coin, multiasset]
     if let Some(amount) = fields[1].as_uint() {
@@ -465,12 +405,12 @@ fn decode_output(raw: &Cbor) -> Result<CardanoOutput, Error> {
             assets: Vec::new(),
         });
     }
-    let value = fields[1].as_array().ok_or(Error::InvalidStructure)?;
+    let value = fields[1].as_array().ok_or(Error::InvalidData)?;
     if value.len() != 2 {
-        return Err(Error::InvalidStructure);
+        return Err(Error::InvalidData);
     }
-    let amount = value[0].as_uint().ok_or(Error::InvalidStructure)?;
-    let multiasset = value[1].as_map().ok_or(Error::InvalidStructure)?;
+    let amount = value[0].as_uint().ok_or(Error::InvalidData)?;
+    let multiasset = value[1].as_map().ok_or(Error::InvalidData)?;
     let assets = flatten_assets(multiasset)?;
     Ok(CardanoOutput {
         address,
@@ -484,13 +424,13 @@ fn decode_output(raw: &Cbor) -> Result<CardanoOutput, Error> {
 fn flatten_assets(multiasset: &[(Cbor, Cbor)]) -> Result<Vec<CardanoAsset>, Error> {
     let mut assets = Vec::new();
     for (policy, names) in multiasset {
-        let policy_id = policy.as_bytes().ok_or(Error::InvalidStructure)?.to_vec();
-        let names = names.as_map().ok_or(Error::InvalidStructure)?;
+        let policy_id = policy.as_bytes().ok_or(Error::InvalidData)?.to_vec();
+        let names = names.as_map().ok_or(Error::InvalidData)?;
         for (name, amount) in names {
             assets.push(CardanoAsset {
                 policy_id: policy_id.clone(),
-                asset_name: name.as_bytes().ok_or(Error::InvalidStructure)?.to_vec(),
-                amount: amount.as_uint().ok_or(Error::InvalidStructure)?,
+                asset_name: name.as_bytes().ok_or(Error::InvalidData)?.to_vec(),
+                amount: amount.as_uint().ok_or(Error::InvalidData)?,
             });
         }
     }

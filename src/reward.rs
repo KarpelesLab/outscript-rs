@@ -1,24 +1,10 @@
 //! Block reward and cumulative-supply calculations across networks. Port of
 //! `reward.go`.
 
+pub use crate::Error;
+
 use num_bigint::BigInt;
 use num_traits::Zero;
-
-/// Errors from reward calculations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// The network has no known reward schedule.
-    UnsupportedNetwork,
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("unsupported network for block rewards")
-    }
-}
-
-impl core::error::Error for Error {}
 
 #[derive(Clone, Copy)]
 enum RewardModel {

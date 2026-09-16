@@ -2,6 +2,8 @@
 //! BIP-341/340), serialization and parsing. Port of `btctx.go` and
 //! `btctx_p2tr.go`.
 
+pub use crate::Error;
+
 use crate::prelude::*;
 
 #[cfg(feature = "std")]
@@ -134,110 +136,7 @@ impl<'a> BtcTxSign<'a> {
 
 fn signer_pubkey_script(key: &dyn Signer, name: &str) -> Result<Vec<u8>, Error> {
     let pk = key.ecdsa_public_key().ok_or(Error::NoPublicKey)?;
-    Ok(Script::new(PubKey::Secp256k1(pk)).generate(name)?)
-}
-
-/// Errors from Bitcoin transaction operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// The number of signing entries does not match the number of inputs.
-    KeyCount,
-    /// A signing entry has no key.
-    MissingKey,
-    /// The signer does not expose an ECDSA public key.
-    NoPublicKey,
-    /// The signer failed.
-    Signer,
-    /// The spend scheme is not supported.
-    UnsupportedScheme,
-    /// The sighash type is not supported for this spend.
-    UnsupportedSighash,
-    /// No standard witness script matches the key and the input's
-    /// scriptPubKey.
-    NoMatchingWitnessScript,
-    /// A taproot sighash needs the previous scriptPubKey of this input.
-    MissingPrevScript(usize),
-    /// The previous outputs do not match the inputs one to one.
-    PrevOutCount,
-    /// A spend needs a redeem or leaf script that was not provided.
-    MissingScript,
-    /// The input index is out of range.
-    InputIndex,
-    /// A signature is not a valid DER encoding.
-    InvalidSignature,
-    /// A script could not be generated.
-    Script(crate::script::Error),
-    /// An address could not be parsed.
-    Address(crate::address::Error),
-    /// A PSBT operation failed.
-    Psbt(crate::psbt::Error),
-    /// The transaction data ended unexpectedly.
-    UnexpectedEof,
-    /// The transaction declares too many inputs.
-    TooManyInputs,
-    /// The transaction declares too many outputs.
-    TooManyOutputs,
-    /// A script or witness item is larger than allowed.
-    BufferTooLarge,
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::KeyCount => f.write_str("signing needs one entry per input"),
-            Error::MissingKey => f.write_str("signing requires a key"),
-            Error::NoPublicKey => f.write_str("signer does not expose an ECDSA public key"),
-            Error::Signer => f.write_str("signer failed"),
-            Error::UnsupportedScheme => f.write_str("unsupported spend scheme"),
-            Error::UnsupportedSighash => f.write_str("unsupported sighash type"),
-            Error::NoMatchingWitnessScript => {
-                f.write_str("no standard witness script matches the input")
-            }
-            Error::MissingPrevScript(i) => write!(f, "input {i} is missing its previous script"),
-            Error::PrevOutCount => f.write_str("previous outputs must match the inputs"),
-            Error::MissingScript => f.write_str("missing redeem or leaf script"),
-            Error::InputIndex => f.write_str("input index out of range"),
-            Error::InvalidSignature => f.write_str("invalid DER signature"),
-            Error::Script(e) => e.fmt(f),
-            Error::Address(e) => e.fmt(f),
-            Error::Psbt(e) => e.fmt(f),
-            Error::UnexpectedEof => f.write_str("unexpected end of transaction data"),
-            Error::TooManyInputs => f.write_str("invalid transaction: too many inputs"),
-            Error::TooManyOutputs => f.write_str("invalid transaction: too many outputs"),
-            Error::BufferTooLarge => f.write_str("buffer larger than maximum allowed length"),
-        }
-    }
-}
-
-impl core::error::Error for Error {}
-
-impl From<crate::script::Error> for Error {
-    fn from(e: crate::script::Error) -> Self {
-        Error::Script(e)
-    }
-}
-
-impl From<crate::address::Error> for Error {
-    fn from(e: crate::address::Error) -> Self {
-        Error::Address(e)
-    }
-}
-
-impl From<SignerError> for Error {
-    fn from(_: SignerError) -> Self {
-        Error::Signer
-    }
-}
-
-impl From<crate::btcraw::Error> for Error {
-    fn from(e: crate::btcraw::Error) -> Self {
-        match e {
-            crate::btcraw::Error::PrevOutCount => Error::PrevOutCount,
-            crate::btcraw::Error::UnsupportedSighash => Error::UnsupportedSighash,
-            _ => Error::InputIndex,
-        }
-    }
+    Script::new(PubKey::Secp256k1(pk)).generate(name)
 }
 
 impl BtcTx {
@@ -447,10 +346,9 @@ impl BtcTx {
             .iter()
             .any(|i| !i.script.is_empty() || !i.witnesses.is_empty())
         {
-            return Err(Error::Psbt(crate::psbt::Error::InvalidUnsignedTx));
+            return Err(Error::InvalidUnsignedTx);
         }
         self.with_raw(crate::psbt::Psbt::create_to_vec)
-            .map_err(Error::Psbt)
     }
 
     /// The BIP-143 hashes shared by every input.
@@ -584,7 +482,7 @@ impl BtcTx {
             in_cnt = read_varint(r, &mut n)?;
         }
         if in_cnt > 10000 {
-            return Err(ReadError::TooManyInputs);
+            return Err(ReadError::TooLarge);
         }
         self.inputs = Vec::with_capacity(in_cnt as usize);
         for _ in 0..in_cnt {
@@ -594,7 +492,7 @@ impl BtcTx {
         }
         let out_cnt = read_varint(r, &mut n)?;
         if out_cnt > 65536 {
-            return Err(ReadError::TooManyOutputs);
+            return Err(ReadError::TooLarge);
         }
         self.outputs = Vec::with_capacity(out_cnt as usize);
         for idx in 0..out_cnt {
@@ -768,7 +666,6 @@ impl BtcTx {
             });
         }
         self.with_raw(|raw| raw.taproot_midstate(&prevouts))
-            .map_err(Error::from)
     }
 
     pub(crate) fn taproot_sighash_parts_raw(
@@ -787,7 +684,6 @@ impl BtcTx {
             prevouts.push(PrevOut { amount, script });
         }
         self.with_raw(|raw| raw.taproot_midstate(&prevouts))
-            .map_err(Error::from)
     }
 
     /// Pre-segwit legacy sighash: clear inputs, substitute `script_code` at
@@ -799,14 +695,14 @@ impl BtcTx {
         script_code: &[u8],
         flag: u32,
     ) -> Result<[u8; 32], Error> {
-        Ok(self.with_raw(|raw| raw.legacy_sighash(n, script_code, flag))?)
+        self.with_raw(|raw| raw.legacy_sighash(n, script_code, flag))
     }
 
     /// Computes the BIP-341 key-path SIGHASH_DEFAULT digest for input `idx`.
     /// Each entry in `keys` must have its `prev_script` and `amount` set.
     pub fn taproot_sighash(&self, keys: &[BtcTxSign], idx: usize) -> Result<[u8; 32], Error> {
         let parts = self.taproot_sighash_parts_from_keys(keys)?;
-        Ok(parts.key_spend_sighash(idx)?)
+        parts.key_spend_sighash(idx)
     }
 
     fn p2tr_sign(
@@ -833,9 +729,7 @@ impl BtcTx {
 #[derive(Debug)]
 enum ReadError {
     Eof,
-    TooManyInputs,
-    TooManyOutputs,
-    BufferTooLarge,
+    TooLarge,
     #[cfg(feature = "std")]
     Io(io::Error),
 }
@@ -844,9 +738,7 @@ impl core::fmt::Display for ReadError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ReadError::Eof => f.write_str("unexpected end of transaction data"),
-            ReadError::TooManyInputs => f.write_str("invalid transaction: too many inputs"),
-            ReadError::TooManyOutputs => f.write_str("invalid transaction: too many outputs"),
-            ReadError::BufferTooLarge => f.write_str("buffer larger than maximum allowed length"),
+            ReadError::TooLarge => f.write_str("transaction data exceeds the allowed maximum"),
             #[cfg(feature = "std")]
             ReadError::Io(e) => e.fmt(f),
         }
@@ -857,9 +749,7 @@ impl ReadError {
     fn into_error(self) -> Error {
         match self {
             ReadError::Eof => Error::UnexpectedEof,
-            ReadError::TooManyInputs => Error::TooManyInputs,
-            ReadError::TooManyOutputs => Error::TooManyOutputs,
-            ReadError::BufferTooLarge => Error::BufferTooLarge,
+            ReadError::TooLarge => Error::TooLarge,
             #[cfg(feature = "std")]
             ReadError::Io(_) => Error::UnexpectedEof,
         }
@@ -944,7 +834,7 @@ fn read_var_buf<S: ByteSource>(r: &mut S, n: &mut u64) -> Result<Vec<u8>, ReadEr
         return Ok(Vec::new());
     }
     if ln > 100000 {
-        return Err(ReadError::BufferTooLarge);
+        return Err(ReadError::TooLarge);
     }
     let mut buf = vec![0u8; ln as usize];
     read_full(r, &mut buf, n)?;

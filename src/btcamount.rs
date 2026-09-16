@@ -1,5 +1,7 @@
 //! Bitcoin amount type (satoshis) with Go-compatible JSON.
 
+pub use crate::Error;
+
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
 #[cfg(feature = "alloc")]
@@ -17,33 +19,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct BtcAmount(pub u64);
 
-/// Errors from [`BtcAmount::from_text`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum AmountError {
-    /// The text is not a valid number.
-    Invalid,
-    /// The amount does not fit in 64 bits of satoshis.
-    Overflow,
-    /// The decimal amount has more than 8 fractional digits.
-    TooManyDecimals,
-}
-
-impl core::fmt::Display for AmountError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            AmountError::Invalid => "invalid amount",
-            AmountError::Overflow => "amount overflows u64",
-            AmountError::TooManyDecimals => "cannot parse amount with more than 8 decimals",
-        })
-    }
-}
-
-impl core::error::Error for AmountError {}
-
 /// Parses decimal digits (with an optional leading `+`, like `u64::from_str`),
 /// skipping the byte at `skip`.
-fn parse_digits(s: &[u8], skip: Option<usize>) -> Result<u64, AmountError> {
+fn parse_digits(s: &[u8], skip: Option<usize>) -> Result<u64, Error> {
     let mut digits = s
         .iter()
         .enumerate()
@@ -59,17 +37,17 @@ fn parse_digits(s: &[u8], skip: Option<usize>) -> Result<u64, AmountError> {
         let d = c
             .checked_sub(b'0')
             .filter(|d| *d < 10)
-            .ok_or(AmountError::Invalid)?;
+            .ok_or(Error::InvalidAmount)?;
         v = v
             .checked_mul(10)
             .and_then(|v| v.checked_add(d as u64))
-            .ok_or(AmountError::Overflow)?;
+            .ok_or(Error::Overflow)?;
         any = true;
     }
     if any {
         Ok(v)
     } else {
-        Err(AmountError::Invalid)
+        Err(Error::InvalidAmount)
     }
 }
 
@@ -84,30 +62,30 @@ impl BtcAmount {
     /// Parses a textual amount. Accepts decimal strings (e.g. "1.5"), integer
     /// strings (multiplied by 10^8), and `0x`-prefixed hex (treated as raw
     /// satoshis).
-    pub fn from_text(s: &str) -> Result<BtcAmount, AmountError> {
+    pub fn from_text(s: &str) -> Result<BtcAmount, Error> {
         if let Some(hex_part) = s.strip_prefix("0x") {
             return u64::from_str_radix(hex_part, 16)
                 .map(BtcAmount)
                 .map_err(|e| match e.kind() {
-                    core::num::IntErrorKind::PosOverflow => AmountError::Overflow,
-                    _ => AmountError::Invalid,
+                    core::num::IntErrorKind::PosOverflow => Error::Overflow,
+                    _ => Error::InvalidAmount,
                 });
         }
         match s.find('.') {
             None => {
                 let v = parse_digits(s.as_bytes(), None)?;
                 Ok(BtcAmount(
-                    v.checked_mul(100_000_000).ok_or(AmountError::Overflow)?,
+                    v.checked_mul(100_000_000).ok_or(Error::Overflow)?,
                 ))
             }
             Some(pos) => {
                 let dec_count = s.len() - pos - 1;
                 if dec_count > 8 {
-                    return Err(AmountError::TooManyDecimals);
+                    return Err(Error::TooManyDecimals);
                 }
                 let mut v = parse_digits(s.as_bytes(), Some(pos))?;
                 for _ in dec_count..8 {
-                    v = v.checked_mul(10).ok_or(AmountError::Overflow)?;
+                    v = v.checked_mul(10).ok_or(Error::Overflow)?;
                 }
                 Ok(BtcAmount(v))
             }
@@ -203,7 +181,7 @@ mod tests {
         }
         assert_eq!(
             BtcAmount::from_text("18446744073709551616"),
-            Err(AmountError::Overflow)
+            Err(Error::Overflow)
         );
     }
 

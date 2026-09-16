@@ -36,7 +36,7 @@ fn is_over_half_order(s_be: &[u8; 32]) -> bool {
 }
 
 /// Errors from secp256k1 operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
     /// A secret key, scalar or coordinate was out of range.

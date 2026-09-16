@@ -22,6 +22,8 @@
 //!
 //! With `alloc`, each `*_to_slice` operation has a `*_to_vec` counterpart.
 
+pub use crate::Error;
+
 mod finalize;
 mod sign;
 
@@ -115,112 +117,6 @@ pub mod output {
     pub const PROPRIETARY: u64 = 0xfc;
 }
 
-/// Errors from PSBT operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// The data does not start with the PSBT magic.
-    InvalidMagic,
-    /// The data ended unexpectedly.
-    UnexpectedEof,
-    /// Bytes remain after the last map.
-    TrailingData,
-    /// A compact-size integer is not minimally encoded.
-    NonCanonicalVarint,
-    /// A map contains the same key twice.
-    DuplicateKey,
-    /// A key has the wrong key data for its type (or a v2-only type).
-    InvalidKey,
-    /// A value is malformed for its key type.
-    InvalidValue,
-    /// The global map has no unsigned transaction.
-    MissingUnsignedTx,
-    /// The unsigned transaction is malformed or has scriptSigs/witnesses.
-    InvalidUnsignedTx,
-    /// The PSBT version is not 0.
-    UnsupportedVersion,
-    /// The base64 text is invalid.
-    InvalidBase64,
-    /// The output buffer is too small.
-    BufferTooSmall,
-    /// The input index is out of range.
-    InputIndex,
-    /// The output index is out of range.
-    OutputIndex,
-    /// The input has no UTXO information.
-    MissingUtxo,
-    /// The non-witness UTXO's txid does not match the spent outpoint.
-    UtxoTxidMismatch,
-    /// A P2SH input has no redeem script.
-    MissingRedeemScript,
-    /// The redeem script does not hash to the P2SH scriptPubKey.
-    RedeemScriptMismatch,
-    /// A P2WSH input has no witness script.
-    MissingWitnessScript,
-    /// The witness script does not hash to the P2WSH program.
-    WitnessScriptMismatch,
-    /// Only a witness UTXO is provided for a non-witness spend.
-    WitnessUtxoForNonWitness,
-    /// The sighash type is not supported (ECDSA: `SIGHASH_ALL`; taproot:
-    /// `SIGHASH_DEFAULT` or `SIGHASH_ALL`).
-    UnsupportedSighash,
-    /// The input's script type is not supported for this operation.
-    UnsupportedScript,
-    /// The signer's key is not involved in the input.
-    KeyNotInvolved,
-    /// The signer failed.
-    Signer,
-    /// Not every input is finalized.
-    NotFinalized,
-    /// The PSBTs being combined are for different transactions.
-    TxMismatch,
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Error::InvalidMagic => "not a PSBT (bad magic)",
-            Error::UnexpectedEof => "unexpected end of PSBT data",
-            Error::TrailingData => "trailing data after PSBT",
-            Error::NonCanonicalVarint => "non-canonical compact size",
-            Error::DuplicateKey => "duplicate key in PSBT map",
-            Error::InvalidKey => "invalid PSBT key",
-            Error::InvalidValue => "invalid PSBT value",
-            Error::MissingUnsignedTx => "PSBT has no unsigned transaction",
-            Error::InvalidUnsignedTx => "invalid PSBT unsigned transaction",
-            Error::UnsupportedVersion => "unsupported PSBT version",
-            Error::InvalidBase64 => "invalid PSBT base64",
-            Error::BufferTooSmall => "PSBT output buffer too small",
-            Error::InputIndex => "input index out of range",
-            Error::OutputIndex => "output index out of range",
-            Error::MissingUtxo => "input has no UTXO information",
-            Error::UtxoTxidMismatch => "non-witness UTXO does not match the input txid",
-            Error::MissingRedeemScript => "P2SH input has no redeem script",
-            Error::RedeemScriptMismatch => "redeem script does not match the scriptPubKey",
-            Error::MissingWitnessScript => "P2WSH input has no witness script",
-            Error::WitnessScriptMismatch => "witness script does not match the witness program",
-            Error::WitnessUtxoForNonWitness => "witness UTXO provided for a non-witness input",
-            Error::UnsupportedSighash => "unsupported sighash type",
-            Error::UnsupportedScript => "unsupported input script type",
-            Error::KeyNotInvolved => "signer key is not involved in this input",
-            Error::Signer => "signer failed",
-            Error::NotFinalized => "PSBT is not fully finalized",
-            Error::TxMismatch => "PSBTs are for different transactions",
-        })
-    }
-}
-
-impl core::error::Error for Error {}
-
-impl From<base64::Error> for Error {
-    fn from(e: base64::Error) -> Self {
-        match e {
-            base64::Error::BufferTooSmall => Error::BufferTooSmall,
-            _ => Error::InvalidBase64,
-        }
-    }
-}
-
 // --- reading ---
 
 #[derive(Clone)]
@@ -255,7 +151,7 @@ impl<'a> Reader<'a> {
         let (v, n) = BtcVarInt::decode(&self.buf[self.pos.min(self.buf.len())..])
             .ok_or(Error::UnexpectedEof)?;
         if v.len() != n {
-            return Err(Error::NonCanonicalVarint);
+            return Err(Error::NonCanonical);
         }
         self.pos += n;
         Ok(v.0)
@@ -308,7 +204,7 @@ impl TxLayout {
                     inputs_at = r.pos;
                     input_count = r.varint()?;
                 }
-                _ => return Err(Error::InvalidValue),
+                _ => return Err(Error::InvalidRecordValue),
             }
         }
         let mut unsigned = !segwit;
@@ -344,12 +240,12 @@ impl TxLayout {
             }
             if !any {
                 // a witness marker with no witness data is not canonical
-                return Err(Error::InvalidValue);
+                return Err(Error::InvalidRecordValue);
             }
         }
         r.u32()?;
         if !r.is_empty() {
-            return Err(Error::InvalidValue);
+            return Err(Error::InvalidRecordValue);
         }
         Ok(TxLayout {
             inputs_at,
@@ -583,15 +479,21 @@ fn validate_record(kind: MapKind, rec: &Record<'_>) -> Result<(), Error> {
         if data.is_empty() {
             Ok(())
         } else {
-            Err(Error::InvalidKey)
+            Err(Error::InvalidRecordKey)
         }
     };
-    let check = |ok: bool| if ok { Ok(()) } else { Err(Error::InvalidValue) };
+    let check = |ok: bool| {
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::InvalidRecordValue)
+        }
+    };
     match (kind, rec.key_type()) {
         (MapKind::Global, global::UNSIGNED_TX) => no_key_data(),
         (MapKind::Global, global::XPUB) => {
             if data.len() != 78 {
-                return Err(Error::InvalidKey);
+                return Err(Error::InvalidRecordKey);
             }
             check(is_derivation_path(value))
         }
@@ -599,12 +501,12 @@ fn validate_record(kind: MapKind, rec: &Record<'_>) -> Result<(), Error> {
             no_key_data()?;
             match value {
                 [0, 0, 0, 0] => Ok(()),
-                [_, _, _, _] => Err(Error::UnsupportedVersion),
-                _ => Err(Error::InvalidValue),
+                [_, _, _, _] => Err(Error::UnsupportedPsbtVersion),
+                _ => Err(Error::InvalidRecordValue),
             }
         }
         // PSBTv2-only global fields
-        (MapKind::Global, 0x02..=0x06) => Err(Error::InvalidKey),
+        (MapKind::Global, 0x02..=0x06) => Err(Error::InvalidRecordKey),
         (MapKind::Input, input::NON_WITNESS_UTXO) => {
             no_key_data()?;
             TxLayout::parse(value, true).map(|_| ())
@@ -618,7 +520,7 @@ fn validate_record(kind: MapKind, rec: &Record<'_>) -> Result<(), Error> {
         }
         (MapKind::Input, input::PARTIAL_SIG) => {
             if !is_pubkey(data) {
-                return Err(Error::InvalidKey);
+                return Err(Error::InvalidRecordKey);
             }
             check(!value.is_empty())
         }
@@ -631,7 +533,7 @@ fn validate_record(kind: MapKind, rec: &Record<'_>) -> Result<(), Error> {
         }
         (MapKind::Input, input::BIP32_DERIVATION) | (MapKind::Output, output::BIP32_DERIVATION) => {
             if !is_pubkey(data) {
-                return Err(Error::InvalidKey);
+                return Err(Error::InvalidRecordKey);
             }
             check(is_derivation_path(value))
         }
@@ -644,39 +546,39 @@ fn validate_record(kind: MapKind, rec: &Record<'_>) -> Result<(), Error> {
             check(r.is_empty())
         }
         (MapKind::Input, input::RIPEMD160 | input::HASH160) => {
-            check(data.len() == 20).map_err(|_| Error::InvalidKey)
+            check(data.len() == 20).map_err(|_| Error::InvalidRecordKey)
         }
         (MapKind::Input, input::SHA256 | input::HASH256) => {
-            check(data.len() == 32).map_err(|_| Error::InvalidKey)
+            check(data.len() == 32).map_err(|_| Error::InvalidRecordKey)
         }
         // PSBTv2-only input fields
-        (MapKind::Input, 0x0e..=0x12) => Err(Error::InvalidKey),
+        (MapKind::Input, 0x0e..=0x12) => Err(Error::InvalidRecordKey),
         (MapKind::Input, input::TAP_KEY_SIG) => {
             no_key_data()?;
             check(matches!(value.len(), 64 | 65))
         }
         (MapKind::Input, input::TAP_SCRIPT_SIG) => {
             if data.len() != 64 {
-                return Err(Error::InvalidKey);
+                return Err(Error::InvalidRecordKey);
             }
             check(matches!(value.len(), 64 | 65))
         }
         (MapKind::Input, input::TAP_LEAF_SCRIPT) => {
             if data.len() < 33 || !(data.len() - 33).is_multiple_of(32) {
-                return Err(Error::InvalidKey);
+                return Err(Error::InvalidRecordKey);
             }
             check(!value.is_empty())
         }
         (MapKind::Input, input::TAP_BIP32_DERIVATION)
         | (MapKind::Output, output::TAP_BIP32_DERIVATION) => {
             if data.len() != 32 {
-                return Err(Error::InvalidKey);
+                return Err(Error::InvalidRecordKey);
             }
             let mut r = Reader::new(value);
             let hashes = r.varint()?;
             r.take(
                 usize::try_from(hashes)
-                    .map_err(|_| Error::InvalidValue)?
+                    .map_err(|_| Error::InvalidRecordValue)?
                     .saturating_mul(32),
             )?;
             check(is_derivation_path(&value[r.pos..]))
@@ -690,11 +592,11 @@ fn validate_record(kind: MapKind, rec: &Record<'_>) -> Result<(), Error> {
             no_key_data()
         }
         // PSBTv2-only output fields
-        (MapKind::Output, 0x03 | 0x04) => Err(Error::InvalidKey),
+        (MapKind::Output, 0x03 | 0x04) => Err(Error::InvalidRecordKey),
         (_, 0xfc) => Reader::new(data)
             .var_bytes()
             .map(|_| ())
-            .map_err(|_| Error::InvalidKey),
+            .map_err(|_| Error::InvalidRecordKey),
         _ => Ok(()),
     }
 }
@@ -846,7 +748,7 @@ impl<'a> Psbt<'a> {
             }
             return tx_outputs(prev, &layout)
                 .nth(outpoint.vout as usize)
-                .ok_or(Error::InvalidValue);
+                .ok_or(Error::InvalidRecordValue);
         }
         inp.witness_utxo().ok_or(Error::MissingUtxo)
     }
@@ -1186,7 +1088,7 @@ fn create(tx: &RawTx<'_>, s: &mut dyn Sink) -> Result<(), Error> {
 
 fn key_with_data<'k>(key: &'k mut [u8; 66], data: &[u8]) -> Result<&'k [u8], Error> {
     if !matches!(data.len(), 33 | 65) {
-        return Err(Error::InvalidKey);
+        return Err(Error::InvalidRecordKey);
     }
     key[1..=data.len()].copy_from_slice(data);
     Ok(&key[..=data.len()])

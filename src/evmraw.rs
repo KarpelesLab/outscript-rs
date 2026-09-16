@@ -5,6 +5,8 @@
 //! EIP-1559 transactions with an empty access list — the same subset as
 //! `EvmTx`.
 
+pub use crate::Error;
+
 use purecrypto::hash::{Digest, Keccak256};
 
 use crate::crypto::secp256k1::{SecpPrivateKey, recover_public_key};
@@ -37,33 +39,6 @@ impl EvmTxType {
         }
     }
 }
-
-/// Errors from [`RawEvmTx`] operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// The transaction type cannot be encoded (EIP-4844).
-    UnsupportedType,
-    /// The signature's `v` does not match the transaction type.
-    InvalidV,
-    /// Public-key recovery failed.
-    Recovery,
-    /// The output buffer is too small.
-    BufferTooSmall,
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Error::UnsupportedType => "transaction type not supported",
-            Error::InvalidV => "invalid signature v value",
-            Error::Recovery => "sender recovery failed",
-            Error::BufferTooSmall => "transaction output buffer too small",
-        })
-    }
-}
-
-impl core::error::Error for Error {}
 
 /// A transaction signature as carried in the encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,7 +159,7 @@ impl RawEvmTx<'_> {
     /// Writes the full encoding: optional type byte, then the RLP list.
     fn encode<S: Sink>(&self, s: &mut S, sig: Option<&EvmSignature>) -> Result<(), Error> {
         if self.tx_type == EvmTxType::Eip4844 {
-            return Err(Error::UnsupportedType);
+            return Err(Error::UnsupportedTxType);
         }
         let eip155_suffix =
             sig.is_none() && self.tx_type == EvmTxType::Legacy && self.chain_id != 0;
@@ -367,6 +342,6 @@ mod tests {
             value: [0; 32],
             data: &[],
         };
-        assert_eq!(blob.signing_hash(), Err(Error::UnsupportedType));
+        assert_eq!(blob.signing_hash(), Err(Error::UnsupportedTxType));
     }
 }

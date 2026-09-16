@@ -5,6 +5,8 @@
 //! cache and `Out` conversion, and `format_def` describes each format as
 //! composable `Insertable` steps.
 
+pub use crate::Error;
+
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
 #[cfg(feature = "alloc")]
@@ -30,31 +32,6 @@ pub const MAX_SCRIPT_LEN: usize = 67;
 /// A generated output script (or public-key encoding), stored inline.
 pub type ScriptBytes = InlineBytes<MAX_SCRIPT_LEN>;
 
-/// Errors from [`generate_script`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// The format name is not a built-in format.
-    UnknownFormat,
-    /// The format needs a different key type (e.g. `p2pkh` from an Ed25519
-    /// key).
-    UnsupportedKey,
-    /// The key could not be used for the format (e.g. a failed taproot tweak).
-    InvalidKey,
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Error::UnknownFormat => "unsupported format",
-            Error::UnsupportedKey => "public key type not supported by this format",
-            Error::InvalidKey => "invalid public key for this format",
-        })
-    }
-}
-
-impl core::error::Error for Error {}
-
 fn script_of(parts: &[&[u8]]) -> ScriptBytes {
     let mut out = ScriptBytes::new();
     for p in parts {
@@ -70,15 +47,15 @@ fn script_of(parts: &[&[u8]]) -> ScriptBytes {
 pub fn generate_script(pubkey: &PubKey, name: &str) -> Result<ScriptBytes, Error> {
     let comp = || match pubkey {
         PubKey::Secp256k1(k) => Ok(k.serialize_compressed()),
-        _ => Err(Error::UnsupportedKey),
+        _ => Err(Error::UnsupportedKeyType),
     };
     let uncomp = || match pubkey {
         PubKey::Secp256k1(k) => Ok(k.serialize_uncompressed()),
-        _ => Err(Error::UnsupportedKey),
+        _ => Err(Error::UnsupportedKeyType),
     };
     let ed = || match pubkey {
         PubKey::Ed25519(k) => Ok(*k),
-        _ => Err(Error::UnsupportedKey),
+        _ => Err(Error::UnsupportedKeyType),
     };
 
     if let Some(inner) = name.strip_prefix("p2sh:") {
@@ -285,10 +262,13 @@ mod tests {
             generate_script(&secp, "p2puk").unwrap().len(),
             MAX_SCRIPT_LEN
         );
-        assert_eq!(generate_script(&secp, "solana"), Err(Error::UnsupportedKey));
+        assert_eq!(
+            generate_script(&secp, "solana"),
+            Err(Error::UnsupportedKeyType)
+        );
         assert_eq!(
             generate_script(&ed, "p2sh:p2pkh"),
-            Err(Error::UnsupportedKey)
+            Err(Error::UnsupportedKeyType)
         );
         assert_eq!(
             generate_script(&secp, "p2sh:eth"),

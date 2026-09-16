@@ -15,6 +15,8 @@
 //!
 //! Port of `cardano_extkey.go` and `cardano_derive.go`.
 
+pub use crate::Error;
+
 use purecrypto::hash::{Digest, HmacSha512, Sha512};
 use purecrypto::kdf::pbkdf2;
 
@@ -23,38 +25,6 @@ use crate::cardanotx::CardanoSigner;
 use crate::crypto::ed25519;
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
-
-/// Errors from Cardano key construction and derivation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// A key, chain code or xprv had the wrong length.
-    InvalidLength,
-    /// Derivation requires a chain code, but the key was created without one.
-    NoChainCode,
-    /// A hardened child cannot be derived from a public key.
-    HardenedFromPublic,
-    /// The public key is not a valid Ed25519 point.
-    InvalidPoint,
-    /// The master-key entropy was empty.
-    EmptyEntropy,
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Error::InvalidLength => "cardano: invalid key length",
-            Error::NoChainCode => "cardano: extended key has no chain code; cannot derive",
-            Error::HardenedFromPublic => {
-                "cardano: cannot derive a hardened child from a public key"
-            }
-            Error::InvalidPoint => "cardano: invalid parent public key point",
-            Error::EmptyEntropy => "cardano: empty entropy",
-        })
-    }
-}
-
-impl core::error::Error for Error {}
 
 /// The offset that marks a BIP32 derivation index as hardened. A hardened child
 /// can only be derived from a private key.

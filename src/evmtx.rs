@@ -1,6 +1,8 @@
 //! EVM transactions: legacy, EIP-2930, EIP-1559, EIP-4844. Build, sign,
 //! serialize, parse and recover sender. Port of `evmtx.go`.
 
+pub use crate::Error;
+
 use crate::prelude::*;
 
 use num_bigint::{BigInt, Sign};
@@ -13,54 +15,6 @@ use crate::evmabi::{AbiValue, evm_call};
 pub use crate::evmraw::EvmTxType;
 use crate::hash::keccak256_once;
 use crate::rlp::{self, RlpItem};
-
-/// Errors from EVM transaction operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// RLP encoding or decoding failed.
-    Rlp(rlp::Error),
-    /// ABI encoding failed.
-    Abi(crate::evmabi::Error),
-    /// The transaction type is not supported.
-    UnsupportedType,
-    /// The encoding is not a single RLP list.
-    InvalidEncoding,
-    /// The RLP list has the wrong number of fields for its type.
-    InvalidFieldCount,
-    /// The transaction is not signed.
-    NotSigned,
-    /// The signature's `v` value is invalid.
-    InvalidV,
-    /// A signature component is negative or longer than 32 bytes.
-    InvalidSignature,
-    /// Sender public-key recovery failed.
-    Recovery,
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::Rlp(e) => e.fmt(f),
-            Error::Abi(e) => e.fmt(f),
-            Error::UnsupportedType => f.write_str("unsupported EVM transaction type"),
-            Error::InvalidEncoding => f.write_str("invalid EVM transaction encoding"),
-            Error::InvalidFieldCount => f.write_str("wrong number of transaction fields"),
-            Error::NotSigned => f.write_str("transaction is not signed"),
-            Error::InvalidV => f.write_str("invalid signature v value"),
-            Error::InvalidSignature => f.write_str("invalid signature component"),
-            Error::Recovery => f.write_str("sender recovery failed"),
-        }
-    }
-}
-
-impl core::error::Error for Error {}
-
-impl From<crate::evmabi::Error> for Error {
-    fn from(e: crate::evmabi::Error) -> Self {
-        Error::Abi(e)
-    }
-}
 
 /// An EVM transaction.
 #[derive(Debug, Clone)]
@@ -114,13 +68,13 @@ impl Default for EvmTx {
 }
 
 fn to_item(to: &str) -> Result<RlpItem, Error> {
-    RlpItem::hex_str(to).map_err(Error::Rlp)
+    RlpItem::hex_str(to).map_err(Error::from)
 }
 
 impl EvmTx {
     /// Returns the RLP fields for the transaction (excluding signature fields).
     pub fn rlp_fields(&self) -> Result<Vec<RlpItem>, Error> {
-        let bi = |v: &BigInt| RlpItem::bigint(v).map_err(Error::Rlp);
+        let bi = |v: &BigInt| RlpItem::bigint(v).map_err(Error::from);
         Ok(match self.tx_type {
             EvmTxType::Legacy => vec![
                 RlpItem::uint(self.nonce),
@@ -151,7 +105,7 @@ impl EvmTx {
                 RlpItem::Bytes(self.data.clone()),
                 RlpItem::List(vec![]),
             ],
-            EvmTxType::Eip4844 => return Err(Error::UnsupportedType),
+            EvmTxType::Eip4844 => return Err(Error::UnsupportedTxType),
         })
     }
 
@@ -181,7 +135,7 @@ impl EvmTx {
         if !self.signed {
             return self.sign_bytes();
         }
-        let bi = |v: &BigInt| RlpItem::bigint(v).map_err(Error::Rlp);
+        let bi = |v: &BigInt| RlpItem::bigint(v).map_err(Error::from);
         let mut f = self.rlp_fields()?;
         f.push(bi(&self.y)?);
         f.push(bi(&self.r)?);
@@ -199,25 +153,25 @@ impl EvmTx {
     /// Parses a transaction from its binary encoding.
     pub fn parse_transaction(buf: &[u8]) -> Result<EvmTx, Error> {
         if buf.is_empty() {
-            return Err(Error::Rlp(rlp::Error::UnexpectedEof));
+            return Err(Error::UnexpectedEof);
         }
         let mut tx = EvmTx::default();
         if buf[0] >= 0x80 {
             // legacy
-            let dec = rlp::decode(buf).map_err(Error::Rlp)?;
+            let dec = rlp::decode(buf).map_err(Error::from)?;
             if dec.len() != 1 {
-                return Err(Error::InvalidEncoding);
+                return Err(Error::InvalidData);
             }
-            let list = dec[0].as_list().ok_or(Error::InvalidEncoding)?;
+            let list = dec[0].as_list().ok_or(Error::InvalidData)?;
             let ln = list.len();
             if ln != 6 && ln != 9 {
                 return Err(Error::InvalidFieldCount);
             }
             let b = |i: usize| -> &[u8] { list[i].as_bytes().unwrap_or(&[]) };
             tx.tx_type = EvmTxType::Legacy;
-            tx.nonce = rlp::decode_uint64_checked(b(0)).map_err(Error::Rlp)?;
+            tx.nonce = rlp::decode_uint64_checked(b(0)).map_err(Error::from)?;
             tx.gas_fee_cap = BigInt::from_bytes_be(Sign::Plus, b(1));
-            tx.gas = rlp::decode_uint64_checked(b(2)).map_err(Error::Rlp)?;
+            tx.gas = rlp::decode_uint64_checked(b(2)).map_err(Error::from)?;
             tx.to = format!("0x{}", hex::encode(b(3)));
             tx.value = BigInt::from_bytes_be(Sign::Plus, b(4));
             tx.data = b(5).to_vec();
@@ -240,11 +194,11 @@ impl EvmTx {
         let payload = &buf[1..];
         match buf[0] {
             1 | 2 => {
-                let dec = rlp::decode(payload).map_err(Error::Rlp)?;
+                let dec = rlp::decode(payload).map_err(Error::from)?;
                 if dec.len() != 1 {
-                    return Err(Error::InvalidEncoding);
+                    return Err(Error::InvalidData);
                 }
-                let list = dec[0].as_list().ok_or(Error::InvalidEncoding)?;
+                let list = dec[0].as_list().ok_or(Error::InvalidData)?;
                 let b = |i: usize| -> &[u8] { list[i].as_bytes().unwrap_or(&[]) };
                 if buf[0] == 1 {
                     let ln = list.len();
@@ -252,10 +206,10 @@ impl EvmTx {
                         return Err(Error::InvalidFieldCount);
                     }
                     tx.tx_type = EvmTxType::Eip2930;
-                    tx.chain_id = rlp::decode_uint64_checked(b(0)).map_err(Error::Rlp)?;
-                    tx.nonce = rlp::decode_uint64_checked(b(1)).map_err(Error::Rlp)?;
+                    tx.chain_id = rlp::decode_uint64_checked(b(0)).map_err(Error::from)?;
+                    tx.nonce = rlp::decode_uint64_checked(b(1)).map_err(Error::from)?;
                     tx.gas_fee_cap = BigInt::from_bytes_be(Sign::Plus, b(2));
-                    tx.gas = rlp::decode_uint64_checked(b(3)).map_err(Error::Rlp)?;
+                    tx.gas = rlp::decode_uint64_checked(b(3)).map_err(Error::from)?;
                     tx.to = format!("0x{}", hex::encode(b(4)));
                     tx.value = BigInt::from_bytes_be(Sign::Plus, b(5));
                     tx.data = b(6).to_vec();
@@ -271,11 +225,11 @@ impl EvmTx {
                         return Err(Error::InvalidFieldCount);
                     }
                     tx.tx_type = EvmTxType::Eip1559;
-                    tx.chain_id = rlp::decode_uint64_checked(b(0)).map_err(Error::Rlp)?;
-                    tx.nonce = rlp::decode_uint64_checked(b(1)).map_err(Error::Rlp)?;
+                    tx.chain_id = rlp::decode_uint64_checked(b(0)).map_err(Error::from)?;
+                    tx.nonce = rlp::decode_uint64_checked(b(1)).map_err(Error::from)?;
                     tx.gas_tip_cap = BigInt::from_bytes_be(Sign::Plus, b(2));
                     tx.gas_fee_cap = BigInt::from_bytes_be(Sign::Plus, b(3));
-                    tx.gas = rlp::decode_uint64_checked(b(4)).map_err(Error::Rlp)?;
+                    tx.gas = rlp::decode_uint64_checked(b(4)).map_err(Error::from)?;
                     tx.to = format!("0x{}", hex::encode(b(5)));
                     tx.value = BigInt::from_bytes_be(Sign::Plus, b(6));
                     tx.data = b(7).to_vec();
@@ -288,7 +242,7 @@ impl EvmTx {
                 }
                 Ok(tx)
             }
-            _ => Err(Error::UnsupportedType),
+            _ => Err(Error::UnsupportedTxType),
         }
     }
 

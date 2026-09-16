@@ -5,66 +5,9 @@ use alloc::collections::BTreeMap;
 
 use super::*;
 
-/// Errors from Solana transaction operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// The data ended unexpectedly.
-    UnexpectedEof,
-    /// More than 256 accounts are referenced.
-    TooManyAccounts,
-    /// A count exceeds its limit or the remaining data.
-    CountTooLarge,
-    /// The message header counts are inconsistent with the account keys.
-    InvalidHeader,
-    /// An instruction references an account index out of range.
-    IndexOutOfRange,
-    /// A signing key is not one of the transaction's required signers.
-    NotRequiredSigner,
-    /// Fewer signatures than required signers.
-    MissingSignatures,
-    /// The signature at this index is missing or not 64 bytes.
-    InvalidSignature(usize),
-    /// The signature at this index does not verify.
-    VerificationFailed(usize),
-    /// The transaction has no signature (and so no id).
-    NoSignature,
-    /// The message is not a versioned message.
-    NotVersioned,
-    /// The message or transaction version is not supported.
-    UnsupportedVersion(u8),
-    /// A compact-u16 is malformed.
-    CompactU16(CompactU16Error),
-    /// Program-derived address derivation failed.
-    Pda(PdaError),
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::UnexpectedEof => f.write_str("unexpected EOF"),
-            Error::TooManyAccounts => f.write_str("transaction references more than 256 accounts"),
-            Error::CountTooLarge => f.write_str("count exceeds its limit"),
-            Error::InvalidHeader => f.write_str("invalid message header"),
-            Error::IndexOutOfRange => f.write_str("account index out of range"),
-            Error::NotRequiredSigner => f.write_str("key is not a required signer"),
-            Error::MissingSignatures => f.write_str("missing signatures"),
-            Error::InvalidSignature(i) => write!(f, "signature {i} is missing or invalid"),
-            Error::VerificationFailed(i) => write!(f, "signature {i} verification failed"),
-            Error::NoSignature => f.write_str("transaction has no signature"),
-            Error::NotVersioned => f.write_str("not a versioned message"),
-            Error::UnsupportedVersion(v) => write!(f, "unsupported version {v}"),
-            Error::CompactU16(e) => e.fmt(f),
-            Error::Pda(e) => e.fmt(f),
-        }
-    }
-}
-
-impl core::error::Error for Error {}
-
 /// Decodes a compact-u16 length, advancing `pos`.
 fn read_len(data: &[u8], pos: &mut usize) -> Result<usize, Error> {
-    decode_compact_u16(data, pos).map_err(Error::CompactU16)
+    decode_compact_u16(data, pos).map_err(Error::from)
 }
 
 /// Encodes a value in Solana compact-u16 format.
@@ -184,7 +127,7 @@ pub fn create_ata_instruction(
     wallet: SolanaKey,
     mint: SolanaKey,
 ) -> Result<SolanaInstruction, Error> {
-    let ata = associated_token_address(wallet, mint).map_err(Error::Pda)?;
+    let ata = associated_token_address(wallet, mint)?;
     Ok(SolanaInstruction {
         program_id: ata_program(),
         accounts: vec![
@@ -395,7 +338,7 @@ fn compile_accounts(
     all.extend_from_slice(&nw);
     all.extend_from_slice(&nr);
     if all.len() > 256 {
-        return Err(Error::TooManyAccounts);
+        return Err(Error::TooLarge);
     }
 
     let mut index = BTreeMap::new();
@@ -521,13 +464,13 @@ impl SolanaTx {
         for i in 0..num_signers {
             let sig = &self.signatures[i];
             if sig.len() != 64 {
-                return Err(Error::InvalidSignature(i));
+                return Err(Error::InvalidSignature);
             }
             let pubkey = self.account_keys()[i];
             let mut s = [0u8; 64];
             s.copy_from_slice(sig);
             if !ed25519::verify(&pubkey.0, &msg, &s) {
-                return Err(Error::VerificationFailed(i));
+                return Err(Error::SignatureVerification(i));
             }
         }
         Ok(())
@@ -549,7 +492,7 @@ impl SolanaTx {
             if sig.is_empty() {
                 buf.extend(core::iter::repeat_n(0u8, 64));
             } else if sig.len() != 64 {
-                return Err(Error::InvalidSignature(0));
+                return Err(Error::InvalidSignature);
             } else {
                 buf.extend_from_slice(sig);
             }
@@ -563,7 +506,7 @@ impl SolanaTx {
         let mut pos = 0;
         let sig_count = read_len(data, &mut pos)?;
         if sig_count > 256 {
-            return Err(Error::CountTooLarge);
+            return Err(Error::TooLarge);
         }
         let mut signatures = Vec::with_capacity(sig_count);
         for _ in 0..sig_count {
@@ -674,7 +617,7 @@ fn read_message_common(
     *pos += 3;
     let key_count = read_len(data, pos)?;
     if key_count > 256 {
-        return Err(Error::CountTooLarge);
+        return Err(Error::TooLarge);
     }
     let mut account_keys = Vec::with_capacity(key_count);
     for _ in 0..key_count {
@@ -697,7 +640,7 @@ fn read_message_common(
     // Sanity cap: every instruction needs at least one byte (the program id
     // index), so the count cannot exceed the remaining bytes.
     if ix_count > data.len() - *pos {
-        return Err(Error::CountTooLarge);
+        return Err(Error::TooLarge);
     }
     let mut instructions = Vec::with_capacity(ix_count);
     for _ in 0..ix_count {
@@ -797,7 +740,7 @@ impl SolanaMessageV0 {
         // Sanity cap: every lookup needs at least one byte, so the count cannot
         // exceed the remaining bytes.
         if lookup_count > data.len() - pos {
-            return Err(Error::CountTooLarge);
+            return Err(Error::TooLarge);
         }
         let mut lookups = Vec::with_capacity(lookup_count);
         for _ in 0..lookup_count {

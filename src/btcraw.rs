@@ -12,39 +12,14 @@
 //! the Bitcoin Cash `ALL|FORKID` flag, which shares the BIP-143 preimage) and
 //! taproot `SIGHASH_DEFAULT`.
 
+pub use crate::Error;
+
 use purecrypto::hash::{Digest, Sha256};
 
 use crate::btcvarint::BtcVarInt;
 use crate::crypto::secp256k1::tagged_hash;
 use crate::hash::sha256_once;
 use crate::sink::{Counter, HashSink, Sink, SliceSink};
-
-/// Errors from [`RawTx`] operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// The input index is out of range.
-    InputIndex,
-    /// The previous outputs do not match the inputs one to one.
-    PrevOutCount,
-    /// The output buffer is too small.
-    BufferTooSmall,
-    /// The sighash type is not one this module computes.
-    UnsupportedSighash,
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Error::InputIndex => "input index out of range",
-            Error::PrevOutCount => "previous outputs must match the inputs one to one",
-            Error::BufferTooSmall => "transaction output buffer too small",
-            Error::UnsupportedSighash => "unsupported sighash type",
-        })
-    }
-}
-
-impl core::error::Error for Error {}
 
 /// A transaction input.
 #[derive(Debug, Clone, Copy, Default)]

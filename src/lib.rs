@@ -9,6 +9,15 @@
 //! This is a Rust port of the Go library `github.com/KarpelesLab/outscript`. All
 //! cryptography is provided by the `purecrypto` crate.
 //!
+//! # Errors
+//!
+//! Everything in the crate reports failures as [`Error`], which each module
+//! re-exports (`psbt::Error`, `btctx::Error` and `outscript::Error` are the
+//! same type), so `?` composes across modules. The self-contained codecs
+//! ([`base58`], [`base64`], [`bech32`], `cbor`, `rlp`,
+//! [`secp256k1`](crypto::secp256k1) and Solana's compact-u16) keep their own
+//! small error types, which convert into [`Error`].
+//!
 //! # Features
 //!
 //! - `std` (default): implies `alloc`, and adds `std::io` adapters
@@ -95,13 +104,19 @@ pub mod rlp;
 
 mod btcamount;
 mod btcvarint;
+mod error;
 mod sink;
 
 pub use address::{
     DecodedAddress, decode_bitcoin_based_address, decode_evm_address, eip55_to_slice,
     encode_address_to_slice, encode_base58_addr_to_slice,
 };
-pub use btcamount::{AmountError, BtcAmount};
+pub use btcamount::BtcAmount;
+pub use crypto::SignerError;
+pub use error::Error;
+
+/// A [`Result`](core::result::Result) with this crate's [`Error`].
+pub type Result<T> = core::result::Result<T, Error>;
 pub use btcguess::{ScriptGuess, guess_in_script, guess_out_script};
 pub use btcvarint::BtcVarInt;
 pub use cardano::decode_cardano_address;

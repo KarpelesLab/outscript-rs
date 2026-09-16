@@ -2,9 +2,10 @@
 //! `alloc`) instructions and transactions (legacy + v0). Port of
 //! `solanatx.go`, `solana_instructions.go`, `solana_pda.go`.
 
+pub use crate::Error;
+
 use purecrypto::hash::{Digest, Sha256};
 
-use crate::address::Error as AddressError;
 use crate::base58;
 use crate::crypto::ed25519;
 #[cfg(feature = "alloc")]
@@ -21,7 +22,7 @@ pub struct SolanaKey(pub [u8; 32]);
 
 impl SolanaKey {
     /// Parses a base58-encoded key (must decode to 32 bytes).
-    pub fn parse(s: &str) -> Result<SolanaKey, AddressError> {
+    pub fn parse(s: &str) -> Result<SolanaKey, Error> {
         crate::solana_addr::decode_solana_key(s).map(SolanaKey)
     }
     /// Writes the base58 encoding into `out` (44 bytes always suffice),
@@ -170,46 +171,16 @@ pub fn decode_compact_u16(data: &[u8], pos: &mut usize) -> Result<usize, Compact
 
 // --- PDA ---
 
-/// Errors from program-derived address derivation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PdaError {
-    /// More than 16 seeds were given.
-    TooManySeeds,
-    /// A seed is longer than 32 bytes.
-    SeedTooLong,
-    /// The derived address lies on the Ed25519 curve.
-    OnCurve,
-    /// No bump seed produced a valid address.
-    NotFound,
-}
-
-impl core::fmt::Display for PdaError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            PdaError::TooManySeeds => "too many seeds: maximum 16",
-            PdaError::SeedTooLong => "seed too long: maximum 32 bytes",
-            PdaError::OnCurve => "derived address is on the Ed25519 curve",
-            PdaError::NotFound => "could not find valid program address",
-        })
-    }
-}
-
-impl core::error::Error for PdaError {}
-
 /// Derives a program address from seeds and a program id; errors if the result
 /// lies on the Ed25519 curve.
-pub fn create_program_address(
-    seeds: &[&[u8]],
-    program_id: SolanaKey,
-) -> Result<SolanaKey, PdaError> {
+pub fn create_program_address(seeds: &[&[u8]], program_id: SolanaKey) -> Result<SolanaKey, Error> {
     if seeds.len() > 16 {
-        return Err(PdaError::TooManySeeds);
+        return Err(Error::TooManySeeds);
     }
     let mut h = Sha256::new();
     for &seed in seeds {
         if seed.len() > 32 {
-            return Err(PdaError::SeedTooLong);
+            return Err(Error::SeedTooLong);
         }
         h.update(seed);
     }
@@ -218,7 +189,7 @@ pub fn create_program_address(
     let hash = h.finalize();
 
     if ed25519::is_on_curve(&hash) {
-        return Err(PdaError::OnCurve);
+        return Err(Error::AddressOnCurve);
     }
     Ok(SolanaKey(hash))
 }
@@ -227,10 +198,10 @@ pub fn create_program_address(
 pub fn find_program_address(
     seeds: &[&[u8]],
     program_id: SolanaKey,
-) -> Result<(SolanaKey, u8), PdaError> {
+) -> Result<(SolanaKey, u8), Error> {
     if seeds.len() > 15 {
         // the bump seed takes the 16th slot
-        return Err(PdaError::TooManySeeds);
+        return Err(Error::TooManySeeds);
     }
     for bump in (0..=255u8).rev() {
         // Append the trailing bump byte to the caller's seeds for this attempt.
@@ -240,15 +211,15 @@ pub fn find_program_address(
         all[seeds.len()] = &bump_seed;
         match create_program_address(&all[..=seeds.len()], program_id) {
             Ok(addr) => return Ok((addr, bump)),
-            Err(PdaError::OnCurve) => continue,
+            Err(Error::AddressOnCurve) => continue,
             Err(e) => return Err(e),
         }
     }
-    Err(PdaError::NotFound)
+    Err(Error::PdaNotFound)
 }
 
 /// Derives the Associated Token Account address for a wallet and mint.
-pub fn associated_token_address(wallet: SolanaKey, mint: SolanaKey) -> Result<SolanaKey, PdaError> {
+pub fn associated_token_address(wallet: SolanaKey, mint: SolanaKey) -> Result<SolanaKey, Error> {
     let (addr, _) = find_program_address(
         &[&wallet.0[..], &token_program().0[..], &mint.0[..]],
         ata_program(),
@@ -293,11 +264,11 @@ mod tests {
         let seeds: [&[u8]; 16] = [b"x"; 16];
         assert_eq!(
             find_program_address(&seeds, system_program()),
-            Err(PdaError::TooManySeeds)
+            Err(Error::TooManySeeds)
         );
         assert_eq!(
             find_program_address(&[&[0u8; 33]], system_program()),
-            Err(PdaError::SeedTooLong)
+            Err(Error::SeedTooLong)
         );
         let (addr, bump) = find_program_address(&seeds[..15], system_program()).unwrap();
         let mut with_bump: [&[u8]; 16] = seeds;

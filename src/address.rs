@@ -1,6 +1,8 @@
 //! Address parsing and encoding across Bitcoin-family, EVM, Massa and Solana
 //! networks (port of `address.go`, `eip55.go`).
 
+pub use crate::Error;
+
 use purecrypto::hash::{Digest, Sha256};
 
 use crate::base58;
@@ -13,77 +15,6 @@ use crate::script::ScriptBytes;
 use crate::out::Out;
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
-
-/// Errors from heap-free address encoding and decoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// The script format has no address form.
-    UnsupportedFormat,
-    /// The network is not supported for this format.
-    UnsupportedNetwork,
-    /// The script bytes do not match their format.
-    InvalidScript,
-    /// A key hash or payload has the wrong length.
-    InvalidLength,
-    /// The output buffer is too small.
-    BufferTooSmall,
-    /// A bech32/CashAddr encoding error.
-    Bech32(bech32::Error),
-    /// The string is not a recognized address encoding.
-    InvalidAddress,
-    /// The address checksum does not verify.
-    BadChecksum,
-    /// The address belongs to a different network than the one requested.
-    NetworkMismatch,
-    /// The base58 version byte, witness version or address type is not
-    /// supported.
-    UnsupportedVersion(u8),
-    /// The output script could not be generated.
-    Script(crate::script::Error),
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::UnsupportedFormat => f.write_str("format has no address form"),
-            Error::UnsupportedNetwork => f.write_str("unsupported network for this address"),
-            Error::InvalidScript => f.write_str("invalid script for address type"),
-            Error::InvalidLength => f.write_str("invalid address payload length"),
-            Error::BufferTooSmall => f.write_str("address output buffer too small"),
-            Error::Bech32(e) => e.fmt(f),
-            Error::InvalidAddress => f.write_str("unsupported or malformed address"),
-            Error::BadChecksum => f.write_str("bad address checksum"),
-            Error::NetworkMismatch => f.write_str("address is for a different network"),
-            Error::UnsupportedVersion(v) => write!(f, "unsupported address version {v:#x}"),
-            Error::Script(e) => e.fmt(f),
-        }
-    }
-}
-
-impl core::error::Error for Error {}
-
-impl From<bech32::Error> for Error {
-    fn from(e: bech32::Error) -> Self {
-        match e {
-            bech32::Error::BufferTooSmall => Error::BufferTooSmall,
-            e => Error::Bech32(e),
-        }
-    }
-}
-
-impl From<crate::script::Error> for Error {
-    fn from(e: crate::script::Error) -> Self {
-        Error::Script(e)
-    }
-}
-
-impl From<base58::Error> for Error {
-    fn from(_: base58::Error) -> Self {
-        // encoding only fails for lack of space
-        Error::BufferTooSmall
-    }
-}
 
 /// An upper bound on the length of any address [`encode_address_to_slice`]
 /// produces for a built-in format.
@@ -420,7 +351,7 @@ pub fn decode_bitcoin_based_address(network: &str, address: &str) -> Result<Deco
                     flags,
                 )),
                 (0, _) => Err(Error::InvalidLength),
-                (v, _) => Err(Error::UnsupportedVersion(v)),
+                (v, _) => Err(Error::UnsupportedAddressVersion(v)),
             };
         }
     }
@@ -461,7 +392,7 @@ fn decode_cashaddr(address: &str) -> Result<DecodedAddress, Error> {
     match typ {
         0 => Ok(p2pkh(&hash[..20], &["bitcoin-cash"])),
         1 => Ok(p2sh(&hash[..20], &["bitcoin-cash"])),
-        n => Err(Error::UnsupportedVersion(n)),
+        n => Err(Error::UnsupportedAddressVersion(n)),
     }
 }
 
@@ -486,7 +417,7 @@ fn decode_base58_versioned(
             0x6f => Ok(p2pkh(hash, &["bitcoin-testnet"])),
             0x89 => Ok(p2sh(hash, &["electraproto"])),
             0xc4 => Ok(p2sh(hash, &["bitcoin-testnet"])),
-            v => Err(Error::UnsupportedVersion(v)),
+            v => Err(Error::UnsupportedAddressVersion(v)),
         };
     }
     // bitcoin-cash legacy addresses share bitcoin's versions
@@ -500,7 +431,7 @@ fn decode_base58_versioned(
     match version {
         v if v == pkh => Ok(p2pkh(hash, flags)),
         v if v == sh => Ok(p2sh(hash, flags)),
-        v => Err(Error::UnsupportedVersion(v)),
+        v => Err(Error::UnsupportedAddressVersion(v)),
     }
 }
 

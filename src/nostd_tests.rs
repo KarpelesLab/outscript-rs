@@ -112,7 +112,7 @@ fn bitcoin_decode_details() {
     assert_eq!(d.networks, &["bitcoin", "bitcoin-cash"]);
     assert_eq!(
         decode_bitcoin_based_address("litecoin", genesis),
-        Err(Error::UnsupportedVersion(0))
+        Err(Error::UnsupportedAddressVersion(0))
     );
     assert_eq!(
         decode_bitcoin_based_address("litecoin", tr),

@@ -4,6 +4,8 @@
 //! [`uint_word`], [`erc20_transfer_calldata`]) never allocate; the dynamic
 //! `AbiBuffer` encoder needs `alloc`.
 
+pub use crate::Error;
+
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
 
@@ -13,39 +15,6 @@ use num_bigint::{BigInt, Sign};
 use crate::hash::keccak256_once;
 #[cfg(feature = "alloc")]
 use crate::out::Out;
-
-/// Errors from ABI encoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// The ABI signature is not of the form `name(type,...)`.
-    InvalidSignature,
-    /// The number of values does not match the number of types.
-    ArgumentCount,
-    /// An ABI type is not supported.
-    UnsupportedType,
-    /// A value's kind does not fit its ABI type.
-    ValueMismatch,
-    /// An address is not 20 bytes (or not valid hex).
-    InvalidAddress,
-    /// An integer does not fit in 256 bits.
-    IntegerOverflow,
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Error::InvalidSignature => "invalid ABI signature",
-            Error::ArgumentCount => "wrong number of ABI arguments",
-            Error::UnsupportedType => "unsupported ABI type",
-            Error::ValueMismatch => "value does not fit its ABI type",
-            Error::InvalidAddress => "invalid EVM address",
-            Error::IntegerOverflow => "integer exceeds 256 bits",
-        })
-    }
-}
-
-impl core::error::Error for Error {}
 
 /// Returns the 4-byte function selector for a signature such as
 /// `"transfer(address,uint256)"`: the first 4 bytes of its keccak-256 hash.
@@ -145,7 +114,7 @@ impl AbiBuffer {
                     if o.name == "evm" || o.name == "eth" {
                         self.append_big_int(&BigInt::from_bytes_be(Sign::Plus, o.bytes()))?;
                     } else {
-                        return Err(Error::ValueMismatch);
+                        return Err(Error::AbiValueMismatch);
                     }
                 }
             }
@@ -156,9 +125,9 @@ impl AbiBuffer {
     /// Encodes parameters according to an ABI signature like
     /// "transfer(address,uint256)".
     pub fn encode_abi(&mut self, abi: &str, params: &[AbiValue]) -> Result<(), Error> {
-        let pos = abi.find('(').ok_or(Error::InvalidSignature)?;
+        let pos = abi.find('(').ok_or(Error::InvalidAbiSignature)?;
         if !abi.ends_with(')') {
-            return Err(Error::InvalidSignature);
+            return Err(Error::InvalidAbiSignature);
         }
         let inner = &abi[pos + 1..abi.len() - 1];
         let types: Vec<&str> = if inner.is_empty() {
@@ -172,7 +141,7 @@ impl AbiBuffer {
     /// Encodes parameters according to explicit ABI type strings.
     pub fn encode_types(&mut self, types: &[&str], params: &[AbiValue]) -> Result<(), Error> {
         if types.len() != params.len() {
-            return Err(Error::ArgumentCount);
+            return Err(Error::AbiArgumentCount);
         }
         for (t, p) in types.iter().zip(params.iter()) {
             match *t {
@@ -180,7 +149,7 @@ impl AbiBuffer {
                 | "bytes32" => self.append_uint256_any(p)?,
                 "address" => self.append_address_any(p)?,
                 "bytes" | "string" => self.append_buffer_any(p)?,
-                _ => return Err(Error::UnsupportedType),
+                _ => return Err(Error::UnsupportedAbiType),
             }
         }
         Ok(())
@@ -192,7 +161,7 @@ impl AbiBuffer {
             AbiValue::Int(o) => self.append_big_int(&BigInt::from(*o)),
             AbiValue::Uint64(o) => self.append_big_int(&BigInt::from(*o)),
             AbiValue::Uint(o) => self.append_big_int(o),
-            _ => Err(Error::ValueMismatch),
+            _ => Err(Error::AbiValueMismatch),
         }
     }
 
@@ -209,7 +178,7 @@ impl AbiBuffer {
         match v {
             AbiValue::Out(o) => {
                 if o.name != "evm" && o.name != "eth" {
-                    return Err(Error::ValueMismatch);
+                    return Err(Error::AbiValueMismatch);
                 }
                 self.append_address_bytes(o.bytes())
             }
@@ -219,7 +188,7 @@ impl AbiBuffer {
                 let addr = hex::decode(s).map_err(|_| Error::InvalidAddress)?;
                 self.append_address_bytes(&addr)
             }
-            _ => Err(Error::ValueMismatch),
+            _ => Err(Error::AbiValueMismatch),
         }
     }
 
@@ -233,7 +202,7 @@ impl AbiBuffer {
                 self.append_bytes(s.as_bytes());
                 Ok(())
             }
-            _ => Err(Error::ValueMismatch),
+            _ => Err(Error::AbiValueMismatch),
         }
     }
 
@@ -247,14 +216,14 @@ impl AbiBuffer {
             // an all-ones 32-byte word.
             owned = &bound + v;
             if owned.sign() != Sign::Plus {
-                return Err(Error::IntegerOverflow);
+                return Err(Error::Overflow);
             }
             &owned
         } else {
             v
         };
         if *val >= bound {
-            return Err(Error::IntegerOverflow);
+            return Err(Error::Overflow);
         }
         let mut inbuf = [0u8; 32];
         let (_, bytes) = val.to_bytes_be();
