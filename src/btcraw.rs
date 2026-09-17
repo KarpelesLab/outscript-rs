@@ -8,9 +8,10 @@
 //! [`SecpPrivateKey::sign_taproot`](crate::crypto::secp256k1::SecpPrivateKey::sign_taproot)),
 //! place the result in that input's `script_sig`/`witness`, then serialize.
 //!
-//! Only whole-transaction commitments are supported: `SIGHASH_ALL` (including
-//! the Bitcoin Cash `ALL|FORKID` flag, which shares the BIP-143 preimage) and
-//! taproot `SIGHASH_DEFAULT`.
+//! Legacy and segwit v0 sighashes support whole-transaction commitments only:
+//! `SIGHASH_ALL` (including the Bitcoin Cash `ALL|FORKID` flag, which shares
+//! the BIP-143 preimage). Taproot supports every BIP-341 hash type, the annex
+//! and script-path spends through [`RawTx::taproot_sighash`].
 
 pub use crate::Error;
 
@@ -322,6 +323,26 @@ impl<'a> RawTx<'a> {
             .sighash(input, script_code, amount, sighash_type))
     }
 
+    /// The BIP-341 signature hash of input `index` for any hash type, key or
+    /// script path, with or without an annex (see [`TapSighash`]).
+    ///
+    /// `midstate` comes from [`taproot_midstate`](Self::taproot_midstate) over
+    /// the same `prevouts` (the outputs the inputs spend, in order); computing
+    /// it once serves every input.
+    pub fn taproot_sighash(
+        &self,
+        midstate: &TaprootMidstate,
+        prevouts: &[PrevOut<'_>],
+        index: usize,
+        opts: &TapSighash<'_>,
+    ) -> Result<[u8; 32], Error> {
+        if prevouts.len() != self.inputs.len() {
+            return Err(Error::PrevOutCount);
+        }
+        let prevout = *prevouts.get(index).ok_or(Error::InputIndex)?;
+        taproot_sighash_of(self, midstate, index, prevout, opts)
+    }
+
     /// Precomputes the BIP-341 hashes shared by every input's taproot sighash.
     /// `prevouts` are the outputs spent by each input, in order.
     pub fn taproot_midstate(&self, prevouts: &[PrevOut<'_>]) -> Result<TaprootMidstate, Error> {
@@ -440,6 +461,164 @@ impl TaprootMidstate {
             ],
         ))
     }
+}
+
+/// The script-path extension of a taproot sighash (BIP-342): which leaf is
+/// being executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TapScriptPath {
+    /// The `TapLeaf` hash of the executed script (see
+    /// [`tapleaf_hash`](crate::taproot::tapleaf_hash)).
+    pub leaf_hash: [u8; 32],
+    /// Position of the last executed `OP_CODESEPARATOR`, or `0xffff_ffff` if
+    /// none was executed.
+    pub codesep_pos: u32,
+}
+
+impl TapScriptPath {
+    /// A script-path spend of the leaf with this hash, with no
+    /// `OP_CODESEPARATOR` executed.
+    pub const fn new(leaf_hash: [u8; 32]) -> Self {
+        TapScriptPath {
+            leaf_hash,
+            codesep_pos: 0xffff_ffff,
+        }
+    }
+
+    /// Sets the position of the last executed `OP_CODESEPARATOR`.
+    #[must_use]
+    pub const fn with_codesep_pos(mut self, pos: u32) -> Self {
+        self.codesep_pos = pos;
+        self
+    }
+}
+
+/// What a BIP-341 signature commits to: the hash type, an optional annex, and
+/// for a script-path spend the executed leaf.
+///
+/// The default is a key-path `SIGHASH_DEFAULT` signature with no annex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct TapSighash<'a> {
+    /// `SIGHASH_DEFAULT` (0x00), `ALL` (0x01), `NONE` (0x02) or `SINGLE`
+    /// (0x03), the last three optionally with `ANYONECANPAY` (0x80). Any
+    /// non-default type is appended to the signature as a 65th byte.
+    pub hash_type: u8,
+    /// The annex (the last witness item when it starts with 0x50), if any.
+    pub annex: Option<&'a [u8]>,
+    /// The executed leaf, for a script-path spend.
+    pub script_path: Option<TapScriptPath>,
+}
+
+impl<'a> TapSighash<'a> {
+    /// A key-path signature hash of the given type.
+    pub const fn new(hash_type: u8) -> Self {
+        TapSighash {
+            hash_type,
+            annex: None,
+            script_path: None,
+        }
+    }
+
+    /// Commits to the annex (which must start with 0x50).
+    #[must_use]
+    pub const fn with_annex(mut self, annex: &'a [u8]) -> Self {
+        self.annex = Some(annex);
+        self
+    }
+
+    /// Makes this a script-path signature hash for the given leaf.
+    #[must_use]
+    pub const fn with_script_path(mut self, leaf: TapScriptPath) -> Self {
+        self.script_path = Some(leaf);
+        self
+    }
+}
+
+/// The BIP-341 signature hash of input `index` of `tx`, whose spent output is
+/// `prevout` (see [`RawTx::taproot_sighash`]).
+pub(crate) fn taproot_sighash_of<T: TxSource + ?Sized>(
+    tx: &T,
+    mid: &TaprootMidstate,
+    index: usize,
+    prevout: PrevOut<'_>,
+    opts: &TapSighash<'_>,
+) -> Result<[u8; 32], Error> {
+    let hash_type = opts.hash_type;
+    if !matches!(hash_type, 0x00..=0x03 | 0x81..=0x83) {
+        return Err(Error::UnsupportedSighash);
+    }
+    let index32 = mid.check(index)?;
+    let anyone_can_pay = hash_type & 0x80 != 0;
+    let (none, single) = (hash_type & 3 == 2, hash_type & 3 == 3);
+    if let Some(annex) = opts.annex
+        && annex.first() != Some(&0x50)
+    {
+        return Err(Error::InvalidData);
+    }
+
+    // SIGHASH_SINGLE commits to the output at the input's own index
+    let mut sha_single_output = None;
+    if single {
+        let mut i = 0;
+        tx.for_each_output(&mut |o| {
+            if i == index {
+                sha_single_output = Some(sha256_with(|s| put_output(s, o)));
+            }
+            i += 1;
+        });
+        if sha_single_output.is_none() {
+            return Err(Error::OutputIndex);
+        }
+    }
+
+    let tag = sha256_once(b"TapSighash");
+    let mut h = HashSink(Sha256::new());
+    h.put(&tag);
+    h.put(&tag);
+    h.put(&[0x00, hash_type]); // epoch, hash_type
+    h.put(&mid.version.to_le_bytes());
+    h.put(&mid.locktime.to_le_bytes());
+    if !anyone_can_pay {
+        h.put(&mid.sha_prevouts);
+        h.put(&mid.sha_amounts);
+        h.put(&mid.sha_scriptpubkeys);
+        h.put(&mid.sha_sequences);
+    }
+    if !none && !single {
+        h.put(&mid.sha_outputs);
+    }
+    let spend_type = 2 * opts.script_path.is_some() as u8 + opts.annex.is_some() as u8;
+    h.put(&[spend_type]);
+    if anyone_can_pay {
+        let mut i = 0;
+        tx.for_each_input(&mut |input| {
+            if i == index {
+                put_outpoint(&mut h, input);
+                put_output(&mut h, &prevout); // amount, then scriptPubKey
+                h.put(&input.sequence.to_le_bytes());
+            }
+            i += 1;
+        });
+    } else {
+        h.put(&index32.to_le_bytes());
+    }
+    if let Some(annex) = opts.annex {
+        h.put(&sha256_with(|s| {
+            put_varint(s, annex.len());
+            s.put(annex);
+        }));
+    }
+    if let Some(sha) = sha_single_output {
+        h.put(&sha);
+    }
+    if let Some(leaf) = opts.script_path {
+        h.put(&leaf.leaf_hash);
+        h.put(&[0x00]); // key_version
+        h.put(&leaf.codesep_pos.to_le_bytes());
+    }
+    Ok(h.0.finalize())
 }
 
 #[cfg(test)]

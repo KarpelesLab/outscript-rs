@@ -793,3 +793,161 @@ fn psbt_taproot_sighash_all() {
         Some(crate::psbt::Error::UnsupportedSighash)
     );
 }
+
+/// The BIP-341 wallet test vectors for key-path spending: every hash type
+/// (`DEFAULT`, `ALL`, `NONE`, `SINGLE` and their `ANYONECANPAY` forms), with
+/// and without a script tree. Checks the sighash and the final signature.
+#[test]
+fn bip341_key_path_spending_vectors() {
+    use crate::Error;
+    use crate::btcraw::{PrevOut, TapScriptPath, TapSighash};
+
+    let json: serde_json::Value =
+        serde_json::from_str(include_str!("../testdata/bip341_wallet_vectors.json")).unwrap();
+    let v = &json["keyPathSpending"][0];
+    let tx =
+        BtcTx::from_bytes(&hex::decode(v["given"]["rawUnsignedTx"].as_str().unwrap()).unwrap())
+            .unwrap();
+    let scripts: Vec<Vec<u8>> = v["given"]["utxosSpent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| hex::decode(u["scriptPubKey"].as_str().unwrap()).unwrap())
+        .collect();
+    let prevouts: Vec<PrevOut<'_>> = v["given"]["utxosSpent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(&scripts)
+        .map(|(u, script)| PrevOut {
+            amount: u["amountSats"].as_u64().unwrap(),
+            script,
+        })
+        .collect();
+
+    let arr32 = |v: &serde_json::Value| -> [u8; 32] {
+        let mut a = [0u8; 32];
+        hex::decode_to_slice(v.as_str().unwrap(), &mut a).unwrap();
+        a
+    };
+    let mut seen = Vec::new();
+    tx.with_raw(|raw| {
+        let mid = raw.taproot_midstate(&prevouts).unwrap();
+        for spend in v["inputSpending"].as_array().unwrap() {
+            let index = spend["given"]["txinIndex"].as_u64().unwrap() as usize;
+            let hash_type = spend["given"]["hashType"].as_u64().unwrap() as u8;
+            seen.push(hash_type);
+            let sighash = raw
+                .taproot_sighash(&mid, &prevouts, index, &TapSighash::new(hash_type))
+                .unwrap();
+            assert_eq!(
+                sighash,
+                arr32(&spend["intermediary"]["sigHash"]),
+                "input {index}"
+            );
+            // the midstate-only shortcut agrees where it applies
+            if hash_type <= 1 {
+                assert_eq!(
+                    mid.key_spend_sighash_with_type(index, hash_type).unwrap(),
+                    sighash
+                );
+            }
+
+            let key =
+                SecpPrivateKey::from_bytes(&arr32(&spend["given"]["internalPrivkey"])).unwrap();
+            assert_eq!(
+                key.xonly_public_key(),
+                arr32(&spend["intermediary"]["internalPubkey"])
+            );
+            let root = (!spend["given"]["merkleRoot"].is_null())
+                .then(|| arr32(&spend["given"]["merkleRoot"]));
+            let mut sig = key
+                .sign_taproot_with_root(&sighash, root.as_ref())
+                .unwrap()
+                .to_vec();
+            if hash_type != 0 {
+                sig.push(hash_type);
+            }
+            assert_eq!(
+                hex::encode(&sig),
+                spend["expected"]["witness"][0].as_str().unwrap(),
+                "input {index}"
+            );
+            // and it verifies under the tweaked output key
+            let (output_key, _) =
+                crate::taproot::taproot_tweak_with_root(&key.xonly_public_key(), root.as_ref())
+                    .unwrap();
+            assert_eq!(&prevouts[index].script[2..], &output_key);
+            assert!(bip340_verify(
+                &output_key,
+                &sighash,
+                sig[..64].try_into().unwrap()
+            ));
+        }
+
+        // script path and annex change the digest; the legacy helper matches
+        // the general one for a plain script-path spend
+        let leaf_script = [0x51u8];
+        let leaf = TapScriptPath::new(crate::taproot::tapleaf_hash(0xc0, &leaf_script));
+        let key_path = raw
+            .taproot_sighash(&mid, &prevouts, 0, &TapSighash::new(0))
+            .unwrap();
+        let script_path = raw
+            .taproot_sighash(
+                &mid,
+                &prevouts,
+                0,
+                &TapSighash::new(0).with_script_path(leaf),
+            )
+            .unwrap();
+        assert_ne!(key_path, script_path);
+        assert_eq!(
+            script_path,
+            mid.script_path_sighash(0, &leaf_script).unwrap()
+        );
+        let with_codesep = TapSighash::new(0).with_script_path(leaf.with_codesep_pos(3));
+        assert_ne!(
+            raw.taproot_sighash(&mid, &prevouts, 0, &with_codesep)
+                .unwrap(),
+            script_path
+        );
+        let annex = [0x50u8, 1, 2];
+        assert_ne!(
+            raw.taproot_sighash(&mid, &prevouts, 0, &TapSighash::new(0).with_annex(&annex))
+                .unwrap(),
+            key_path
+        );
+
+        // rejections
+        let err = |index, opts: TapSighash<'_>| raw.taproot_sighash(&mid, &prevouts, index, &opts);
+        assert_eq!(
+            err(0, TapSighash::new(0x04)),
+            Err(Error::UnsupportedSighash)
+        );
+        assert_eq!(
+            err(0, TapSighash::new(0x80)),
+            Err(Error::UnsupportedSighash)
+        );
+        assert_eq!(
+            err(0, TapSighash::new(0x84)),
+            Err(Error::UnsupportedSighash)
+        );
+        assert_eq!(err(99, TapSighash::new(0)), Err(Error::InputIndex));
+        assert_eq!(
+            err(0, TapSighash::new(0).with_annex(&[0x51])),
+            Err(Error::InvalidData)
+        );
+        // SIGHASH_SINGLE needs an output at the input's index (9 inputs, fewer outputs)
+        assert!(raw.outputs.len() < raw.inputs.len());
+        assert_eq!(
+            err(raw.outputs.len(), TapSighash::new(0x03)),
+            Err(Error::OutputIndex)
+        );
+        assert_eq!(
+            raw.taproot_sighash(&mid, &prevouts[..1], 0, &TapSighash::new(0)),
+            Err(Error::PrevOutCount)
+        );
+    });
+    seen.sort_unstable();
+    assert_eq!(seen, [0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83]);
+}

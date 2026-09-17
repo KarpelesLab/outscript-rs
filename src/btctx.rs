@@ -319,7 +319,7 @@ impl BtcTx {
 
     /// Runs `f` on a borrowed [`RawTx`] view of this transaction. Scripts and
     /// witnesses are left empty: the view only serves sighash computation.
-    fn with_raw<R>(&self, f: impl FnOnce(&RawTx<'_>) -> R) -> R {
+    pub(crate) fn with_raw<R>(&self, f: impl FnOnce(&RawTx<'_>) -> R) -> R {
         let inputs: Vec<RawTxIn<'_>> = self.inputs.iter().map(BtcTxInput::raw).collect();
         let outputs: Vec<RawTxOut<'_>> = self
             .outputs
