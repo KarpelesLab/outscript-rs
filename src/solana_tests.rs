@@ -226,11 +226,9 @@ fn v1_byte_layout_matches_reference() {
     assert_eq!(minimal.to_bytes().unwrap(), expected);
 
     let with_config = SolanaMessageV1 {
-        config: SolanaTxConfig {
-            priority_fee: Some(0x0102030405060708),
-            compute_unit_limit: Some(0x11223344),
-            ..Default::default()
-        },
+        config: SolanaTxConfig::new()
+            .with_priority_fee(0x0102030405060708)
+            .with_compute_unit_limit(0x11223344),
         recent_blockhash: key(0xBB),
         instructions: vec![SolanaCompiledInstruction {
             program_id_index: 1,
@@ -265,12 +263,11 @@ fn v1_transfer_sign_verify_roundtrip() {
     let from = SolanaKey(public_from_seed(&s));
     let to = SolanaKey::parse("83astBRguLMdt2h5U1Tpdq5tjFoJ6noeGwaY3mDLVcri").unwrap();
     let blockhash = SolanaKey::parse("EETubP5AKHgjPAhzPkA6E6HPBj7HtchdMWv2SzTqiYsC").unwrap();
-    let config = SolanaTxConfig {
-        priority_fee: Some(5_000),
-        compute_unit_limit: Some(20_000),
-        loaded_accounts_data_size_limit: Some(65_536),
-        heap_size: Some(65_536),
-    };
+    let config = SolanaTxConfig::new()
+        .with_priority_fee(5_000)
+        .with_compute_unit_limit(20_000)
+        .with_loaded_accounts_data_size_limit(65_536)
+        .with_heap_size(65_536);
     let ix = transfer_instruction(from, to, 1_000_000);
     let mut tx = new_solana_tx_v1(from, blockhash, config, &[ix]).unwrap();
     let msg = tx.message_v1.clone().unwrap();

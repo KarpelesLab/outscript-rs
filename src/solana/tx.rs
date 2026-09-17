@@ -276,7 +276,11 @@ const V1_FIXED_HEADER_LEN: usize = 1 + 3 + 4 + 32 + 1 + 1;
 ///
 /// An unset field requests the minimum: no priority fee, a compute-unit limit
 /// of 0, a loaded-accounts data size limit of 0 and a 32 KiB heap.
+///
+/// Non-exhaustive: the mask reserves bits for future requests, so build it
+/// from [`SolanaTxConfig::default`] and the `with_*` setters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct SolanaTxConfig {
     /// Total priority fee for the transaction, in lamports (not per compute
     /// unit).
@@ -290,6 +294,45 @@ pub struct SolanaTxConfig {
 }
 
 impl SolanaTxConfig {
+    /// A config with nothing requested (every field unset).
+    pub const fn new() -> Self {
+        SolanaTxConfig {
+            priority_fee: None,
+            compute_unit_limit: None,
+            loaded_accounts_data_size_limit: None,
+            heap_size: None,
+        }
+    }
+
+    /// Sets the total priority fee, in lamports.
+    #[must_use]
+    pub const fn with_priority_fee(mut self, lamports: u64) -> Self {
+        self.priority_fee = Some(lamports);
+        self
+    }
+
+    /// Sets the compute-unit limit.
+    #[must_use]
+    pub const fn with_compute_unit_limit(mut self, units: u32) -> Self {
+        self.compute_unit_limit = Some(units);
+        self
+    }
+
+    /// Sets the loaded-accounts data size limit, in bytes.
+    #[must_use]
+    pub const fn with_loaded_accounts_data_size_limit(mut self, bytes: u32) -> Self {
+        self.loaded_accounts_data_size_limit = Some(bytes);
+        self
+    }
+
+    /// Sets the heap size in bytes (a multiple of 1024 between 32 KiB and
+    /// 256 KiB; checked when the message is built or serialized).
+    #[must_use]
+    pub const fn with_heap_size(mut self, bytes: u32) -> Self {
+        self.heap_size = Some(bytes);
+        self
+    }
+
     /// The `TransactionConfigMask` for the fields that are set.
     pub fn mask(&self) -> u32 {
         let mut mask = 0;
@@ -388,7 +431,11 @@ pub struct SolanaMessageV1 {
 
 /// A Solana transaction: legacy, v0 or v1. `message_v1` takes precedence over
 /// `message_v0`, which takes precedence over the legacy `message`.
+///
+/// Non-exhaustive: construct one with [`new_solana_tx`], [`new_solana_tx_v0`],
+/// [`new_solana_tx_v1`] or [`SolanaTx::from_bytes`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct SolanaTx {
     /// Signatures (64 bytes each; empty = unsigned slot).
     pub signatures: Vec<Vec<u8>>,
