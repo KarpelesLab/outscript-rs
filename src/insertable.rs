@@ -3,7 +3,9 @@
 
 use crate::prelude::*;
 
-use crate::hash::{HashFn, hash_chain, ripemd160_vec, sha256_vec};
+use crate::hash::{HashFn, hash_chain};
+#[cfg(feature = "bitcoin")]
+use crate::hash::{ripemd160_vec, sha256_vec};
 use crate::pushbytes::push_bytes;
 use crate::script::Script;
 
@@ -24,6 +26,7 @@ pub enum Insertable {
     Hash(Box<Insertable>, Vec<HashFn>),
     /// Applies the BIP-341 key-path taproot tweak to a 33-byte compressed
     /// secp256k1 pubkey, emitting the 32-byte tweaked x-only output key.
+    #[cfg(feature = "bitcoin")]
     TaprootTweak(Box<Insertable>),
 }
 
@@ -44,6 +47,7 @@ impl Insertable {
                 let v = inner.bytes(script)?;
                 Ok(hash_chain(&v, fns))
             }
+            #[cfg(feature = "bitcoin")]
             Insertable::TaprootTweak(inner) => {
                 let v = inner.bytes(script)?;
                 let x_only: [u8; 32] = v
@@ -60,22 +64,31 @@ impl Insertable {
 }
 
 // --- concise constructors for the built-in formats ---
+//
+// Each is used by `script::format_def` for some subset of the chain features,
+// so any one of them may be dead in a given build.
 
+#[allow(dead_code)]
 pub(crate) fn b(bytes: &[u8]) -> Insertable {
     Insertable::Bytes(bytes.to_vec())
 }
+#[allow(dead_code)]
 pub(crate) fn lookup(name: &'static str) -> Insertable {
     Insertable::Lookup(name)
 }
+#[allow(dead_code)]
 pub(crate) fn push(inner: Insertable) -> Insertable {
     Insertable::PushBytes(Box::new(inner))
 }
+#[allow(dead_code)]
 pub(crate) fn ihash(inner: Insertable, fns: &[HashFn]) -> Insertable {
     Insertable::Hash(Box::new(inner), fns.to_vec())
 }
+#[cfg(feature = "bitcoin")]
 pub(crate) fn ihash160(inner: Insertable) -> Insertable {
     ihash(inner, &[sha256_vec, ripemd160_vec])
 }
+#[cfg(feature = "bitcoin")]
 pub(crate) fn ttweak(inner: Insertable) -> Insertable {
     Insertable::TaprootTweak(Box::new(inner))
 }

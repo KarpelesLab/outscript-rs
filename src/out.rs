@@ -5,8 +5,10 @@ use crate::prelude::*;
 
 use serde::Serialize;
 
+#[cfg(feature = "bitcoin")]
 use crate::hash::hash160;
 use crate::pubkey::PubKey;
+#[cfg(feature = "bitcoin")]
 use crate::pushbytes::{parse_push_bytes, push_bytes};
 use crate::script::{ALL_FORMATS, Script};
 
@@ -49,27 +51,39 @@ impl Out {
         }
     }
 
-    /// Extracts the hash part of the output, or `None` if there is no known hash.
+    /// Extracts the hash part of the output, or `None` if there is no known hash
+    /// (including the formats of chains that are not enabled).
+    #[allow(clippy::match_single_binding)]
     pub fn hash(&self) -> Option<Vec<u8>> {
         match self.name.as_str() {
+            #[cfg(feature = "bitcoin")]
             "p2wpkh" | "p2tr" => self
                 .raw
                 .get(1..)
                 .and_then(parse_push_bytes)
                 .map(|(d, _)| d.to_vec()),
+            #[cfg(feature = "bitcoin")]
             "p2pkh" | "p2pukh" => self
                 .raw
                 .get(2..)
                 .and_then(parse_push_bytes)
                 .map(|(d, _)| d.to_vec()),
+            #[cfg(feature = "bitcoin")]
             "p2pk" | "p2puk" => parse_push_bytes(&self.raw).map(|(pub_, _)| hash160(pub_).to_vec()),
+            #[cfg(feature = "bitcoin")]
             "p2sh" => self
                 .raw
                 .get(1..)
                 .and_then(parse_push_bytes)
                 .map(|(d, _)| d.to_vec()),
-            "eth" | "massa" | "solana" => Some(self.raw.clone()),
+            #[cfg(feature = "evm")]
+            "eth" => Some(self.raw.clone()),
+            #[cfg(feature = "massa")]
+            "massa" => Some(self.raw.clone()),
+            #[cfg(feature = "solana")]
+            "solana" => Some(self.raw.clone()),
             // raw is "header byte + credential(s)"; return the payment/stake credential
+            #[cfg(feature = "cardano")]
             "cardano" if self.raw.len() >= 29 => Some(self.raw[1..29].to_vec()),
             _ => None,
         }
@@ -84,6 +98,7 @@ impl core::fmt::Display for Out {
 
 /// Attempts to identify the output-script type of `script`, optionally using a
 /// public-key hint to distinguish compressed/uncompressed variants.
+#[cfg(feature = "bitcoin")]
 pub fn guess_out(script: &[u8], pubkey_hint: Option<&PubKey>) -> Out {
     if script.is_empty() {
         return Out::make("empty", script.to_vec(), &["invalid"]);
@@ -195,5 +210,7 @@ mod tests {
         assert_eq!(Out::make("p2pkh", vec![0x76], &[]).hash(), None);
         assert_eq!(Out::make("p2sh", vec![], &[]).hash(), None);
         assert_eq!(Out::make("cardano", vec![0x01], &[]).hash(), None);
+        // unknown formats have no hash either
+        assert_eq!(Out::make("nope", vec![1, 2, 3], &[]).hash(), None);
     }
 }

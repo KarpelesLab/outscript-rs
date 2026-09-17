@@ -6,9 +6,8 @@
 /// addresses, transactions, PSBTs), so `?` composes across them without
 /// wrapping. The self-contained codecs keep their own small error types
 /// ([`base58`](crate::base58), [`base64`](crate::base64),
-/// [`bech32`](crate::bech32), `cbor`, `rlp`,
-/// [`secp256k1`](crate::crypto::secp256k1) and Solana's compact-u16), which
-/// convert into this one.
+/// [`bech32`](crate::bech32), `cbor`, `rlp`, `crypto::secp256k1` and
+/// Solana's compact-u16), which convert into this one.
 ///
 /// Each module re-exports this type, so `psbt::Error`, `btctx::Error` and
 /// `outscript::Error` all name it.
@@ -200,8 +199,10 @@ pub enum Error {
     /// A bech32 or CashAddr error.
     Bech32(crate::bech32::Error),
     /// A secp256k1 error.
+    #[cfg(feature = "secp256k1")]
     Secp256k1(crate::crypto::secp256k1::Error),
     /// A Solana compact-u16 error.
+    #[cfg(feature = "solana")]
     CompactU16(crate::solana::CompactU16Error),
     /// A CBOR error.
     #[cfg(feature = "alloc")]
@@ -310,7 +311,9 @@ impl core::fmt::Display for Error {
             Error::Base58(e) => e.fmt(f),
             Error::Base64(e) => e.fmt(f),
             Error::Bech32(e) => e.fmt(f),
+            #[cfg(feature = "secp256k1")]
             Error::Secp256k1(e) => e.fmt(f),
+            #[cfg(feature = "solana")]
             Error::CompactU16(e) => e.fmt(f),
             #[cfg(feature = "alloc")]
             Error::Cbor(e) => e.fmt(f),
@@ -349,12 +352,14 @@ impl From<crate::bech32::Error> for Error {
     }
 }
 
+#[cfg(feature = "secp256k1")]
 impl From<crate::crypto::secp256k1::Error> for Error {
     fn from(e: crate::crypto::secp256k1::Error) -> Self {
         Error::Secp256k1(e)
     }
 }
 
+#[cfg(feature = "solana")]
 impl From<crate::solana::CompactU16Error> for Error {
     fn from(e: crate::solana::CompactU16Error) -> Self {
         Error::CompactU16(e)

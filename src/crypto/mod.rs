@@ -1,6 +1,8 @@
 //! Cryptographic primitives used by outscript, built on `purecrypto`.
 
+#[cfg(feature = "ed25519")]
 pub mod ed25519;
+#[cfg(feature = "secp256k1")]
 pub mod secp256k1;
 
 /// The error an external signer reports when it cannot produce a signature

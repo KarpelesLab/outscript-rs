@@ -31,6 +31,7 @@ const NET_MAINNET: u8 = 0x1;
 
 /// The longest Cardano address this module produces (a testnet base address).
 pub const MAX_CARDANO_ADDRESS_LEN: usize = 108;
+const _: () = assert!(MAX_CARDANO_ADDRESS_LEN <= crate::address::MAX_ADDRESS_LEN);
 
 /// Returns the 28-byte blake2b-224 credential for an Ed25519 public key, as used
 /// in Cardano payment and stake credentials.

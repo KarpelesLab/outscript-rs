@@ -249,9 +249,34 @@ let reward = outscript::block_reward("bitcoin", 840_000).unwrap();      // 3.125
 let total  = outscript::cumulative_reward("bitcoin", 840_000).unwrap(); // total minted
 ```
 
+## Cargo features
+
+Chains are opt-in. Each chain feature enables its modules, output-script
+formats and address codecs, and pulls in only the curve arithmetic it needs
+from `purecrypto`. All chains are enabled by default.
+
+| Feature | Enables | Curve |
+|---------|---------|-------|
+| `bitcoin` | Bitcoin-family scripts and addresses, `btcraw`, `BtcTx`, PSBT, script guessing, `BtcAmount`, block rewards | `secp256k1` |
+| `evm` | EIP-55 addresses, `evmraw`, `EvmTx`, ABI helpers | `secp256k1` |
+| `solana` | addresses, program-derived addresses, `SolanaTx` | `ed25519` |
+| `cardano` | Shelley addresses, BIP32-Ed25519 derivation, `CardanoTx` | `ed25519` |
+| `massa` | addresses | `ed25519` |
+
+The `secp256k1` and `ed25519` features can also be enabled on their own for
+the raw `crypto` helpers and the matching `PubKey` variant. Formats and
+networks of chains that are not enabled are simply unknown to
+`generate_script`, `formats_per_network` and `encode_address_to_slice`.
+
+```toml
+# Solana only: no secp256k1 code is compiled in
+outscript = { version = "0.1", default-features = false, features = ["std", "solana"] }
+```
+
 ## `no_std` and no-alloc
 
-The crate is `#![no_std]`. Its Cargo features form three tiers:
+The crate is `#![no_std]`. Independently of the chain features, the runtime
+tiers are:
 
 | Features | Available |
 |----------|-----------|
@@ -259,11 +284,14 @@ The crate is `#![no_std]`. Its Cargo features form three tiers:
 | `alloc` | everything else: `Out`/`Script`, address parsing, all transaction types, RLP/CBOR, JSON |
 | none | a heap-free core (below) |
 
+Disabling the default features also disables every chain, so name the ones
+you need:
+
 ```toml
 # heap-free core only
-outscript = { version = "0.1", default-features = false }
+outscript = { version = "0.1", default-features = false, features = ["bitcoin", "evm"] }
 # full API on no_std targets with an allocator
-outscript = { version = "0.1", default-features = false, features = ["alloc"] }
+outscript = { version = "0.1", default-features = false, features = ["alloc", "bitcoin", "evm", "solana", "cardano", "massa"] }
 ```
 
 Without `alloc` you still get:

@@ -16,7 +16,11 @@ name = "outscript"
 # `std` is the default and implies `alloc`. Build with `--no-default-features`
 # for a `no_std` + no-alloc core (hashing, keys/signing, and slice-based address
 # codecs); add `--features alloc` for everything else on `no_std` targets.
-default = ["std"]
+#
+# Chains are opt-in: each chain feature enables its modules, formats and
+# address codecs, and pulls in only the curve arithmetic it needs. The default
+# enables every chain.
+default = ["std", "bitcoin", "evm", "solana", "cardano", "massa"]
 std = [
     "alloc",
     "purecrypto/std",
@@ -35,8 +39,27 @@ alloc = [
     "purecrypto/alloc",
 ]
 
+# --- chains ---
+# Bitcoin and Bitcoin-like networks (Litecoin, Dogecoin, Namecoin, Monacoin,
+# Dash, Bitcoin Cash, Electraproto): scripts, addresses, `btcraw`/`BtcTx`,
+# PSBT, script guessing and block rewards.
+bitcoin = ["secp256k1"]
+# EVM networks: EIP-55 addresses, `evmraw`/`EvmTx`, ABI helpers.
+evm = ["secp256k1"]
+# Solana: addresses, program-derived addresses, `SolanaTx`.
+solana = ["ed25519"]
+# Cardano: Shelley addresses, BIP32-Ed25519 derivation, `CardanoTx`.
+cardano = ["ed25519", "purecrypto/kdf"]
+# Massa: addresses.
+massa = ["ed25519"]
+
+# --- curves (enabled by the chains above; usable on their own for the raw
+# `crypto` helpers) ---
+secp256k1 = ["purecrypto/hazmat-secp256k1"]
+ed25519 = ["purecrypto/hazmat-edwards25519"]
+
 [dependencies]
-purecrypto = { version = "0.9", default-features = false, features = ["hash", "kdf", "hazmat-secp256k1", "hazmat-edwards25519"] }
+purecrypto = { version = "0.9", default-features = false, features = ["hash"] }
 num-bigint = { version = "0.4", default-features = false, optional = true }
 num-traits = { version = "0.2", default-features = false, optional = true }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }

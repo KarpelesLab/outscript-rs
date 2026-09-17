@@ -49,8 +49,15 @@ jobs:
       fail-fast: false
       matrix:
         features:
-          - { name: no-alloc, flags: --no-default-features }
-          - { name: alloc, flags: --no-default-features --features alloc }
+          - { name: no-alloc, flags: --no-default-features --features bitcoin,evm,solana,cardano,massa }
+          - { name: alloc, flags: --no-default-features --features alloc,bitcoin,evm,solana,cardano,massa }
+          # each chain on its own, so none of them leans on another's gates
+          - { name: bitcoin, flags: --no-default-features --features alloc,bitcoin }
+          - { name: evm, flags: --no-default-features --features alloc,evm }
+          - { name: solana, flags: --no-default-features --features alloc,solana }
+          - { name: cardano, flags: --no-default-features --features alloc,cardano }
+          - { name: massa, flags: --no-default-features --features alloc,massa }
+          - { name: no-chains, flags: --no-default-features --features alloc }
     steps:
       - uses: actions/checkout@v6
 
@@ -98,7 +105,7 @@ jobs:
         run: cargo build --all-targets
 
       - name: Build (no_std, no alloc)
-        run: cargo build --no-default-features
+        run: cargo build --no-default-features --features bitcoin,evm,solana,cardano,massa
 
   docs:
     name: Docs build (warnings denied)

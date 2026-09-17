@@ -139,6 +139,7 @@ pub fn decode(input: &str) -> Result<Vec<u8>, Error> {
 
 /// Decodes a base58 string that must represent exactly 32 bytes, at compile
 /// time. Panics (a compile error in const context) on invalid input.
+#[cfg(any(feature = "solana", test))]
 pub(crate) const fn decode_32_const(input: &str) -> [u8; 32] {
     let bytes = input.as_bytes();
     let mut zeros = 0;

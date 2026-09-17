@@ -6,9 +6,14 @@
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
 
+#[cfg(feature = "secp256k1")]
 use crate::crypto::secp256k1::SecpPublicKey;
 
 /// A public key understood by outscript: either secp256k1 or Ed25519.
+///
+/// Each variant exists only with its curve feature (`secp256k1`, enabled by
+/// the `bitcoin` and `evm` chains; `ed25519`, enabled by `solana`, `cardano`
+/// and `massa`).
 ///
 /// Non-exhaustive: more key/curve types may be added as new chains are
 /// supported.
@@ -16,8 +21,10 @@ use crate::crypto::secp256k1::SecpPublicKey;
 #[non_exhaustive]
 pub enum PubKey {
     /// A secp256k1 public key (Bitcoin, EVM, ...).
+    #[cfg(feature = "secp256k1")]
     Secp256k1(SecpPublicKey),
-    /// A raw 32-byte Ed25519 public key (Solana, Massa).
+    /// A raw 32-byte Ed25519 public key (Solana, Cardano, Massa).
+    #[cfg(feature = "ed25519")]
     Ed25519([u8; 32]),
 }
 
@@ -33,6 +40,7 @@ impl PubKey {
     }
 }
 
+#[cfg(feature = "secp256k1")]
 impl From<SecpPublicKey> for PubKey {
     fn from(k: SecpPublicKey) -> Self {
         PubKey::Secp256k1(k)

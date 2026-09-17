@@ -6,8 +6,14 @@ pub use crate::Error;
 use purecrypto::hash::{Digest, Sha256};
 
 use crate::base58;
+#[cfg(feature = "bitcoin")]
 use crate::bech32;
-use crate::hash::{dsha256, keccak256_once, sha256_once};
+#[cfg(any(feature = "bitcoin", feature = "massa"))]
+use crate::hash::dsha256;
+#[cfg(feature = "evm")]
+use crate::hash::keccak256_once;
+use crate::hash::sha256_once;
+#[cfg(feature = "bitcoin")]
 use crate::pushbytes::parse_push_bytes;
 use crate::script::ScriptBytes;
 
@@ -17,10 +23,11 @@ use crate::out::Out;
 use crate::prelude::*;
 
 /// An upper bound on the length of any address [`encode_address_to_slice`]
-/// produces for a built-in format.
-pub const MAX_ADDRESS_LEN: usize = crate::cardano::MAX_CARDANO_ADDRESS_LEN;
+/// produces for a built-in format (a Cardano base address is the longest).
+pub const MAX_ADDRESS_LEN: usize = 108;
 
 /// base58check versions of P2PKH and P2SH addresses for a network.
+#[cfg(feature = "bitcoin")]
 fn base58_versions(network: &str) -> Option<(u8, u8)> {
     Some(match network {
         "litecoin" => (0x30, 0x32),
@@ -36,6 +43,7 @@ fn base58_versions(network: &str) -> Option<(u8, u8)> {
 }
 
 /// The segwit human-readable part for a network.
+#[cfg(feature = "bitcoin")]
 fn segwit_hrp(network: &str) -> Option<&'static str> {
     Some(match network {
         "litecoin" => "ltc",
@@ -49,6 +57,7 @@ fn segwit_hrp(network: &str) -> Option<&'static str> {
 }
 
 /// Writes `prefix` followed by the base58 of `data || dsha256(data)[..4]`.
+#[cfg(feature = "massa")]
 fn prefixed_base58check(prefix: &[u8], data: &[u8], out: &mut [u8]) -> Result<usize, Error> {
     let chk = dsha256(data);
     let body = out.get_mut(prefix.len()..).ok_or(Error::BufferTooSmall)?;
@@ -66,7 +75,12 @@ fn prefixed_base58check(prefix: &[u8], data: &[u8], out: &mut [u8]) -> Result<us
 /// is ignored, so `p2sh:p2wpkh` renders as `p2sh`), `script` its bytes, and
 /// `network` selects the encoding where a format is shared between chains
 /// (e.g. `bitcoin`, `litecoin`, `bitcoin-cash`, `cardano-testnet`).
-/// [`MAX_ADDRESS_LEN`] bytes always suffice for built-in formats.
+/// [`MAX_ADDRESS_LEN`] bytes always suffice for built-in formats. Formats of
+/// chains that are not enabled fail with [`Error::UnsupportedFormat`].
+#[cfg_attr(
+    not(any(feature = "bitcoin", feature = "cardano")),
+    allow(unused_variables)
+)]
 pub fn encode_address_to_slice(
     format: &str,
     script: &[u8],
@@ -75,15 +89,21 @@ pub fn encode_address_to_slice(
 ) -> Result<usize, Error> {
     let base = format.split_once(':').map_or(format, |(b, _)| b);
     match base {
+        #[cfg(feature = "solana")]
         "solana" => Ok(base58::encode_to_slice(script, out)?),
+        #[cfg(feature = "cardano")]
         "cardano" => crate::cardano::cardano_address_from_raw_to_slice(script, network, out),
+        #[cfg(feature = "evm")]
         "eth" | "evm" => eip55_to_slice(script, out).ok_or(Error::BufferTooSmall),
+        #[cfg(feature = "massa")]
         "massa_pubkey" => prefixed_base58check(b"P", script, out),
+        #[cfg(feature = "massa")]
         "massa" => match script.split_first() {
             Some((0, rest)) => prefixed_base58check(b"AU", rest, out),
             Some((1, rest)) => prefixed_base58check(b"AS", rest, out),
             _ => Err(Error::InvalidScript),
         },
+        #[cfg(feature = "bitcoin")]
         "p2pkh" | "p2pukh" | "p2sh" => {
             let (p2sh, inner) = if base == "p2sh" {
                 (true, script.get(1..script.len().saturating_sub(1)))
@@ -109,6 +129,7 @@ pub fn encode_address_to_slice(
                 out,
             )?)
         }
+        #[cfg(feature = "bitcoin")]
         "p2wpkh" | "p2wsh" | "p2tr" => {
             let (hash, _) = script
                 .get(1..)
@@ -135,6 +156,7 @@ pub fn encode_address_to_slice(
 /// Writes the EIP-55 checksummed hex address (`0x...`) for `addr` (normally 20
 /// bytes) into `out`, returning the number of (ASCII) bytes written —
 /// `2 + 2 * addr.len()` — or `None` if `out` is too small.
+#[cfg(feature = "evm")]
 pub fn eip55_to_slice(addr: &[u8], out: &mut [u8]) -> Option<usize> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let len = 2 + addr.len() * 2;
@@ -162,7 +184,7 @@ pub fn eip55_to_slice(addr: &[u8], out: &mut [u8]) -> Option<usize> {
 }
 
 /// Computes the EIP-55 checksummed hex address (`0x...`) for a 20-byte address.
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", feature = "evm"))]
 pub fn eip55(addr: &[u8]) -> String {
     let mut buf = vec![0u8; 2 + addr.len() * 2];
     eip55_to_slice(addr, &mut buf).expect("buffer sized for the address");
@@ -211,6 +233,16 @@ pub struct DecodedAddress {
 }
 
 impl DecodedAddress {
+    #[cfg_attr(
+        not(any(
+            feature = "bitcoin",
+            feature = "evm",
+            feature = "solana",
+            feature = "cardano",
+            feature = "massa"
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn new(
         format: &'static str,
         parts: &[&[u8]],
@@ -238,6 +270,7 @@ impl From<DecodedAddress> for Out {
 }
 
 /// The single-network flag list for a known network name.
+#[cfg(feature = "bitcoin")]
 fn network_flags(net: &str) -> &'static [&'static str] {
     match net {
         "bitcoin" => &["bitcoin"],
@@ -253,6 +286,7 @@ fn network_flags(net: &str) -> &'static [&'static str] {
     }
 }
 
+#[cfg(feature = "evm")]
 fn hex_nibble(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
@@ -264,6 +298,7 @@ fn hex_nibble(c: u8) -> Option<u8> {
 
 /// Decodes an EVM (`0x...`) address. Mixed-case addresses must carry a valid
 /// EIP-55 checksum.
+#[cfg(feature = "evm")]
 pub fn decode_evm_address(address: &str) -> Result<DecodedAddress, Error> {
     let digits = address
         .strip_prefix("0x")
@@ -287,6 +322,7 @@ pub fn decode_evm_address(address: &str) -> Result<DecodedAddress, Error> {
     Ok(DecodedAddress::new("eth", &[&addr], &["evm"]))
 }
 
+#[cfg(feature = "bitcoin")]
 fn p2pkh(hash: &[u8], networks: &'static [&'static str]) -> DecodedAddress {
     DecodedAddress::new(
         "p2pkh",
@@ -295,12 +331,14 @@ fn p2pkh(hash: &[u8], networks: &'static [&'static str]) -> DecodedAddress {
     )
 }
 
+#[cfg(feature = "bitcoin")]
 fn p2sh(hash: &[u8], networks: &'static [&'static str]) -> DecodedAddress {
     DecodedAddress::new("p2sh", &[&[0xa9, 0x14], hash, &[0x87]], networks)
 }
 
 /// Decodes a Bitcoin-family address for `network`, without allocating. The
 /// special network `"auto"` detects the network from the address.
+#[cfg(feature = "bitcoin")]
 pub fn decode_bitcoin_based_address(network: &str, address: &str) -> Result<DecodedAddress, Error> {
     // case 1: explicit bitcoincash: prefix
     if address.starts_with("bitcoincash:") {
@@ -382,6 +420,7 @@ pub fn decode_bitcoin_based_address(network: &str, address: &str) -> Result<Deco
     Err(Error::InvalidAddress)
 }
 
+#[cfg(feature = "bitcoin")]
 fn decode_cashaddr(address: &str) -> Result<DecodedAddress, Error> {
     let mut hash = [0u8; 64];
     let (typ, len) = bech32::cashaddr_decode_to_slice("bitcoincash:", address, &mut hash)?;
@@ -396,6 +435,7 @@ fn decode_cashaddr(address: &str) -> Result<DecodedAddress, Error> {
     }
 }
 
+#[cfg(feature = "bitcoin")]
 fn decode_base58_versioned(
     network: &str,
     version: u8,
@@ -436,14 +476,14 @@ fn decode_base58_versioned(
 }
 
 /// Parses an EVM (`0x...`) address.
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", feature = "evm"))]
 pub fn parse_evm_address(address: &str) -> Result<Out, Error> {
     decode_evm_address(address).map(Out::from)
 }
 
 /// Parses a Bitcoin-family address for the given network. The special network
 /// `"auto"` attempts to detect the network from the address.
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", feature = "bitcoin"))]
 pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, Error> {
     decode_bitcoin_based_address(network, address).map(Out::from)
 }
@@ -470,6 +510,7 @@ impl Out {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "evm")]
     #[test]
     fn eip55_slice() {
         let addr = [
@@ -482,6 +523,7 @@ mod tests {
         assert_eq!(eip55_to_slice(&addr, &mut out[..41]), None);
     }
 
+    #[cfg(all(feature = "bitcoin", feature = "massa"))]
     #[test]
     fn render_rejects_short_scripts() {
         let mut out = [0u8; MAX_ADDRESS_LEN];
