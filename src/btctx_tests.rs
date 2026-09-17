@@ -1,5 +1,6 @@
 //! Ported known-answer tests from `btctx_test.go` and `p2tr_test.go`.
 
+use crate::Error;
 use crate::btctx::{BtcTx, BtcTxInput, BtcTxOutput, BtcTxSign};
 use crate::crypto::secp256k1::{SecpPrivateKey, bip340_sign, bip340_verify, taproot_tweak};
 use crate::script::Script;
@@ -270,6 +271,7 @@ fn p2tr_sign_produces_valid_sig() {
         amount: crate::BtcAmount(100000),
         sighash: 0,
         prev_script: script_pubkey.clone(),
+        ..Default::default()
     }];
     let digest = tx.taproot_sighash(&keys, 0).unwrap();
     let mut xonly = [0u8; 32];
@@ -336,6 +338,7 @@ fn p2tr_external_signer() {
         amount: crate::BtcAmount(100000),
         sighash: 0,
         prev_script: script_pubkey.clone(),
+        ..Default::default()
     }];
     let digest = tx.taproot_sighash(&keys, 0).unwrap();
     let mut sig = [0u8; 64];
@@ -823,7 +826,6 @@ fn psbt_taproot_sighash_all() {
 /// and without a script tree. Checks the sighash and the final signature.
 #[test]
 fn bip341_key_path_spending_vectors() {
-    use crate::Error;
     use crate::btcraw::{PrevOut, TapScriptPath, TapSighash};
 
     let json: serde_json::Value =
@@ -974,4 +976,193 @@ fn bip341_key_path_spending_vectors() {
     });
     seen.sort_unstable();
     assert_eq!(seen, [0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83]);
+}
+
+// --- taproot script trees through BtcTx ---
+
+/// A taproot output with internal key `k1` committing to the tree
+/// `[<k2> CHECKSIG, <k3> CHECKSIG]`, and a transaction spending it.
+struct TapTreeFixture {
+    tx: BtcTx,
+    spk: Vec<u8>,
+    root: [u8; 32],
+    scripts: [Vec<u8>; 2],
+    control_blocks: [Vec<u8>; 2],
+}
+
+fn tap_tree_fixture() -> TapTreeFixture {
+    use crate::taproot::{
+        MAX_CONTROL_BLOCK_LEN, TapLeaf, control_block_to_slice, p2tr_script_pubkey, tap_tree_root,
+    };
+    let leaf_of = |secret: u8| {
+        let k = SecpPrivateKey::from_bytes(&[secret; 32]).unwrap();
+        let mut s = vec![0x20];
+        s.extend_from_slice(&k.xonly_public_key());
+        s.push(0xac);
+        s
+    };
+    let scripts = [leaf_of(2), leaf_of(3)];
+    let leaves = [TapLeaf::new(1, &scripts[0]), TapLeaf::new(1, &scripts[1])];
+    let internal = SecpPrivateKey::from_bytes(&[1; 32])
+        .unwrap()
+        .xonly_public_key();
+    let root = tap_tree_root(&leaves).unwrap();
+    let spk = p2tr_script_pubkey(&internal, Some(&root)).unwrap().to_vec();
+    let control_blocks = [0, 1].map(|i| {
+        let mut cb = [0u8; MAX_CONTROL_BLOCK_LEN];
+        let n = control_block_to_slice(&internal, &leaves, i, &mut cb).unwrap();
+        cb[..n].to_vec()
+    });
+    let tx = BtcTx {
+        version: 2,
+        inputs: vec![BtcTxInput {
+            sequence: 0xffff_fffd,
+            ..Default::default()
+        }],
+        outputs: vec![BtcTxOutput {
+            amount: crate::BtcAmount(90_000),
+            n: 0,
+            script: spk.clone(),
+        }],
+        locktime: 0,
+    };
+    TapTreeFixture {
+        tx,
+        spk,
+        root,
+        scripts,
+        control_blocks,
+    }
+}
+
+#[test]
+fn p2tr_key_path_over_script_tree() {
+    use crate::btcraw::TapSighash;
+    let TapTreeFixture {
+        mut tx, spk, root, ..
+    } = tap_tree_fixture();
+    let k1 = SecpPrivateKey::from_bytes(&[1; 32]).unwrap();
+    let output_key: [u8; 32] = spk[2..].try_into().unwrap();
+    let probe = [BtcTxSign::without_key("p2tr")
+        .amount(100_000)
+        .prev_script(spk.clone())];
+
+    // without the merkle root the signature is for another output key
+    tx.sign(&[BtcTxSign::new(&k1, "p2tr")
+        .amount(100_000)
+        .prev_script(spk.clone())])
+        .unwrap();
+    let digest = tx.taproot_sighash(&probe, 0).unwrap();
+    let sig: [u8; 64] = tx.inputs[0].witnesses[0][..].try_into().unwrap();
+    assert!(!bip340_verify(&output_key, &digest, &sig));
+
+    tx.sign(&[BtcTxSign::new(&k1, "p2tr")
+        .amount(100_000)
+        .prev_script(spk.clone())
+        .tap_merkle_root(root)])
+        .unwrap();
+    assert_eq!(tx.inputs[0].witnesses.len(), 1);
+    let sig: [u8; 64] = tx.inputs[0].witnesses[0][..].try_into().unwrap();
+    assert!(bip340_verify(&output_key, &digest, &sig));
+
+    // every BIP-341 hash type is signed as such and carries its type byte
+    for hash_type in [0x01u8, 0x02, 0x03, 0x81, 0x82, 0x83] {
+        tx.sign(&[BtcTxSign::new(&k1, "p2tr")
+            .amount(100_000)
+            .prev_script(spk.clone())
+            .tap_merkle_root(root)
+            .sighash(hash_type as u32)])
+            .unwrap();
+        let w = &tx.inputs[0].witnesses[0];
+        assert_eq!((w.len(), w[64]), (65, hash_type));
+        let digest = tx
+            .taproot_sighash_with(&probe, 0, &TapSighash::new(hash_type))
+            .unwrap();
+        assert!(bip340_verify(
+            &output_key,
+            &digest,
+            w[..64].try_into().unwrap()
+        ));
+    }
+    for bad in [0x04u32, 0x80, 0x84, 0x1_00] {
+        let r = tx.sign(&[BtcTxSign::new(&k1, "p2tr")
+            .amount(100_000)
+            .prev_script(spk.clone())
+            .sighash(bad)]);
+        assert_eq!(r, Err(Error::UnsupportedSighash), "{bad:#x}");
+    }
+}
+
+#[test]
+fn p2tr_script_path_spend() {
+    use crate::btcraw::{TapScriptPath, TapSighash};
+    use crate::taproot::{ControlBlock, tapleaf_hash};
+    let TapTreeFixture {
+        mut tx,
+        spk,
+        scripts,
+        control_blocks,
+        ..
+    } = tap_tree_fixture();
+    let output_key: [u8; 32] = spk[2..].try_into().unwrap();
+    let probe = [BtcTxSign::without_key("p2tr")
+        .amount(100_000)
+        .prev_script(spk.clone())];
+
+    for (i, secret) in [(0usize, 2u8), (1, 3)] {
+        let k = SecpPrivateKey::from_bytes(&[secret; 32]).unwrap();
+        tx.sign(&[BtcTxSign::new(&k, "p2tr")
+            .amount(100_000)
+            .prev_script(spk.clone())
+            .tap_leaf(scripts[i].clone(), control_blocks[i].clone())])
+            .unwrap();
+        let w = &tx.inputs[0].witnesses;
+        assert_eq!(w.len(), 3);
+        assert_eq!((&w[1], &w[2]), (&scripts[i], &control_blocks[i]));
+        assert!(
+            ControlBlock::parse(&w[2])
+                .unwrap()
+                .verify(&w[1], &output_key)
+        );
+        let opts = TapSighash::new(0)
+            .with_script_path(TapScriptPath::new(tapleaf_hash(0xc0, &scripts[i])));
+        let digest = tx.taproot_sighash_with(&probe, 0, &opts).unwrap();
+        // signed by the leaf key itself, untweaked
+        assert!(bip340_verify(
+            &k.xonly_public_key(),
+            &digest,
+            w[0][..].try_into().unwrap()
+        ));
+        // and the signed transaction still round-trips
+        let bytes = tx.bytes();
+        assert_eq!(BtcTx::from_bytes(&bytes).unwrap().bytes(), bytes);
+    }
+
+    let k2 = SecpPrivateKey::from_bytes(&[2; 32]).unwrap();
+    let sign = |tx: &mut BtcTx, key: &SecpPrivateKey, script: Vec<u8>, cb: Vec<u8>| {
+        tx.sign(&[BtcTxSign::new(key, "p2tr")
+            .amount(100_000)
+            .prev_script(spk.clone())
+            .tap_leaf(script, cb)])
+    };
+    // the wrong key for the leaf
+    let k3 = SecpPrivateKey::from_bytes(&[3; 32]).unwrap();
+    assert_eq!(
+        sign(&mut tx, &k3, scripts[0].clone(), control_blocks[0].clone()),
+        Err(Error::KeyNotInvolved)
+    );
+    // a control block that does not prove this leaf for this output
+    assert_eq!(
+        sign(&mut tx, &k2, scripts[0].clone(), control_blocks[1].clone()),
+        Err(Error::InvalidScript)
+    );
+    assert_eq!(
+        sign(&mut tx, &k2, scripts[0].clone(), vec![0xc0; 10]),
+        Err(Error::InvalidLength)
+    );
+    // only single-key leaves get their witness built
+    assert_eq!(
+        sign(&mut tx, &k2, vec![0x51], control_blocks[0].clone()),
+        Err(Error::UnsupportedScript)
+    );
 }

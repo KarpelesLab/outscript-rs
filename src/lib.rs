@@ -35,8 +35,9 @@
 //!
 //! - `bitcoin`: Bitcoin and Bitcoin-like networks (Litecoin, Dogecoin,
 //!   Namecoin, Monacoin, Dash, Bitcoin Cash, Electraproto) — scripts,
-//!   addresses, `btcraw`, `psbt`, `btcguess`, `BtcAmount` and
-//!   (with `alloc`) `BtcTx` and block rewards. Implies `secp256k1`.
+//!   addresses, `btcraw`, `psbt`, `taproot` (script trees and control
+//!   blocks), `btcguess`, `BtcAmount` and (with `alloc`) `BtcTx` and block
+//!   rewards. Implies `secp256k1`.
 //! - `evm`: EIP-55 addresses, `evmraw`, `evmabi` and (with `alloc`)
 //!   `EvmTx`. Implies `secp256k1`.
 //! - `solana`: addresses, program-derived addresses and (with `alloc`)
@@ -64,9 +65,10 @@
 //!   ([`generate_script`]), address rendering
 //!   ([`encode_address_to_slice`], plus the `cardano` address builders) and
 //!   address decoding (`decode_bitcoin_based_address` and friends);
-//! - transaction signing: `btcraw` (legacy, BIP-143 and taproot sighashes,
-//!   serialization, txid), `psbt` (BIP-174 creator, updater, signer,
-//!   combiner, finalizer and extractor) and `evmraw`
+//! - transaction signing: `btcraw` (legacy, BIP-143 and every BIP-341 taproot
+//!   sighash, serialization, txid), `taproot` (script trees, merkle roots and
+//!   control blocks), `psbt` (BIP-174 creator, updater, signer, combiner,
+//!   finalizer and extractor, including taproot script paths) and `evmraw`
 //!   (legacy/EIP-2930/EIP-1559 signing, encoding, hashing and sender
 //!   recovery);
 //! - `solana` keys, program-derived addresses and compact-u16; `evmabi`

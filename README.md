@@ -100,6 +100,49 @@ Taproot supports both raw `SecpPrivateKey` signing (the library applies the
 BIP-341 tweak) and external signers implementing the [`Signer::sign_taproot`]
 method (TSS / MuSig2 / FROST / HSM). Use [`crypto::secp256k1::taproot_tweak`]
 and [`BtcTx::taproot_sighash`] to compute the tweaked key and sighash offline.
+Every BIP-341 sighash type is supported (`.sighash(0x83)` for
+`SINGLE|ANYONECANPAY`, and so on).
+
+### Taproot script trees
+
+The `taproot` module builds script trees without allocating. A tree is a
+slice of leaves in depth-first order with their depths, the same shape as the
+BIP-371 tap tree:
+
+```rust
+use outscript::taproot::{
+    TapLeaf, MAX_CONTROL_BLOCK_LEN, control_block_to_slice, p2tr_script_pubkey, tap_tree_root,
+};
+
+//        root
+//       /    \
+//   leaf_a    *          two scripts at depth 2 under one branch,
+//            / \         one at depth 1
+//      leaf_b   leaf_c
+let leaves = [TapLeaf::new(1, &leaf_a), TapLeaf::new(2, &leaf_b), TapLeaf::new(2, &leaf_c)];
+let root = tap_tree_root(&leaves).unwrap();
+let script_pubkey = p2tr_script_pubkey(&internal_key, Some(&root)).unwrap();
+
+let mut control_block = [0u8; MAX_CONTROL_BLOCK_LEN];
+let n = control_block_to_slice(&internal_key, &leaves, 1, &mut control_block).unwrap();
+```
+
+Spend such an output through the key path by giving the signer the root, or
+through a `<key> OP_CHECKSIG` leaf with its control block:
+
+```rust
+// key path: the internal key, tweaked with the tree's merkle root
+tx.sign(&[BtcTxSign::new(&internal, "p2tr").amount(amt).prev_script(spk.clone())
+    .tap_merkle_root(root)]).unwrap();
+
+// script path: the leaf key signs untweaked; witness = [sig, script, control block]
+tx.sign(&[BtcTxSign::new(&leaf_key, "p2tr").amount(amt).prev_script(spk)
+    .tap_leaf(leaf_b.to_vec(), control_block[..n].to_vec())]).unwrap();
+```
+
+For other leaf scripts, compute the digest with `RawTx::taproot_sighash` (any
+hash type, annex, code separator position), sign it with
+`SecpPrivateKey::sign_schnorr`, and assemble the witness yourself.
 
 ### PSBT (BIP-174)
 
@@ -131,9 +174,21 @@ let bytes = Psbt::decode_base64(&text)?;
 ```
 
 Signing covers P2PKH, P2PK, multisig, P2WPKH, P2WSH, their P2SH-nested forms
-and P2TR key path (`SIGHASH_ALL`, and `SIGHASH_DEFAULT` for taproot), through
-the `PsbtSigner` trait for external signers. The implementation reproduces
-the BIP-174 test vectors byte for byte.
+and P2TR, through the `PsbtSigner` trait for external signers. The
+implementation reproduces the BIP-174 test vectors byte for byte.
+
+Taproot inputs are signed on the key path, including outputs that commit to a
+script tree, and on the script path for every tapscript leaf the key appears
+in, with any BIP-341 sighash type. The finalizer uses the key-path signature
+when there is one, and otherwise spends through a `<key> OP_CHECKSIG` or
+`multi_a` leaf that has enough signatures:
+
+```rust
+// updater: what a signer needs for an output that commits to a script tree
+psbt.set_tap_internal_key(0, &internal_key, &mut out)?;
+psbt.set_tap_merkle_root(0, &root, &mut out)?;
+psbt.add_tap_leaf_script(0, &control_block[..n], &leaf_b, &mut out)?;
+```
 
 ### EVM transactions
 

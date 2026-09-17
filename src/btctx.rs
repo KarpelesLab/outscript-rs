@@ -15,7 +15,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::address::parse_bitcoin_based_address;
 use crate::btcamount::BtcAmount;
-use crate::btcraw::{PrevOut, RawTx, RawTxIn, RawTxOut, SegwitV0Midstate, TaprootMidstate};
+use crate::btcraw::{
+    PrevOut, RawTx, RawTxIn, RawTxOut, SegwitV0Midstate, TapScriptPath, TapSighash,
+    TaprootMidstate, taproot_sighash_of,
+};
 use crate::btcvarint::BtcVarInt;
 use crate::crypto::SignerError;
 use crate::crypto::secp256k1::DerSignature;
@@ -24,6 +27,7 @@ use crate::hash::{dsha256, hash160, sha256_once};
 use crate::pubkey::PubKey;
 use crate::pushbytes::push_bytes;
 use crate::script::Script;
+use crate::taproot::ControlBlock;
 
 /// A signer capable of producing ECDSA and/or taproot signatures for a single
 /// transaction input. Implemented by
@@ -44,6 +48,25 @@ pub trait Signer {
     fn sign_taproot(&self, _sighash: &[u8; 32]) -> Result<[u8; 64], SignerError> {
         Err(SignerError)
     }
+    /// A BIP-340 key-path signature for an output committing to the script
+    /// tree with `merkle_root` (`None` for an empty tree, as
+    /// [`sign_taproot`](Self::sign_taproot)). By default only the empty tree
+    /// is supported, through `sign_taproot`.
+    fn sign_taproot_with_root(
+        &self,
+        sighash: &[u8; 32],
+        merkle_root: Option<&[u8; 32]>,
+    ) -> Result<[u8; 64], SignerError> {
+        match merkle_root {
+            None => self.sign_taproot(sighash),
+            Some(_) => Err(SignerError),
+        }
+    }
+    /// A BIP-340 signature over a taproot script-path sighash with the key as
+    /// is (no tweak), for a tapscript `OP_CHECKSIG`. Unsupported by default.
+    fn sign_schnorr(&self, _sighash: &[u8; 32]) -> Result<[u8; 64], SignerError> {
+        Err(SignerError)
+    }
 }
 
 impl Signer for crate::crypto::secp256k1::SecpPrivateKey {
@@ -55,6 +78,17 @@ impl Signer for crate::crypto::secp256k1::SecpPrivateKey {
     }
     fn sign_taproot(&self, sighash: &[u8; 32]) -> Result<[u8; 64], SignerError> {
         self.sign_taproot(sighash).map_err(|_| SignerError)
+    }
+    fn sign_taproot_with_root(
+        &self,
+        sighash: &[u8; 32],
+        merkle_root: Option<&[u8; 32]>,
+    ) -> Result<[u8; 64], SignerError> {
+        self.sign_taproot_with_root(sighash, merkle_root)
+            .map_err(|_| SignerError)
+    }
+    fn sign_schnorr(&self, sighash: &[u8; 32]) -> Result<[u8; 64], SignerError> {
+        self.sign_schnorr(sighash).map_err(|_| SignerError)
     }
 }
 
@@ -98,6 +132,11 @@ pub struct BtcTx {
 }
 
 /// Signing parameters for a single transaction input.
+///
+/// Non-exhaustive: build one with [`BtcTxSign::new`] (or
+/// [`BtcTxSign::without_key`]) and the setter methods.
+#[derive(Default)]
+#[non_exhaustive]
 pub struct BtcTxSign<'a> {
     /// The signer (required for signing; may be `None` for sighash-only use).
     pub key: Option<&'a dyn Signer>,
@@ -105,10 +144,17 @@ pub struct BtcTxSign<'a> {
     pub scheme: String,
     /// Value of the input being spent (required for segwit and taproot).
     pub amount: BtcAmount,
-    /// Sighash flag (0 defaults to SIGHASH_ALL for non-taproot).
+    /// Sighash flag. 0 defaults to `SIGHASH_ALL`, except for taproot where it
+    /// is `SIGHASH_DEFAULT`; taproot accepts every BIP-341 type.
     pub sighash: u32,
     /// scriptPubKey of the output being spent (required for taproot).
     pub prev_script: Vec<u8>,
+    /// Taproot: the merkle root of the script tree the output commits to, for
+    /// a key-path spend of such an output (`None` for a BIP-86 output).
+    pub tap_merkle_root: Option<[u8; 32]>,
+    /// Taproot: the `(leaf script, control block)` to spend through, making
+    /// this a script-path spend of a `<key> OP_CHECKSIG` leaf.
+    pub tap_leaf: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl<'a> BtcTxSign<'a> {
@@ -117,10 +163,35 @@ impl<'a> BtcTxSign<'a> {
         BtcTxSign {
             key: Some(key),
             scheme: scheme.to_string(),
-            amount: BtcAmount(0),
-            sighash: 0,
-            prev_script: Vec::new(),
+            ..Default::default()
         }
+    }
+    /// Parameters without a signer, for computing sighashes only (see
+    /// [`BtcTx::taproot_sighash`]).
+    pub fn without_key(scheme: &str) -> Self {
+        BtcTxSign {
+            scheme: scheme.to_string(),
+            ..Default::default()
+        }
+    }
+    /// Sets the sighash flag.
+    pub fn sighash(mut self, flag: u32) -> Self {
+        self.sighash = flag;
+        self
+    }
+    /// Taproot key path: the merkle root of the script tree the output
+    /// commits to (see [`tap_tree_root`](crate::taproot::tap_tree_root)).
+    pub fn tap_merkle_root(mut self, root: [u8; 32]) -> Self {
+        self.tap_merkle_root = Some(root);
+        self
+    }
+    /// Taproot script path: spend through the `<key> OP_CHECKSIG` leaf
+    /// `script`, proven by `control_block` (see
+    /// [`control_block_to_slice`](crate::taproot::control_block_to_slice)).
+    /// The signer signs with its untweaked key.
+    pub fn tap_leaf(mut self, script: Vec<u8>, control_block: Vec<u8>) -> Self {
+        self.tap_leaf = Some((script, control_block));
+        self
     }
     /// Sets the input amount.
     pub fn amount(mut self, amount: u64) -> Self {
@@ -705,19 +776,74 @@ impl BtcTx {
         parts.key_spend_sighash(idx)
     }
 
+    /// Computes the BIP-341 digest of input `idx` for any hash type, the key
+    /// or a script path, with or without an annex (see [`TapSighash`]). Each
+    /// entry in `keys` must have its `prev_script` and `amount` set.
+    pub fn taproot_sighash_with(
+        &self,
+        keys: &[BtcTxSign],
+        idx: usize,
+        opts: &TapSighash<'_>,
+    ) -> Result<[u8; 32], Error> {
+        let parts = self.taproot_sighash_parts_from_keys(keys)?;
+        let k = keys.get(idx).ok_or(Error::InputIndex)?;
+        let prevout = PrevOut {
+            amount: k.amount.0,
+            script: &k.prev_script,
+        };
+        self.with_raw(|raw| taproot_sighash_of(raw, &parts, idx, prevout, opts))
+    }
+
     fn p2tr_sign(
         &mut self,
         n: usize,
         k: &BtcTxSign,
         parts: &TaprootSighashParts,
     ) -> Result<(), Error> {
-        if k.sighash != 0 && k.sighash != 1 {
-            return Err(Error::UnsupportedSighash);
-        }
-        let sighash = parts.key_spend_sighash(n)?;
+        let hash_type = match k.sighash {
+            t @ (0x00..=0x03 | 0x81..=0x83) => t as u8,
+            _ => return Err(Error::UnsupportedSighash),
+        };
         let key = k.key.ok_or(Error::MissingKey)?;
-        let sig = key.sign_taproot(&sighash)?;
-        self.inputs[n].witnesses = vec![sig.to_vec()];
+        let prevout = PrevOut {
+            amount: k.amount.0,
+            script: &k.prev_script,
+        };
+        let mut opts = TapSighash::new(hash_type);
+        if let Some((script, control_block)) = &k.tap_leaf {
+            // only a `<32-byte key> OP_CHECKSIG` leaf has the witness built here
+            let leaf_key = match script.as_slice() {
+                [0x20, key @ .., 0xac] if key.len() == 32 => key,
+                _ => return Err(Error::UnsupportedScript),
+            };
+            if let Some(pk) = key.ecdsa_public_key()
+                && pk.serialize_compressed()[1..] != *leaf_key
+            {
+                return Err(Error::KeyNotInvolved);
+            }
+            let output_key: [u8; 32] = match k.prev_script.as_slice() {
+                [0x51, 0x20, key @ ..] => key.try_into().map_err(|_| Error::InvalidScript)?,
+                _ => return Err(Error::InvalidScript),
+            };
+            let cb = ControlBlock::parse(control_block)?;
+            if !cb.verify(script, &output_key) {
+                return Err(Error::InvalidScript);
+            }
+            opts = opts.with_script_path(TapScriptPath::new(cb.leaf_hash(script)));
+        }
+        let sighash = self.with_raw(|raw| taproot_sighash_of(raw, parts, n, prevout, &opts))?;
+        let mut sig = match &k.tap_leaf {
+            Some(_) => key.sign_schnorr(&sighash)?,
+            None => key.sign_taproot_with_root(&sighash, k.tap_merkle_root.as_ref())?,
+        }
+        .to_vec();
+        if hash_type != 0 {
+            sig.push(hash_type);
+        }
+        self.inputs[n].witnesses = match &k.tap_leaf {
+            Some((script, control_block)) => vec![sig, script.clone(), control_block.clone()],
+            None => vec![sig],
+        };
         self.inputs[n].script = Vec::new();
         Ok(())
     }
