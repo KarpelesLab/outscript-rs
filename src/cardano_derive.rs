@@ -19,6 +19,7 @@ pub use crate::Error;
 
 use purecrypto::hash::{Digest, HmacSha512, Sha512};
 use purecrypto::kdf::pbkdf2;
+use purecrypto::zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 #[cfg(feature = "alloc")]
 use crate::cardanotx::CardanoSigner;
@@ -40,6 +41,11 @@ pub fn cardano_harden(index: u32) -> u32 {
 /// See the [module documentation](self) for the representation. Create one from
 /// an xprv with [`CardanoExtendedKey::new`], or derive a root from entropy with
 /// [`cardano_icarus_master_key`].
+///
+/// The scalar, nonce and chain code are wiped when the key is dropped
+/// ([`ZeroizeOnDrop`]), including every intermediate key of a
+/// [`derive_path`](Self::derive_path); [`Zeroize::zeroize`] scrubs them earlier
+/// on demand, after which the key must not be used again.
 #[derive(Clone)]
 pub struct CardanoExtendedKey {
     scalar: [u8; 32],     // kL: the (clamped or derived) signing scalar
@@ -48,6 +54,26 @@ pub struct CardanoExtendedKey {
     chain_code: [u8; 32], // chain code (only meaningful when has_chain)
     has_chain: bool,      // whether chain_code is present (required for derivation)
 }
+
+impl Zeroize for CardanoExtendedKey {
+    fn zeroize(&mut self) {
+        self.scalar.zeroize();
+        self.nonce.zeroize();
+        // the chain code lets anyone holding a parent public key derive
+        // children, so it is cleared with the secrets
+        self.chain_code.zeroize();
+        self.pub_key.zeroize();
+        self.has_chain = false;
+    }
+}
+
+impl Drop for CardanoExtendedKey {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for CardanoExtendedKey {}
 
 impl CardanoExtendedKey {
     /// Builds an extended key from a Cardano xprv. The input is either the
@@ -90,10 +116,12 @@ impl CardanoExtendedKey {
     }
 
     /// Returns the xprv: the 64-byte expanded secret (scalar followed by nonce),
-    /// plus the 32-byte chain code when present (96 bytes total).
+    /// plus the 32-byte chain code when present (96 bytes total). The buffer
+    /// dereferences to a `Vec<u8>` and is wiped when dropped.
     #[cfg(feature = "alloc")]
-    pub fn bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(96);
+    pub fn bytes(&self) -> Zeroizing<Vec<u8>> {
+        // sized up front: a reallocation would leave an unwiped copy behind
+        let mut out = Zeroizing::new(Vec::with_capacity(96));
         out.extend_from_slice(&self.scalar);
         out.extend_from_slice(&self.nonce);
         if self.has_chain {
@@ -115,9 +143,16 @@ impl CardanoExtendedKey {
     /// sig  = R || S
     /// ```
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
-        let a = ed25519::scalar_reduce_wide(&extend64(&self.scalar));
+        // `a` is the key and `r` the per-signature nonce (which reveals the key
+        // together with the signature): both, and the buffers they are reduced
+        // from, are wiped on return.
+        let a = Zeroizing::new(ed25519::scalar_reduce_wide(&Zeroizing::new(extend64(
+            &self.scalar,
+        ))));
 
-        let r = ed25519::scalar_reduce_wide(&sha512_parts(&[&self.nonce, message]));
+        let r = Zeroizing::new(ed25519::scalar_reduce_wide(&Zeroizing::new(sha512_parts(
+            &[&self.nonce, message],
+        ))));
         let r_point = ed25519::scalar_mul_base(&r);
 
         let hram = ed25519::scalar_reduce_wide(&sha512_parts(&[&r_point, &self.pub_key, message]));
@@ -158,8 +193,10 @@ impl CardanoExtendedKey {
             )
         };
 
-        let mut zl = [0u8; 32];
-        let mut zr = [0u8; 32];
+        // the HMAC outputs are the child's key tweaks and chain code
+        let (zout, iout) = (Zeroizing::new(zout), Zeroizing::new(iout));
+        let mut zl = Zeroizing::new([0u8; 32]);
+        let mut zr = Zeroizing::new([0u8; 32]);
         zl.copy_from_slice(&zout[..32]);
         zr.copy_from_slice(&zout[32..64]);
 
@@ -291,14 +328,14 @@ pub fn cardano_icarus_master_key(
     if entropy.is_empty() {
         return Err(Error::EmptyEntropy);
     }
-    let mut xprv = [0u8; 96];
-    pbkdf2::<Sha512>(password, entropy, 4096, &mut xprv);
+    let mut xprv = Zeroizing::new([0u8; 96]);
+    pbkdf2::<Sha512>(password, entropy, 4096, &mut xprv[..]);
     // CIP-3 force-3rd clamp: clear the low 3 bits and the two highest bits, set
     // bit 254.
     xprv[0] &= 0b1111_1000;
     xprv[31] &= 0b0001_1111;
     xprv[31] |= 0b0100_0000;
-    CardanoExtendedKey::new(&xprv)
+    CardanoExtendedKey::new(&xprv[..])
 }
 
 // --- byte-level helpers ---

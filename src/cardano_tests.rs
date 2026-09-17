@@ -376,7 +376,7 @@ const D1_H0_SIG: &str = "90194d57cde4fdadd01eb7cf161780c277e129fc7135b97779a3268
 fn cardano_derive_hardened_vector() {
     let parent = CardanoExtendedKey::new(&hex::decode(D1).unwrap()).unwrap();
     let child = parent.derive_child(0x8000_0000).unwrap();
-    assert_eq!(hex::encode(child.bytes()), D1_H0);
+    assert_eq!(hex::encode(&*child.bytes()), D1_H0);
 }
 
 #[test]
@@ -450,4 +450,27 @@ fn cardano_public_derivation_matches_private() {
 
     // hardened public derivation must be rejected
     assert!(xpub.derive_child(harden(0)).is_err());
+}
+
+#[test]
+fn extended_key_zeroizes() {
+    use crate::crypto::{Zeroize, ZeroizeOnDrop};
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+    assert_zeroize_on_drop::<crate::CardanoExtendedKey>();
+
+    let root = cardano_icarus_master_key(&[0x42; 16], b"").unwrap();
+    let mut key = root.derive_path(&[crate::cardano_harden(1852), 0]).unwrap();
+    let copy = key.clone();
+    let xprv = key.bytes();
+    assert_eq!(xprv.len(), 96);
+    assert!(xprv.iter().any(|&b| b != 0));
+
+    key.zeroize();
+    // scalar and nonce are gone, and so is the chain code
+    assert_eq!(key.bytes().len(), 64);
+    assert!(key.bytes().iter().all(|&b| b == 0));
+    assert!(key.chain_code().is_none());
+    assert_eq!(key.public_key(), [0u8; 32]);
+    // a clone is independent
+    assert_eq!(*copy.bytes(), *xprv);
 }

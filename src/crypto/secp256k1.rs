@@ -8,6 +8,7 @@
 
 use purecrypto::ec::secp256k1::{AffinePoint, ProjectivePoint, Scalar};
 use purecrypto::hash::{Digest, HmacSha256, Sha256, sha256};
+use purecrypto::zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
@@ -74,21 +75,23 @@ fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 /// `KarpelesLab/secp256k1`'s `NonceRFC6979` with `extra`/`version` unset.
 /// `extra_iterations` selects the (extra_iterations+1)-th valid candidate.
 fn generate_k(priv_be: &[u8; 32], hash: &[u8; 32], extra_iterations: u32) -> Scalar {
-    let mut key = [0u8; 64];
+    // The key material and the whole HMAC-DRBG state (K, V) determine the
+    // nonce, and the nonce reveals the private key: wipe all of it on return.
+    let mut key = Zeroizing::new([0u8; 64]);
     key[..32].copy_from_slice(priv_be);
     key[32..].copy_from_slice(hash);
 
-    let mut v = [1u8; 32];
-    let mut k = [0u8; 32];
+    let mut v = Zeroizing::new([1u8; 32]);
+    let mut k = Zeroizing::new([0u8; 32]);
 
-    k = hmac(&k, &[&v, &[0x00], &key]);
-    v = hmac(&k, &[&v]);
-    k = hmac(&k, &[&v, &[0x01], &key]);
-    v = hmac(&k, &[&v]);
+    *k = hmac(&k[..], &[&v[..], &[0x00], &key[..]]);
+    *v = hmac(&k[..], &[&v[..]]);
+    *k = hmac(&k[..], &[&v[..], &[0x01], &key[..]]);
+    *v = hmac(&k[..], &[&v[..]]);
 
     let mut generated: u32 = 0;
     loop {
-        v = hmac(&k, &[&v]);
+        *v = hmac(&k[..], &[&v[..]]);
         if let Ok(cand) = Scalar::from_bytes_be(&v)
             && !bool::from(cand.is_zero())
         {
@@ -97,8 +100,8 @@ fn generate_k(priv_be: &[u8; 32], hash: &[u8; 32], extra_iterations: u32) -> Sca
                 return cand;
             }
         }
-        k = hmac(&k, &[&v, &[0x00]]);
-        v = hmac(&k, &[&v]);
+        *k = hmac(&k[..], &[&v[..], &[0x00]]);
+        *v = hmac(&k[..], &[&v[..]]);
     }
 }
 
@@ -171,11 +174,32 @@ impl SecpPublicKey {
 // ---------------------------------------------------------------------------
 
 /// A secp256k1 private key.
+///
+/// The secret scalar is wiped when the key is dropped ([`ZeroizeOnDrop`]), and
+/// [`Zeroize::zeroize`] scrubs it earlier on demand. A zeroized key holds the
+/// invalid scalar 0 and must not be used again. Each [`Clone`] is an
+/// independent copy that wipes itself; the bytes passed to
+/// [`from_bytes`](Self::from_bytes) stay the caller's to wipe.
 #[derive(Clone)]
 pub struct SecpPrivateKey {
     d: Scalar,
     d_be: [u8; 32],
 }
+
+impl Zeroize for SecpPrivateKey {
+    fn zeroize(&mut self) {
+        self.d.zeroize();
+        self.d_be.zeroize();
+    }
+}
+
+impl Drop for SecpPrivateKey {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for SecpPrivateKey {}
 
 impl SecpPrivateKey {
     /// Creates a private key from a 32-byte big-endian secret scalar. Returns
@@ -510,14 +534,15 @@ fn bip340_sign_scalar(d0: &Scalar, msg: &[u8; 32], aux: &[u8; 32]) -> Result<[u8
 
     // t = d XOR tagged_hash("BIP0340/aux", aux)
     let aux_hash = tagged_hash("BIP0340/aux", &[aux]);
-    let d_bytes = d.to_bytes_be();
-    let mut t = [0u8; 32];
+    // (the key bytes, the masked key and the nonce seed are all wiped on return)
+    let d_bytes = Zeroizing::new(d.to_bytes_be());
+    let mut t = Zeroizing::new([0u8; 32]);
     for i in 0..32 {
         t[i] = d_bytes[i] ^ aux_hash[i];
     }
 
     // rand = tagged_hash("BIP0340/nonce", t || P.x || msg)
-    let rand = tagged_hash("BIP0340/nonce", &[&t, &px, msg]);
+    let rand = Zeroizing::new(tagged_hash("BIP0340/nonce", &[&t[..], &px, msg]));
     let mut k = Scalar::from_bytes_be_reduce(&rand);
     if bool::from(k.is_zero()) {
         return Err(Error::InvalidKey);
@@ -594,6 +619,23 @@ pub fn bip340_verify(xonly_pub: &[u8; 32], msg: &[u8; 32], sig: &[u8; 64]) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_key_zeroizes() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<SecpPrivateKey>();
+
+        let mut key = SecpPrivateKey::from_bytes(&[0x11; 32]).unwrap();
+        let copy = key.clone();
+        let sig = key.sign_der(&[7u8; 32]);
+        key.zeroize();
+        assert_eq!(key.d_be, [0u8; 32]);
+        assert!(bool::from(key.d.is_zero()));
+        // a clone is independent, and signing is unchanged by the wiping of
+        // its temporaries
+        assert_eq!(copy.d_be, [0x11; 32]);
+        assert_eq!(copy.sign_der(&[7u8; 32]), sig);
+    }
 
     #[test]
     fn recovery_with_overflowed_r() {

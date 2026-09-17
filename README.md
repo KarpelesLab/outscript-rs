@@ -291,6 +291,27 @@ networks of chains that are not enabled are simply unknown to
 outscript = { version = "0.1", default-features = false, features = ["std", "solana"] }
 ```
 
+## Key hygiene
+
+`SecpPrivateKey` and `CardanoExtendedKey` wipe their key material when dropped
+and implement `Zeroize` to scrub it on demand. Signing and key derivation wipe
+the secret-derived buffers they create, and `CardanoExtendedKey::bytes` returns
+a self-wiping buffer. The wiping API is re-exported from `purecrypto`, so no
+extra dependency is needed:
+
+```rust
+use outscript::crypto::{Zeroize, Zeroizing, secp256k1::SecpPrivateKey};
+
+let secret = Zeroizing::new(load_secret());   // your copy: wiped on drop
+let mut key = SecpPrivateKey::from_bytes(&secret).unwrap();
+let sig = key.sign_der(&digest);
+key.zeroize();                                // or just let it drop
+```
+
+Seeds passed by reference (Solana and Cardano `sign(&[seed])`) stay yours to
+wipe. Wiping is hygiene: it cannot reach copies the compiler left in registers
+or on the stack.
+
 ## `no_std` and no-alloc
 
 The crate is `#![no_std]`. Independently of the chain features, the runtime

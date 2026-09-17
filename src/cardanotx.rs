@@ -73,9 +73,16 @@ pub trait CardanoSigner {
     fn sign_cardano(&self, message: &[u8]) -> Result<[u8; 64], SignerError>;
 }
 
-/// Adapts a standard 32-byte Ed25519 seed to [`CardanoSigner`].
+/// Adapts a standard 32-byte Ed25519 seed to [`CardanoSigner`]. The copied
+/// seed is wiped when the adapter is dropped.
 struct StdEd25519Signer {
     seed: [u8; 32],
+}
+
+impl Drop for StdEd25519Signer {
+    fn drop(&mut self) {
+        crate::crypto::Zeroize::zeroize(&mut self.seed);
+    }
 }
 
 impl CardanoSigner for StdEd25519Signer {

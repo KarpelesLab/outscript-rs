@@ -18,6 +18,15 @@
 //! `crypto::secp256k1` and Solana's compact-u16) keep their own
 //! small error types, which convert into [`Error`].
 //!
+//! # Secrets
+//!
+//! `SecpPrivateKey` and `CardanoExtendedKey` wipe their
+//! key material when dropped, and implement [`crypto::Zeroize`] to scrub it
+//! earlier. Signing and derivation wipe the secret-derived buffers they create
+//! (nonces, HMAC state, PBKDF2 output), and `CardanoExtendedKey::bytes` returns
+//! a [`crypto::Zeroizing`] buffer. Seeds and key bytes you pass in by reference
+//! remain yours to wipe: wrap them in [`crypto::Zeroizing`].
+//!
 //! # Features
 //!
 //! Chains are opt-in. Each chain feature enables its modules, output-script

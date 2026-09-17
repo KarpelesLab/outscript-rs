@@ -3,6 +3,7 @@
 
 use purecrypto::ec::ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature};
 use purecrypto::ec::edwards25519::hazmat::{EdwardsPoint, Scalar};
+use purecrypto::zeroize::Zeroizing;
 
 /// Derives the 32-byte raw Ed25519 public key from a 32-byte seed.
 pub fn public_from_seed(seed: &[u8; 32]) -> [u8; 32] {
@@ -41,7 +42,9 @@ pub fn is_on_curve(point: &[u8; 32]) -> bool {
 /// group order L. Derived BIP32-Ed25519 scalars are not in canonical (< L) form,
 /// so reduction (rather than a canonical decode) is required.
 fn scalar_from_le(bytes: &[u8; 32]) -> Scalar {
-    let mut wide = [0u8; 64];
+    // `bytes` may be a secret scalar, so the widened copy is wiped on return
+    // (the `Scalar` wipes itself).
+    let mut wide = Zeroizing::new([0u8; 64]);
     wide[..32].copy_from_slice(bytes);
     Scalar::from_bytes_mod_order(&wide)
 }
