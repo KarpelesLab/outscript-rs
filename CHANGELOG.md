@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/KarpelesLab/outscript-rs/compare/v0.1.3...v0.2.0) - 2026-09-17
+
+### Other
+
+- make SolanaTx and SolanaTxConfig non_exhaustive
+- support v1 transactions (SIMD-0385)
+- Feature-gate chains so each pulls in only its curve (breaking)
+- Bump purecrypto to 0.9
+- Unify the domain error types into one outscript::Error
+- Replace String errors with typed errors (Cardano, Solana)
+- Replace String errors with typed errors (addresses, scripts, EVM, Bitcoin)
+- cross-check against BtcTx signing, add BtcTx::to_psbt, docs
+- PSBT (BIP-174) support without alloc
+
 ## [0.1.3](https://github.com/KarpelesLab/outscript-rs/compare/v0.1.2...v0.1.3) - 2026-09-15
 
 ### Other
