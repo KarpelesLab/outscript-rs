@@ -121,6 +121,8 @@ pub mod script;
 pub mod solana;
 #[cfg(feature = "solana")]
 pub mod solana_addr;
+#[cfg(feature = "bitcoin")]
+pub mod taproot;
 
 #[cfg(all(feature = "alloc", feature = "bitcoin"))]
 pub mod btctx;

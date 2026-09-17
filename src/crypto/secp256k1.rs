@@ -262,14 +262,34 @@ impl SecpPrivateKey {
         der_encode(&r, &s)
     }
 
+    /// The 32-byte x-only public key (BIP-340), as used for taproot internal
+    /// keys and tapscript `OP_CHECKSIG`.
+    pub fn xonly_public_key(&self) -> [u8; 32] {
+        let comp = self.public_key().serialize_compressed();
+        let mut x_only = [0u8; 32];
+        x_only.copy_from_slice(&comp[1..]);
+        x_only
+    }
+
     /// BIP-341 key-path taproot signing: applies the taproot tweak to this key
     /// (empty merkle root) and produces a 64-byte BIP-340 Schnorr signature
     /// over `sighash`. Uses deterministic (zero) auxiliary randomness.
     pub fn sign_taproot(&self, sighash: &[u8; 32]) -> Result<[u8; 64], Error> {
+        self.sign_taproot_with_root(sighash, None)
+    }
+
+    /// BIP-341 key-path taproot signing for an output that commits to a
+    /// script tree: like [`sign_taproot`](Self::sign_taproot), with the tweak
+    /// taken over `merkle_root` (`None` for a key-path-only output).
+    pub fn sign_taproot_with_root(
+        &self,
+        sighash: &[u8; 32],
+        merkle_root: Option<&[u8; 32]>,
+    ) -> Result<[u8; 64], Error> {
         let pub_bytes = self.public_key().serialize_compressed();
         let mut x_only = [0u8; 32];
         x_only.copy_from_slice(&pub_bytes[1..]);
-        let (_, parity, tweak) = taproot_tweak_full(&x_only)?;
+        let (_, parity, tweak) = taproot_tweak_full(&x_only, merkle_root)?;
 
         // d' = d if internal P.y even else n-d
         let mut d = if pub_bytes[0] == 0x03 {
@@ -283,6 +303,14 @@ impl SecpPrivateKey {
             d = d.negate();
         }
         bip340_sign_scalar(&d, sighash, &[0u8; 32])
+    }
+
+    /// BIP-340 Schnorr signing with this key as is (no taproot tweak), as
+    /// needed for a tapscript `OP_CHECKSIG` against
+    /// [`xonly_public_key`](Self::xonly_public_key). Uses deterministic (zero)
+    /// auxiliary randomness.
+    pub fn sign_schnorr(&self, msg: &[u8; 32]) -> Result<[u8; 64], Error> {
+        bip340_sign_scalar(&self.d, msg, &[0u8; 32])
     }
 }
 
@@ -493,14 +521,22 @@ pub fn tagged_hash(tag: &str, parts: &[&[u8]]) -> [u8; 32] {
     h.finalize()
 }
 
-fn taproot_tweak_full(internal_xonly: &[u8; 32]) -> Result<([u8; 32], u8, [u8; 32]), Error> {
+fn taproot_tweak_full(
+    internal_xonly: &[u8; 32],
+    merkle_root: Option<&[u8; 32]>,
+) -> Result<([u8; 32], u8, [u8; 32]), Error> {
     // lift_x: even-Y point with this x coordinate.
     let mut compressed = [0u8; 33];
     compressed[0] = 0x02;
     compressed[1..].copy_from_slice(internal_xonly);
     let p_point = AffinePoint::from_sec1(&compressed).map_err(|_| Error::Malformed)?;
 
-    let t_bytes = tagged_hash("TapTweak", &[internal_xonly]);
+    // t = tagged_hash("TapTweak", P.x || merkle_root), with no root for a
+    // key-path-only output
+    let t_bytes = match merkle_root {
+        Some(root) => tagged_hash("TapTweak", &[internal_xonly, root]),
+        None => tagged_hash("TapTweak", &[internal_xonly]),
+    };
     let t = Scalar::from_bytes_be(&t_bytes).map_err(|_| Error::InvalidKey)?;
 
     let q = p_point
@@ -516,7 +552,19 @@ fn taproot_tweak_full(internal_xonly: &[u8; 32]) -> Result<([u8; 32], u8, [u8; 3
 /// 32-byte x-only internal public key, returning the tweaked x-only output key
 /// and the parity (0 if Q.y even, 1 if odd).
 pub fn taproot_tweak(internal_xonly: &[u8; 32]) -> Result<([u8; 32], u8), Error> {
-    let (xonly, parity, _) = taproot_tweak_full(internal_xonly)?;
+    taproot_tweak_with_root(internal_xonly, None)
+}
+
+/// Applies the BIP-341 taproot tweak to a 32-byte x-only internal public key,
+/// committing to the script tree with the given `merkle_root` (`None` for a
+/// key-path-only output, as in [`taproot_tweak`]). Returns the tweaked x-only
+/// output key and its parity (0 if Q.y is even, 1 if odd), which a script-path
+/// control block records.
+pub fn taproot_tweak_with_root(
+    internal_xonly: &[u8; 32],
+    merkle_root: Option<&[u8; 32]>,
+) -> Result<([u8; 32], u8), Error> {
+    let (xonly, parity, _) = taproot_tweak_full(internal_xonly, merkle_root)?;
     Ok((xonly, parity))
 }
 
