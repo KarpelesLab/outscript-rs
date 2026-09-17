@@ -783,15 +783,39 @@ fn psbt_taproot_sighash_all() {
         sig[..64].try_into().unwrap()
     ));
 
-    // unsupported sighash types are refused rather than mis-signed
+    // SIGHASH_NONE commits to no outputs: a different digest, signed as such
     let none = Psbt::parse(&psbt)
         .unwrap()
         .set_input_record_to_vec(0, &[0x03], &2u32.to_le_bytes())
         .unwrap();
-    assert_eq!(
-        Psbt::parse(&none).unwrap().sign_to_vec(&k).err(),
-        Some(crate::psbt::Error::UnsupportedSighash)
-    );
+    let (signed, n) = Psbt::parse(&none).unwrap().sign_to_vec(&k).unwrap();
+    assert_eq!(n, 1);
+    let signed = Psbt::parse(&signed).unwrap();
+    let sig = signed.input(0).unwrap().tap_key_sig().unwrap();
+    assert_eq!((sig.len(), sig[64]), (65, 0x02));
+    let mid = tx.taproot_midstate(&prevouts).unwrap();
+    let none_msg = tx
+        .taproot_sighash(&mid, &prevouts, 0, &crate::btcraw::TapSighash::new(0x02))
+        .unwrap();
+    assert_ne!(none_msg, msg);
+    assert!(bip340_verify(
+        &output_key,
+        &none_msg,
+        sig[..64].try_into().unwrap()
+    ));
+
+    // undefined sighash types are refused rather than mis-signed
+    for bad in [0x04u32, 0x80, 0x84, 0x100] {
+        let psbt = Psbt::parse(&psbt)
+            .unwrap()
+            .set_input_record_to_vec(0, &[0x03], &bad.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            Psbt::parse(&psbt).unwrap().sign_to_vec(&k).err(),
+            Some(crate::psbt::Error::UnsupportedSighash),
+            "{bad:#x}"
+        );
+    }
 }
 
 /// The BIP-341 wallet test vectors for key-path spending: every hash type

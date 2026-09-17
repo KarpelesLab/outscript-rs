@@ -3,13 +3,16 @@
 
 use super::{Error, MapEdit, MapLoc, NewRecord, Psbt, input, write_map};
 use crate::btcraw::{
-    self, RawTxIn, RawTxOut, SegwitV0Midstate, TaprootMidstate, legacy_sighash_of,
-    segwit_v0_midstate_of, taproot_midstate_of,
+    self, RawTxIn, RawTxOut, SegwitV0Midstate, TapScriptPath, TapSighash, TaprootMidstate,
+    legacy_sighash_of, segwit_v0_midstate_of, taproot_midstate_of, taproot_sighash_of,
 };
-use crate::crypto::secp256k1::{DerSignature, SecpPrivateKey, SecpPublicKey, taproot_tweak};
+use crate::crypto::secp256k1::{
+    DerSignature, SecpPrivateKey, SecpPublicKey, taproot_tweak_with_root,
+};
 use crate::hash::{hash160, sha256_once};
 use crate::inline::InlineBytes;
 use crate::pushbytes::parse_push_bytes;
+use crate::taproot::{ControlBlock, TAPSCRIPT_LEAF_VERSION};
 
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
@@ -29,6 +32,26 @@ pub trait PsbtSigner {
     fn sign_taproot(&self, _sighash: &[u8; 32]) -> Result<[u8; 64], SignerError> {
         Err(SignerError)
     }
+    /// A BIP-340 key-path signature with the key tweaked for the script tree
+    /// with `merkle_root` (`None` for an empty tree, as
+    /// [`sign_taproot`](Self::sign_taproot)). By default only the empty tree
+    /// is supported, through `sign_taproot`.
+    fn sign_taproot_with_root(
+        &self,
+        sighash: &[u8; 32],
+        merkle_root: Option<&[u8; 32]>,
+    ) -> Result<[u8; 64], SignerError> {
+        match merkle_root {
+            None => self.sign_taproot(sighash),
+            Some(_) => Err(SignerError),
+        }
+    }
+    /// A BIP-340 signature over a taproot script-path `sighash` with the key
+    /// as is (no tweak), for a tapscript `OP_CHECKSIG` against the x-only
+    /// [`public_key`](Self::public_key). Unsupported by default.
+    fn sign_schnorr(&self, _sighash: &[u8; 32]) -> Result<[u8; 64], SignerError> {
+        Err(SignerError)
+    }
 }
 
 impl PsbtSigner for SecpPrivateKey {
@@ -40,6 +63,16 @@ impl PsbtSigner for SecpPrivateKey {
     }
     fn sign_taproot(&self, sighash: &[u8; 32]) -> Result<[u8; 64], SignerError> {
         SecpPrivateKey::sign_taproot(self, sighash).map_err(|_| SignerError)
+    }
+    fn sign_taproot_with_root(
+        &self,
+        sighash: &[u8; 32],
+        merkle_root: Option<&[u8; 32]>,
+    ) -> Result<[u8; 64], SignerError> {
+        SecpPrivateKey::sign_taproot_with_root(self, sighash, merkle_root).map_err(|_| SignerError)
+    }
+    fn sign_schnorr(&self, sighash: &[u8; 32]) -> Result<[u8; 64], SignerError> {
+        SecpPrivateKey::sign_schnorr(self, sighash).map_err(|_| SignerError)
     }
 }
 
@@ -166,9 +199,56 @@ fn key_in_script<'k>(script: &[u8], comp: &'k [u8; 33], uncomp: &'k [u8; 65]) ->
 // --- signing ---
 
 /// A signature record to add to an input map.
+#[derive(Clone, Copy, Default)]
 pub(crate) struct Signed {
     key: InlineBytes<66>,
     value: InlineBytes<73>,
+}
+
+/// The most taproot leaves one signing call signs per input. Leaves that
+/// already carry this key's signature are skipped, so signing again covers
+/// the rest.
+pub(crate) const MAX_LEAF_SIGS: usize = 8;
+
+/// The signature records one signer adds to one input: an ECDSA partial
+/// signature, or a taproot key-path signature and/or script-path signatures.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SignedSet {
+    items: [Signed; 1 + MAX_LEAF_SIGS],
+    len: usize,
+}
+
+impl SignedSet {
+    fn push(&mut self, signed: Signed) {
+        self.items[self.len] = signed;
+        self.len += 1;
+    }
+    fn is_full(&self) -> bool {
+        self.len == self.items.len()
+    }
+    /// A taproot signature record: the 64-byte signature, followed by the
+    /// sighash type unless it is `SIGHASH_DEFAULT`.
+    fn push_schnorr(&mut self, key: &[&[u8]], sig: &[u8; 64], hash_type: u8) {
+        let mut signed = Signed::default();
+        for part in key {
+            signed
+                .key
+                .extend_from_slice(part)
+                .expect("fits a 65-byte key");
+        }
+        signed.value.extend_from_slice(sig).expect("fits");
+        if hash_type != 0 {
+            signed.value.push(hash_type).expect("fits");
+        }
+        self.push(signed);
+    }
+    fn records(&self) -> [NewRecord<'_>; 1 + MAX_LEAF_SIGS] {
+        core::array::from_fn(|i| NewRecord {
+            key: &self.items[i].key,
+            key_tail: &[],
+            value: &self.items[i].value,
+        })
+    }
 }
 
 struct SignCtx<'p, 'a> {
@@ -199,11 +279,22 @@ impl<'a> SignCtx<'_, 'a> {
         })
     }
 
-    /// Signs input `index` if the signer's key is involved.
-    fn sign_input(
+    /// Signs input `index` wherever the signer's key is involved (an empty
+    /// set if it is not).
+    fn sign_input(&mut self, index: usize, signer: &dyn PsbtSigner) -> Result<SignedSet, Error> {
+        let mut set = SignedSet::default();
+        if let Some(signed) = self.sign_input_ecdsa_or_taproot(index, signer, &mut set)? {
+            set.push(signed);
+        }
+        Ok(set)
+    }
+
+    /// Taproot signatures go into `set`; an ECDSA signature is returned.
+    fn sign_input_ecdsa_or_taproot(
         &mut self,
         index: usize,
         signer: &dyn PsbtSigner,
+        set: &mut SignedSet,
     ) -> Result<Option<Signed>, Error> {
         let psbt = self.psbt;
         let inp = psbt.input(index).ok_or(Error::InputIndex)?;
@@ -217,30 +308,82 @@ impl<'a> SignCtx<'_, 'a> {
 
         if let Kind::P2tr(output_key) = res.kind {
             let x_only: [u8; 32] = comp[1..].try_into().unwrap();
-            if inp.tap_merkle_root().is_some()
-                || inp.tap_internal_key().is_some_and(|k| k != x_only)
-                || taproot_tweak(&x_only).map(|(k, _)| k).ok() != Some(output_key)
-            {
-                return Ok(None);
-            }
             let hash_type = match inp.sighash_type() {
                 None => 0,
-                Some(t @ (0 | 1)) => t as u8,
+                Some(t @ (0x00..=0x03 | 0x81..=0x83)) => t as u8,
                 Some(_) => return Err(Error::UnsupportedSighash),
             };
-            let sighash = self
-                .taproot()?
-                .key_spend_sighash_with_type(index, hash_type)
-                .map_err(|_| Error::InputIndex)?;
-            let sig = signer.sign_taproot(&sighash).map_err(|_| Error::Signer)?;
-            let mut value = InlineBytes::from_slice(&sig).unwrap();
-            if hash_type != 0 {
-                value.push(hash_type).unwrap();
+            let mut signer_failed = false;
+
+            // key path: the signer holds the internal key, and tweaking it with
+            // the input's merkle root (if any) gives the output key
+            let root = inp.tap_merkle_root();
+            if inp.tap_internal_key().is_none_or(|k| k == x_only)
+                && taproot_tweak_with_root(&x_only, root.as_ref())
+                    .map(|(k, _)| k)
+                    .ok()
+                    == Some(output_key)
+            {
+                let mid = self.taproot()?;
+                let sighash = taproot_sighash_of(
+                    &psbt.unsigned_tx(),
+                    &mid,
+                    index,
+                    res.utxo,
+                    &TapSighash::new(hash_type),
+                )?;
+                match signer.sign_taproot_with_root(&sighash, root.as_ref()) {
+                    Ok(sig) => set.push_schnorr(&[&[input::TAP_KEY_SIG as u8]], &sig, hash_type),
+                    Err(_) => signer_failed = true,
+                }
             }
-            return Ok(Some(Signed {
-                key: InlineBytes::from_slice(&[input::TAP_KEY_SIG as u8]).unwrap(),
-                value,
-            }));
+
+            // script path: every proven tapscript leaf that pushes the key and
+            // is not signed by it yet
+            for leaf in inp.tap_leaf_scripts() {
+                if set.is_full() {
+                    break;
+                }
+                if leaf.leaf_version != TAPSCRIPT_LEAF_VERSION {
+                    continue;
+                }
+                let mut involved = false;
+                for_each_push(leaf.script, |data| involved |= data == x_only);
+                if !involved {
+                    continue;
+                }
+                let Ok(cb) = ControlBlock::parse(leaf.control_block) else {
+                    continue;
+                };
+                if cb.leaf_version != leaf.leaf_version || !cb.verify(leaf.script, &output_key) {
+                    continue;
+                }
+                let leaf_hash = cb.leaf_hash(leaf.script);
+                if inp.tap_script_sig(&x_only, &leaf_hash).is_some() {
+                    continue;
+                }
+                let mid = self.taproot()?;
+                let sighash = taproot_sighash_of(
+                    &psbt.unsigned_tx(),
+                    &mid,
+                    index,
+                    res.utxo,
+                    &TapSighash::new(hash_type).with_script_path(TapScriptPath::new(leaf_hash)),
+                )?;
+                match signer.sign_schnorr(&sighash) {
+                    Ok(sig) => set.push_schnorr(
+                        &[&[input::TAP_SCRIPT_SIG as u8], &x_only, &leaf_hash],
+                        &sig,
+                        hash_type,
+                    ),
+                    Err(_) => signer_failed = true,
+                }
+            }
+            // a signer that cannot do one of the two still signs what it can
+            if set.len == 0 && signer_failed {
+                return Err(Error::Signer);
+            }
+            return Ok(None);
         }
 
         let p2wpkh_code;
@@ -297,13 +440,25 @@ fn skippable(e: Error) -> bool {
 impl<'a> Psbt<'a> {
     /// An upper bound on the size of a PSBT produced by signing this one.
     pub fn sign_len_bound(&self) -> usize {
-        // per input: key length + 66-byte key + value length + 73-byte value
-        self.len() + self.unsigned_tx().input_count() * 141
+        // per input: key length + 66-byte key + value length + 73-byte value,
+        // plus a 65-byte key and 65-byte signature per taproot leaf signed
+        let leaf_sigs: usize = self
+            .inputs()
+            .map(|i| i.tap_leaf_scripts().count().min(MAX_LEAF_SIGS))
+            .sum();
+        self.len() + self.unsigned_tx().input_count() * 141 + leaf_sigs * 132
     }
 
     /// Signs every input `signer`'s key is involved in, writing the updated
     /// PSBT into `out` ([`Psbt::sign_len_bound`] bytes suffice). Returns the
     /// length written and the number of inputs signed.
+    ///
+    /// Taproot inputs are signed on the key path when `signer` holds the
+    /// internal key (tweaked with the input's merkle root, if any), and on the
+    /// script path for each tapscript leaf that pushes its x-only key and has a
+    /// valid control block, up to 8 leaves per input and call; leaves the key
+    /// already signed are skipped. The input's sighash type is honoured (any
+    /// BIP-341 type for taproot, `SIGHASH_ALL` otherwise).
     ///
     /// Inputs that are already finalized, lack the UTXO/script data to sign,
     /// or do not involve the key are left unchanged. An input whose data fails
@@ -323,16 +478,13 @@ impl<'a> Psbt<'a> {
         let n = self.emit(out, &mut |loc, map, s| {
             if let MapLoc::Input(i) = loc {
                 match ctx.sign_input(i, signer) {
-                    Ok(Some(signed)) => {
+                    Ok(set) if set.len > 0 => {
                         signed_count += 1;
-                        let add = [NewRecord {
-                            key: &signed.key,
-                            value: &signed.value,
-                        }];
-                        write_map(s, map, &MapEdit::add(&add));
+                        let add = set.records();
+                        write_map(s, map, &MapEdit::add(&add[..set.len]));
                         return Ok(());
                     }
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(e) if skippable(e) => {}
                     Err(e) => return Err(e),
                 }
@@ -357,14 +509,12 @@ impl<'a> Psbt<'a> {
             segwit: None,
             taproot: None,
         };
-        let signed = ctx
-            .sign_input(index, signer)?
-            .ok_or(Error::KeyNotInvolved)?;
-        let add = [NewRecord {
-            key: &signed.key,
-            value: &signed.value,
-        }];
-        self.edit_map(out, MapLoc::Input(index), MapEdit::add(&add))
+        let set = ctx.sign_input(index, signer)?;
+        if set.len == 0 {
+            return Err(Error::KeyNotInvolved);
+        }
+        let add = set.records();
+        self.edit_map(out, MapLoc::Input(index), MapEdit::add(&add[..set.len]))
     }
 
     /// [`Psbt::sign_to_slice`] into a new vector.

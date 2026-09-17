@@ -7,6 +7,7 @@ use super::{
 use crate::hash::hash160;
 use crate::pushbytes::push_bytes_len;
 use crate::sink::{Counter, Sink, SliceSink};
+use crate::taproot::{ControlBlock, TAPSCRIPT_LEAF_VERSION};
 
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
@@ -150,6 +151,91 @@ fn satisfy<'a>(inp: &PsbtInput<'a>, t: &Template<'a>) -> Option<Stack<'a>> {
     Some(st)
 }
 
+/// The tapscript key templates: `<key> OP_CHECKSIG`, and the BIP-342
+/// `multi_a` form `<k1> OP_CHECKSIG <k2> OP_CHECKSIGADD ... <m> OP_NUMEQUAL`.
+/// Returns the threshold and the 32-byte keys in script order.
+fn tap_template(script: &[u8]) -> Option<(usize, Stack<'_>)> {
+    let mut keys = Stack::EMPTY;
+    let mut rest = script;
+    loop {
+        // a 32-byte push, then CHECKSIG for the first key and CHECKSIGADD after
+        let (key, tail) = match rest {
+            [0x20, tail @ ..] => tail.split_at_checked(32)?,
+            _ => return None,
+        };
+        let (&op, tail) = tail.split_first()?;
+        if op != if keys.len == 0 { 0xac } else { 0xba } {
+            return None;
+        }
+        // the witness also holds the script and the control block
+        if keys.len == 18 {
+            return None;
+        }
+        keys.push(key);
+        rest = tail;
+        let m = match rest {
+            [] if keys.len == 1 => 1,
+            [m @ 0x51..=0x60, 0x9c] => (m - 0x50) as usize,
+            [0x01, m @ 17..=0x7f, 0x9c] => *m as usize,
+            _ => continue,
+        };
+        return (1..=keys.len).contains(&m).then_some((m, keys));
+    }
+}
+
+/// The witness spending a taproot input through the script path: the first
+/// provable tapscript leaf (preferring the shortest control block) whose
+/// template has enough signatures.
+fn tap_script_witness<'a>(inp: &PsbtInput<'a>, output_key: &[u8; 32]) -> Option<Stack<'a>> {
+    let mut best: Option<(usize, Stack<'a>)> = None;
+    for leaf in inp.tap_leaf_scripts() {
+        if leaf.leaf_version != TAPSCRIPT_LEAF_VERSION
+            || best
+                .as_ref()
+                .is_some_and(|(len, _)| *len <= leaf.control_block.len())
+        {
+            continue;
+        }
+        let Some((m, keys)) = tap_template(leaf.script) else {
+            continue;
+        };
+        let Ok(cb) = ControlBlock::parse(leaf.control_block) else {
+            continue;
+        };
+        if cb.leaf_version != leaf.leaf_version || !cb.verify(leaf.script, output_key) {
+            continue;
+        }
+        let leaf_hash = cb.leaf_hash(leaf.script);
+        let sig_of = |key: &[u8]| {
+            inp.tap_script_sigs()
+                .find(|(k, l, _)| *k == key && *l == leaf_hash)
+                .map(|(_, _, sig)| sig)
+        };
+        // exactly `m` signatures, from the first keys that have one; the
+        // other keys get an empty vector
+        let mut used = [false; 18];
+        let mut count = 0;
+        for (i, key) in keys.items().iter().enumerate() {
+            if count < m && sig_of(key).is_some() {
+                used[i] = true;
+                count += 1;
+            }
+        }
+        if count < m {
+            continue;
+        }
+        // the first key's signature is consumed first, so it sits on top
+        let mut st = Stack::EMPTY;
+        for (i, key) in keys.items().iter().enumerate().rev() {
+            st.push(if used[i] { sig_of(key)? } else { &[] });
+        }
+        st.push(leaf.script);
+        st.push(leaf.control_block);
+        best = Some((leaf.control_block.len(), st));
+    }
+    best.map(|(_, st)| st)
+}
+
 struct Final<'a> {
     script_sig: ScriptSigValue<'a>,
     witness: Stack<'a>,
@@ -183,9 +269,13 @@ fn build_final<'a>(psbt: &Psbt<'a>, index: usize) -> Result<Option<Final<'a>>, E
             st.push(ws);
             witness = st;
         }
-        Kind::P2tr(_) => match inp.tap_key_sig() {
+        // the key path is the cheapest spend; otherwise a signed leaf
+        Kind::P2tr(output_key) => match inp.tap_key_sig() {
             Some(sig) => witness.push(sig),
-            None => return Ok(None),
+            None => match tap_script_witness(&inp, &output_key) {
+                Some(st) => witness = st,
+                None => return Ok(None),
+            },
         },
     }
     Ok(Some(Final {
@@ -205,10 +295,12 @@ impl<'a> Psbt<'a> {
                         *finalized += 1;
                         let witness = WitnessValue(fin.witness);
                         let sig_rec = NewRecord {
+                            key_tail: &[],
                             key: &[input::FINAL_SCRIPTSIG as u8],
                             value: &fin.script_sig,
                         };
                         let wit_rec = NewRecord {
+                            key_tail: &[],
                             key: &[input::FINAL_SCRIPTWITNESS as u8],
                             value: &witness,
                         };
@@ -249,8 +341,11 @@ impl<'a> Psbt<'a> {
     /// the length written and the number of inputs finalized by this call.
     ///
     /// Supports P2PKH, P2PK and `m`-of-`n` multisig scripts (bare, P2SH,
-    /// P2WSH and P2SH-P2WSH), P2WPKH (native and P2SH-nested) and taproot key
-    /// path. Finalized inputs keep only their UTXO and unknown fields.
+    /// P2WSH and P2SH-P2WSH), P2WPKH (native and P2SH-nested), and taproot:
+    /// the key path when its signature is present, else the script path
+    /// through a `<key> OP_CHECKSIG` or `multi_a` leaf (up to 18 keys) with
+    /// enough signatures. Finalized inputs keep only their UTXO and unknown
+    /// fields.
     pub fn finalize_to_slice(&self, out: &mut [u8]) -> Result<(usize, usize), Error> {
         let mut sink = SliceSink::new(out);
         let mut count = 0;

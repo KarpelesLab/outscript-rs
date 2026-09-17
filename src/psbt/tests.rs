@@ -536,3 +536,381 @@ fn rejection_reasons() {
         );
     }
 }
+
+// --- taproot script trees (BIP-341/342/371) ---
+
+mod taproot_tree {
+    use super::*;
+    use crate::btcraw::{
+        PrevOut, RawTx, RawTxIn, RawTxOut, TapScriptPath, TapSighash, taproot_midstate_of,
+        taproot_sighash_of,
+    };
+    use crate::crypto::secp256k1::{bip340_verify, taproot_tweak_with_root};
+    use crate::taproot::{
+        MAX_CONTROL_BLOCK_LEN, TapLeaf, control_block_to_slice, p2tr_script_pubkey, tap_tree_root,
+        tapleaf_hash,
+    };
+
+    fn key(b: u8) -> SecpPrivateKey {
+        SecpPrivateKey::from_bytes(&[b; 32]).unwrap()
+    }
+
+    /// `<key> OP_CHECKSIG`
+    fn single_leaf(k: &SecpPrivateKey) -> [u8; 34] {
+        let mut s = [0u8; 34];
+        s[0] = 0x20;
+        s[1..33].copy_from_slice(&k.xonly_public_key());
+        s[33] = 0xac;
+        s
+    }
+
+    /// `<k1> OP_CHECKSIG <k2> OP_CHECKSIGADD <k3> OP_CHECKSIGADD OP_2 OP_NUMEQUAL`
+    fn multi_a_leaf(keys: [&SecpPrivateKey; 3]) -> [u8; 104] {
+        let mut s = [0u8; 104];
+        for (i, k) in keys.iter().enumerate() {
+            s[34 * i] = 0x20;
+            s[34 * i + 1..34 * i + 33].copy_from_slice(&k.xonly_public_key());
+            s[34 * i + 33] = if i == 0 { 0xac } else { 0xba };
+        }
+        s[102..].copy_from_slice(&[0x52, 0x9c]);
+        s
+    }
+
+    /// Reads a serialized witness: item count, then length-prefixed items.
+    fn witness_items(w: &[u8]) -> ([&[u8]; 8], usize) {
+        let mut items: [&[u8]; 8] = [&[]; 8];
+        let count = w[0] as usize;
+        let mut pos = 1;
+        for item in items.iter_mut().take(count) {
+            let (len, n) = crate::BtcVarInt::decode(&w[pos..]).unwrap();
+            pos += n;
+            *item = &w[pos..pos + len.0 as usize];
+            pos += len.0 as usize;
+        }
+        assert_eq!(pos, w.len());
+        (items, count)
+    }
+
+    struct Fixture {
+        buf: [u8; 2048],
+        len: usize,
+        spk: [u8; 34],
+        output_key: [u8; 32],
+        root: [u8; 32],
+        single: [u8; 34],
+        multi: [u8; 104],
+    }
+
+    const AMOUNT: u64 = 100_000;
+    const DEST: [u8; 22] = [
+        0x00, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    ];
+
+    fn tx_parts() -> ([RawTxIn<'static>; 1], [RawTxOut<'static>; 1]) {
+        (
+            [RawTxIn {
+                txid: [7u8; 32],
+                vout: 1,
+                sequence: 0xffff_fffd,
+                ..Default::default()
+            }],
+            [RawTxOut {
+                amount: 90_000,
+                script: &DEST,
+            }],
+        )
+    }
+
+    /// A PSBT spending a taproot output with internal key `key(1)` and the
+    /// tree `[single(key 2), multi_a 2-of-3 (keys 3, 4, 5)]`, fully updated.
+    fn fixture(sighash_type: Option<u32>) -> Fixture {
+        let single = single_leaf(&key(2));
+        let multi = multi_a_leaf([&key(3), &key(4), &key(5)]);
+        let leaves = [TapLeaf::new(1, &single), TapLeaf::new(1, &multi)];
+        let internal = key(1).xonly_public_key();
+        let root = tap_tree_root(&leaves).unwrap();
+        let spk = p2tr_script_pubkey(&internal, Some(&root)).unwrap();
+        let (output_key, _) = taproot_tweak_with_root(&internal, Some(&root)).unwrap();
+
+        let (inputs, outputs) = tx_parts();
+        let tx = RawTx {
+            version: 2,
+            inputs: &inputs,
+            outputs: &outputs,
+            locktime: 0,
+        };
+        let (mut a, mut b) = ([0u8; 2048], [0u8; 2048]);
+        let mut n = Psbt::create_to_slice(&tx, &mut a).unwrap();
+        macro_rules! step {
+            ($f:expr) => {{
+                n = $f(&Psbt::parse(&a[..n]).unwrap(), &mut b[..]).unwrap();
+                a[..n].copy_from_slice(&b[..n]);
+            }};
+        }
+        step!(|p: &Psbt<'_>, o: &mut [u8]| p.set_witness_utxo(0, AMOUNT, &spk, o));
+        step!(|p: &Psbt<'_>, o: &mut [u8]| p.set_tap_internal_key(0, &internal, o));
+        step!(|p: &Psbt<'_>, o: &mut [u8]| p.set_tap_merkle_root(0, &root, o));
+        for i in 0..2 {
+            let mut cb = [0u8; MAX_CONTROL_BLOCK_LEN];
+            let cn = control_block_to_slice(&internal, &leaves, i, &mut cb).unwrap();
+            step!(|p: &Psbt<'_>, o: &mut [u8]| p.add_tap_leaf_script(
+                0,
+                &cb[..cn],
+                leaves[i].script,
+                o
+            ));
+        }
+        if let Some(t) = sighash_type {
+            step!(|p: &Psbt<'_>, o: &mut [u8]| p.set_sighash_type(0, t, o));
+        }
+        Fixture {
+            buf: a,
+            len: n,
+            spk,
+            output_key,
+            root,
+            single,
+            multi,
+        }
+    }
+
+    impl Fixture {
+        fn psbt(&self) -> Psbt<'_> {
+            Psbt::parse(&self.buf[..self.len]).unwrap()
+        }
+        fn sign(&mut self, k: &SecpPrivateKey) -> usize {
+            let mut out = [0u8; 2048];
+            let p = self.psbt();
+            assert!(p.sign_len_bound() <= out.len());
+            let (n, count) = p.sign_to_slice(k, &mut out).unwrap();
+            assert!(n <= p.sign_len_bound());
+            self.buf[..n].copy_from_slice(&out[..n]);
+            self.len = n;
+            count
+        }
+        fn finalize(&mut self) -> usize {
+            let mut out = [0u8; 2048];
+            let (n, count) = self.psbt().finalize_to_slice(&mut out).unwrap();
+            assert_eq!(n, self.psbt().finalized_len().unwrap());
+            self.buf[..n].copy_from_slice(&out[..n]);
+            self.len = n;
+            count
+        }
+        /// The sighash the network would check for this spend.
+        fn sighash(&self, opts: &TapSighash<'_>) -> [u8; 32] {
+            let (inputs, outputs) = tx_parts();
+            let tx = RawTx {
+                version: 2,
+                inputs: &inputs,
+                outputs: &outputs,
+                locktime: 0,
+            };
+            let prevout = PrevOut {
+                amount: AMOUNT,
+                script: &self.spk,
+            };
+            let mid = taproot_midstate_of(&tx, core::iter::once(prevout)).unwrap();
+            taproot_sighash_of(&tx, &mid, 0, prevout, opts).unwrap()
+        }
+    }
+
+    #[test]
+    fn updater_records_roundtrip() {
+        let f = fixture(None);
+        let inp = f.psbt().input(0).unwrap();
+        assert_eq!(inp.tap_merkle_root(), Some(f.root));
+        assert_eq!(inp.tap_internal_key(), Some(key(1).xonly_public_key()));
+        assert_eq!(inp.tap_leaf_scripts().count(), 2);
+        for leaf in inp.tap_leaf_scripts() {
+            assert_eq!(leaf.leaf_version, 0xc0);
+            assert_eq!(leaf.control_block.len(), 65);
+            let cb = crate::taproot::ControlBlock::parse(leaf.control_block).unwrap();
+            assert!(cb.verify(leaf.script, &f.output_key));
+        }
+        assert!(
+            inp.tap_leaf_scripts()
+                .any(|l| l.script == f.single && l.control_block[0] & 0xfe == 0xc0)
+        );
+        // a malformed control block is refused
+        let mut out = [0u8; 2048];
+        assert_eq!(
+            f.psbt()
+                .add_tap_leaf_script(0, &[0xc0; 40], &f.single, &mut out),
+            Err(Error::InvalidRecordKey)
+        );
+    }
+
+    #[test]
+    fn key_path_over_a_script_tree() {
+        let mut f = fixture(None);
+        // an unrelated key signs nothing
+        assert_eq!(f.sign(&key(9)), 0);
+        assert_eq!(f.sign(&key(1)), 1);
+        let inp = f.psbt().input(0).unwrap();
+        let sig: [u8; 64] = inp.tap_key_sig().unwrap().try_into().unwrap();
+        assert!(bip340_verify(
+            &f.output_key,
+            &f.sighash(&TapSighash::new(0)),
+            &sig
+        ));
+        assert_eq!(inp.tap_script_sigs().count(), 0);
+
+        assert_eq!(f.finalize(), 1);
+        let inp = f.psbt().input(0).unwrap();
+        let (items, count) = witness_items(inp.final_script_witness().unwrap());
+        assert_eq!((count, items[0]), (1, &sig[..]));
+        // the tap fields are gone once finalized
+        assert_eq!(inp.tap_leaf_scripts().count(), 0);
+        assert_eq!(inp.tap_merkle_root(), None);
+        let mut tx = [0u8; 512];
+        let n = f.psbt().extract_tx_to_slice(&mut tx).unwrap();
+        assert!(tx[..n].windows(64).any(|w| w == sig));
+    }
+
+    #[test]
+    fn script_path_single_key_leaf() {
+        let mut f = fixture(None);
+        assert_eq!(f.sign(&key(2)), 1);
+        let inp = f.psbt().input(0).unwrap();
+        assert!(inp.tap_key_sig().is_none());
+        let leaf_hash = tapleaf_hash(0xc0, &f.single);
+        let sig: [u8; 64] = inp
+            .tap_script_sig(&key(2).xonly_public_key(), &leaf_hash)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let opts = TapSighash::new(0).with_script_path(TapScriptPath::new(leaf_hash));
+        assert!(bip340_verify(
+            &key(2).xonly_public_key(),
+            &f.sighash(&opts),
+            &sig
+        ));
+        // signing again adds nothing new
+        let before = f.len;
+        assert_eq!(f.sign(&key(2)), 0);
+        assert_eq!(f.len, before);
+
+        assert_eq!(f.finalize(), 1);
+        let inp = f.psbt().input(0).unwrap();
+        let (items, count) = witness_items(inp.final_script_witness().unwrap());
+        assert_eq!(count, 3);
+        assert_eq!(items[0], &sig[..]);
+        assert_eq!(items[1], &f.single[..]);
+        let cb = crate::taproot::ControlBlock::parse(items[2]).unwrap();
+        assert!(cb.verify(items[1], &f.output_key));
+        let mut tx = [0u8; 512];
+        f.psbt().extract_tx_to_slice(&mut tx).unwrap();
+    }
+
+    #[test]
+    fn script_path_multi_a_leaf() {
+        let mut f = fixture(None);
+        // one of two signatures is not enough
+        assert_eq!(f.sign(&key(5)), 1);
+        assert_eq!(f.finalize(), 0);
+        assert_eq!(f.sign(&key(3)), 1);
+        let leaf_hash = tapleaf_hash(0xc0, &f.multi);
+        let inp = f.psbt().input(0).unwrap();
+        assert_eq!(inp.tap_script_sigs().count(), 2);
+        let opts = TapSighash::new(0).with_script_path(TapScriptPath::new(leaf_hash));
+        let sighash = f.sighash(&opts);
+        let mut sigs = [[0u8; 64]; 2];
+        for (sig, k) in sigs.iter_mut().zip([key(3), key(5)]) {
+            *sig = inp
+                .tap_script_sig(&k.xonly_public_key(), &leaf_hash)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            assert!(bip340_verify(&k.xonly_public_key(), &sighash, sig));
+        }
+        // a third signature must not end up in the witness: NUMEQUAL wants 2
+        assert_eq!(f.sign(&key(4)), 1);
+
+        assert_eq!(f.finalize(), 1);
+        let inp = f.psbt().input(0).unwrap();
+        let (items, count) = witness_items(inp.final_script_witness().unwrap());
+        assert_eq!(count, 5);
+        // keys 3 and 4 sign (the first two with signatures); last key first
+        assert_eq!(items[0], &[] as &[u8]);
+        assert_eq!(items[1].len(), 64);
+        assert_eq!(items[2], &sigs[0][..]);
+        assert!(bip340_verify(
+            &key(4).xonly_public_key(),
+            &sighash,
+            items[1].try_into().unwrap()
+        ));
+        assert_eq!(items[3], &f.multi[..]);
+        assert!(
+            crate::taproot::ControlBlock::parse(items[4])
+                .unwrap()
+                .verify(items[3], &f.output_key)
+        );
+    }
+
+    #[test]
+    fn sighash_types_and_key_in_both_paths() {
+        // SINGLE|ANYONECANPAY: the type is committed to and appended
+        let mut f = fixture(Some(0x83));
+        assert_eq!(f.sign(&key(1)), 1);
+        assert_eq!(f.sign(&key(2)), 1);
+        let inp = f.psbt().input(0).unwrap();
+        let mut key_sig = [0u8; 65];
+        key_sig.copy_from_slice(inp.tap_key_sig().unwrap());
+        assert_eq!(key_sig[64], 0x83);
+        assert!(bip340_verify(
+            &f.output_key,
+            &f.sighash(&TapSighash::new(0x83)),
+            key_sig[..64].try_into().unwrap()
+        ));
+        let leaf_hash = tapleaf_hash(0xc0, &f.single);
+        let script_sig = inp
+            .tap_script_sig(&key(2).xonly_public_key(), &leaf_hash)
+            .unwrap();
+        assert_eq!((script_sig.len(), script_sig[64]), (65, 0x83));
+        let opts = TapSighash::new(0x83).with_script_path(TapScriptPath::new(leaf_hash));
+        assert!(bip340_verify(
+            &key(2).xonly_public_key(),
+            &f.sighash(&opts),
+            script_sig[..64].try_into().unwrap()
+        ));
+        // the key path wins at finalization
+        assert_eq!(f.finalize(), 1);
+        let inp = f.psbt().input(0).unwrap();
+        let (items, count) = witness_items(inp.final_script_witness().unwrap());
+        assert_eq!((count, items[0]), (1, &key_sig[..]));
+
+        let bad = fixture(Some(0x04));
+        let mut out = [0u8; 2048];
+        assert_eq!(
+            bad.psbt().sign_to_slice(&key(1), &mut out),
+            Err(Error::UnsupportedSighash)
+        );
+    }
+
+    /// An external signer that only knows BIP-86 key-path signing still
+    /// works for outputs without a script tree, and reports failure otherwise.
+    #[test]
+    fn signer_without_script_tree_support() {
+        struct Bip86Only(SecpPrivateKey);
+        impl PsbtSigner for Bip86Only {
+            fn public_key(&self) -> crate::crypto::secp256k1::SecpPublicKey {
+                self.0.public_key()
+            }
+            fn sign_ecdsa(
+                &self,
+                digest: &[u8; 32],
+            ) -> Result<crate::crypto::secp256k1::DerSignature, SignerError> {
+                Ok(self.0.sign_der(digest))
+            }
+            fn sign_taproot(&self, sighash: &[u8; 32]) -> Result<[u8; 64], SignerError> {
+                self.0.sign_taproot(sighash).map_err(|_| SignerError)
+            }
+        }
+        let f = fixture(None);
+        let mut out = [0u8; 2048];
+        assert_eq!(
+            f.psbt().sign_to_slice(&Bip86Only(key(1)), &mut out),
+            Err(Error::Signer)
+        );
+    }
+}

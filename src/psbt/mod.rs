@@ -830,7 +830,11 @@ impl<'a> Psbt<'a> {
         value: &[u8],
         out: &mut [u8],
     ) -> Result<usize, Error> {
-        let add = [NewRecord { key, value: &value }];
+        let add = [NewRecord {
+            key_tail: &[],
+            key,
+            value: &value,
+        }];
         self.edit_map(out, MapLoc::Input(index), MapEdit::add(&add))
     }
 
@@ -853,7 +857,11 @@ impl<'a> Psbt<'a> {
         value: &[u8],
         out: &mut [u8],
     ) -> Result<usize, Error> {
-        let add = [NewRecord { key, value: &value }];
+        let add = [NewRecord {
+            key_tail: &[],
+            key,
+            value: &value,
+        }];
         self.edit_map(out, MapLoc::Output(index), MapEdit::add(&add))
     }
 
@@ -875,7 +883,11 @@ impl<'a> Psbt<'a> {
         value: &[u8],
         out: &mut [u8],
     ) -> Result<usize, Error> {
-        let add = [NewRecord { key, value: &value }];
+        let add = [NewRecord {
+            key_tail: &[],
+            key,
+            value: &value,
+        }];
         self.edit_map(out, MapLoc::Global, MapEdit::add(&add))
     }
 
@@ -892,6 +904,7 @@ impl<'a> Psbt<'a> {
             script: script_pubkey,
         };
         let add = [NewRecord {
+            key_tail: &[],
             key: &[input::WITNESS_UTXO as u8],
             value: &value,
         }];
@@ -958,7 +971,11 @@ impl<'a> Psbt<'a> {
         key[0] = input::BIP32_DERIVATION as u8;
         let key = key_with_data(&mut key, pubkey)?;
         let value = DerivationValue { fingerprint, path };
-        let add = [NewRecord { key, value: &value }];
+        let add = [NewRecord {
+            key_tail: &[],
+            key,
+            value: &value,
+        }];
         self.edit_map(out, MapLoc::Input(index), MapEdit::add(&add))
     }
 
@@ -976,7 +993,11 @@ impl<'a> Psbt<'a> {
         key[0] = output::BIP32_DERIVATION as u8;
         let key = key_with_data(&mut key, pubkey)?;
         let value = DerivationValue { fingerprint, path };
-        let add = [NewRecord { key, value: &value }];
+        let add = [NewRecord {
+            key_tail: &[],
+            key,
+            value: &value,
+        }];
         self.edit_map(out, MapLoc::Output(index), MapEdit::add(&add))
     }
 
@@ -988,6 +1009,47 @@ impl<'a> Psbt<'a> {
         out: &mut [u8],
     ) -> Result<usize, Error> {
         self.set_input_record(index, &[input::TAP_INTERNAL_KEY as u8], key, out)
+    }
+
+    /// Writes a copy with input `index`'s taproot merkle root set: the root of
+    /// the script tree its output commits to (see
+    /// [`tap_tree_root`](crate::taproot::tap_tree_root)). Signers need it to
+    /// sign the key path of such an output.
+    pub fn set_tap_merkle_root(
+        &self,
+        index: usize,
+        root: &[u8; 32],
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
+        self.set_input_record(index, &[input::TAP_MERKLE_ROOT as u8], root, out)
+    }
+
+    /// Writes a copy with a taproot leaf script added to input `index`: the
+    /// `script` with its `control_block` (see
+    /// [`control_block_to_slice`](crate::taproot::control_block_to_slice)).
+    /// Signers sign the leaves their key appears in, and the finalizer spends
+    /// through a leaf that has enough signatures. At most
+    /// `self.len() + control_block.len() + script.len() + 20` bytes are
+    /// written.
+    pub fn add_tap_leaf_script(
+        &self,
+        index: usize,
+        control_block: &[u8],
+        script: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
+        let cb = crate::taproot::ControlBlock::parse(control_block)
+            .map_err(|_| Error::InvalidRecordKey)?;
+        let value = LeafScriptValue {
+            script,
+            leaf_version: cb.leaf_version,
+        };
+        let add = [NewRecord {
+            key: &[input::TAP_LEAF_SCRIPT as u8],
+            key_tail: control_block,
+            value: &value,
+        }];
+        self.edit_map(out, MapLoc::Input(index), MapEdit::add(&add))
     }
 
     // --- combiner ---
@@ -1162,10 +1224,52 @@ impl<'a> PsbtInput<'a> {
     pub fn tap_merkle_root(&self) -> Option<[u8; 32]> {
         self.0.get_type(input::TAP_MERKLE_ROOT)?.try_into().ok()
     }
+    /// The taproot leaf scripts, each with its control block.
+    pub fn tap_leaf_scripts(&self) -> impl Iterator<Item = TapLeafScript<'a>> + 'a {
+        self.0.records_of(input::TAP_LEAF_SCRIPT).filter_map(|r| {
+            let (&leaf_version, script) = r.value.split_last()?;
+            Some(TapLeafScript {
+                control_block: r.key_data(),
+                script,
+                leaf_version,
+            })
+        })
+    }
+    /// The taproot script-path signatures as `(x-only pubkey, leaf hash,
+    /// signature)`; a non-default sighash type is the signature's 65th byte.
+    pub fn tap_script_sigs(&self) -> impl Iterator<Item = (&'a [u8], &'a [u8], &'a [u8])> + 'a {
+        self.0.records_of(input::TAP_SCRIPT_SIG).filter_map(|r| {
+            let (xonly, leaf_hash) = r.key_data().split_at_checked(32)?;
+            Some((xonly, leaf_hash, r.value))
+        })
+    }
+    /// The taproot script-path signature of `xonly_pubkey` for the leaf with
+    /// `leaf_hash`.
+    pub fn tap_script_sig(
+        &self,
+        xonly_pubkey: &[u8; 32],
+        leaf_hash: &[u8; 32],
+    ) -> Option<&'a [u8]> {
+        self.tap_script_sigs()
+            .find(|(k, l, _)| k == xonly_pubkey && l == leaf_hash)
+            .map(|(_, _, sig)| sig)
+    }
     /// Reports whether the input has a final scriptSig or witness.
     pub fn is_finalized(&self) -> bool {
         self.final_script_sig().is_some() || self.final_script_witness().is_some()
     }
+}
+
+/// A taproot leaf script of an input (`PSBT_IN_TAP_LEAF_SCRIPT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TapLeafScript<'a> {
+    /// The control block proving the leaf (see
+    /// [`ControlBlock`](crate::taproot::ControlBlock)).
+    pub control_block: &'a [u8],
+    /// The leaf script.
+    pub script: &'a [u8],
+    /// The leaf version.
+    pub leaf_version: u8,
 }
 
 /// A typed view of an output map.
@@ -1216,6 +1320,19 @@ impl<const N: usize> WriteValue for crate::inline::InlineBytes<N> {
     }
 }
 
+/// A `PSBT_IN_TAP_LEAF_SCRIPT` value: the script, then its leaf version.
+struct LeafScriptValue<'a> {
+    script: &'a [u8],
+    leaf_version: u8,
+}
+
+impl WriteValue for LeafScriptValue<'_> {
+    fn write_value(&self, s: &mut dyn Sink) {
+        s.put(self.script);
+        s.put(&[self.leaf_version]);
+    }
+}
+
 struct WitnessUtxoValue<'a> {
     amount: u64,
     script: &'a [u8],
@@ -1243,10 +1360,21 @@ impl WriteValue for DerivationValue<'_> {
     }
 }
 
-/// A record to add to a map.
+/// A record to add to a map. Its full key is `key` followed by `key_tail`,
+/// so long key data (a taproot control block) need not be copied next to its
+/// key type.
 pub(crate) struct NewRecord<'x> {
     pub(crate) key: &'x [u8],
+    pub(crate) key_tail: &'x [u8],
     pub(crate) value: &'x dyn WriteValue,
+}
+
+impl NewRecord<'_> {
+    fn has_key(&self, key: &[u8]) -> bool {
+        key.len() == self.key.len() + self.key_tail.len()
+            && key.starts_with(self.key)
+            && key.ends_with(self.key_tail)
+    }
 }
 
 /// How to rewrite a map: keep a subset of its records, merge in records from
@@ -1284,10 +1412,15 @@ fn key_type_of(key: &[u8]) -> u64 {
 }
 
 fn put_record(s: &mut dyn Sink, key: &[u8], value: &dyn WriteValue) {
+    put_record_split(s, key, &[], value);
+}
+
+fn put_record_split(s: &mut dyn Sink, key: &[u8], key_tail: &[u8], value: &dyn WriteValue) {
     let mut c = Counter::default();
     value.write_value(&mut c);
-    put_varint(s, key.len());
+    put_varint(s, key.len() + key_tail.len());
     s.put(key);
+    s.put(key_tail);
     put_varint(s, c.0);
     value.write_value(s);
 }
@@ -1296,7 +1429,7 @@ fn put_record(s: &mut dyn Sink, key: &[u8], value: &dyn WriteValue) {
 /// in their existing order within a type (kept records, then merged, then
 /// added), followed by the terminator.
 pub(crate) fn write_map<'m>(s: &mut dyn Sink, map: Map<'m>, edit: &MapEdit<'_, 'm>) {
-    let added = |key: &[u8]| edit.added.iter().any(|a| a.key == key);
+    let added = |key: &[u8]| edit.added.iter().any(|a| a.has_key(key));
     let primary = |r: &Record<'m>| edit.keep.is_none_or(|k| k(r)) && !added(r.key);
     let secondary = |r: &Record<'m>| !map.contains_key(r.key) && !added(r.key);
 
@@ -1329,7 +1462,7 @@ pub(crate) fn write_map<'m>(s: &mut dyn Sink, map: Map<'m>, edit: &MapEdit<'_, '
             }
         }
         for a in edit.added.iter().filter(|a| key_type_of(a.key) == t) {
-            put_record(s, a.key, a.value);
+            put_record_split(s, a.key, a.key_tail, a.value);
         }
         last = Some(t);
     }
