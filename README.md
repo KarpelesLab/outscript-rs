@@ -170,6 +170,26 @@ let data = tx.to_bytes().unwrap();
 let txid = tx.hash().unwrap(); // first signature
 ```
 
+`new_solana_tx_v0` builds a v0 transaction with address lookup tables, and
+`new_solana_tx_v1` a v1 transaction (SIMD-0385, up to 4096 bytes): fee and
+resource requests move from ComputeBudget instructions into a
+`SolanaTxConfig`, and the signatures trail the message.
+
+```rust
+use outscript::solana::{new_solana_tx_v1, SolanaTxConfig};
+
+let config = SolanaTxConfig {
+    priority_fee: Some(5_000),          // total lamports, not per compute unit
+    compute_unit_limit: Some(200_000),
+    ..Default::default()                // unset = minimum (0 CU, 32 KiB heap, ...)
+};
+let mut tx = new_solana_tx_v1(from, blockhash, config, &[ix]).unwrap();
+tx.sign(&[seed]).unwrap();
+let data = tx.to_bytes().unwrap();      // starts with 0x81
+```
+
+`SolanaTx::from_bytes` recognizes all three formats.
+
 ### Cardano transactions
 
 Builds Shelley/Conway-era transactions: a CBOR-encoded body (inputs, outputs,

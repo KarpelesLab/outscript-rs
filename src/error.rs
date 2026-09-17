@@ -144,11 +144,15 @@ pub enum Error {
     NotVersioned,
     /// The message or transaction version is not supported.
     UnsupportedVersion(u8),
+    /// A v1 transaction config is malformed: an unknown mask bit, a half-set
+    /// priority fee, or a heap size that is not a multiple of 1 KiB in
+    /// 32..=256 KiB.
+    InvalidTxConfig,
 
     // --- PSBT ---
     /// The data does not start with the PSBT magic.
     InvalidMagic,
-    /// A map contains the same key twice.
+    /// A map or account list contains the same key twice.
     DuplicateKey,
     /// A record key has the wrong key data for its type.
     InvalidRecordKey,
@@ -289,8 +293,9 @@ impl core::fmt::Display for Error {
             Error::InvalidHeader => f.write_str("invalid message header"),
             Error::NotVersioned => f.write_str("not a versioned message"),
             Error::UnsupportedVersion(v) => write!(f, "unsupported version {v}"),
+            Error::InvalidTxConfig => f.write_str("invalid transaction config"),
             Error::InvalidMagic => f.write_str("not a PSBT (bad magic)"),
-            Error::DuplicateKey => f.write_str("duplicate key in PSBT map"),
+            Error::DuplicateKey => f.write_str("duplicate key"),
             Error::InvalidRecordKey => f.write_str("invalid PSBT key"),
             Error::InvalidRecordValue => f.write_str("invalid PSBT value"),
             Error::MissingUnsignedTx => f.write_str("PSBT has no unsigned transaction"),

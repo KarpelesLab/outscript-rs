@@ -1,5 +1,5 @@
-//! Solana instructions, messages and transactions (legacy + v0). Port of
-//! `solanatx.go` and `solana_instructions.go`.
+//! Solana instructions, messages and transactions (legacy, v0 and v1). Port of
+//! `solanatx.go` and `solana_instructions.go`, plus the SIMD-0385 v1 format.
 
 use alloc::collections::BTreeMap;
 
@@ -257,7 +257,137 @@ pub struct SolanaMessageV0 {
     pub address_table_lookups: Vec<SolanaAddressTableLookup>,
 }
 
-/// A Solana transaction (legacy or versioned).
+/// Version byte that opens a v1 message and transaction (SIMD-0385).
+pub const SOLANA_V1_PREFIX: u8 = 0x81;
+/// The largest serialized v1 transaction the network accepts.
+pub const SOLANA_V1_MAX_TX_SIZE: usize = 4096;
+const V1_MAX_SIGNATURES: usize = 12;
+const V1_MAX_ADDRESSES: usize = 64;
+const V1_MAX_INSTRUCTIONS: usize = 64;
+const V1_MIN_HEAP_SIZE: u32 = 32 * 1024;
+const V1_MAX_HEAP_SIZE: u32 = 256 * 1024;
+/// Config-mask bits this crate understands; any other bit is rejected.
+const V1_KNOWN_CONFIG_BITS: u32 = 0b1_1111;
+const V1_FIXED_HEADER_LEN: usize = 1 + 3 + 4 + 32 + 1 + 1;
+
+/// Fee and resource requests carried in a v1 message (SIMD-0385). They replace
+/// the ComputeBudget instructions of legacy/v0 transactions, which a v1
+/// transaction ignores.
+///
+/// An unset field requests the minimum: no priority fee, a compute-unit limit
+/// of 0, a loaded-accounts data size limit of 0 and a 32 KiB heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SolanaTxConfig {
+    /// Total priority fee for the transaction, in lamports (not per compute
+    /// unit).
+    pub priority_fee: Option<u64>,
+    /// Compute-unit limit.
+    pub compute_unit_limit: Option<u32>,
+    /// Loaded-accounts data size limit, in bytes.
+    pub loaded_accounts_data_size_limit: Option<u32>,
+    /// Heap size in bytes: a multiple of 1024 between 32 KiB and 256 KiB.
+    pub heap_size: Option<u32>,
+}
+
+impl SolanaTxConfig {
+    /// The `TransactionConfigMask` for the fields that are set.
+    pub fn mask(&self) -> u32 {
+        let mut mask = 0;
+        if self.priority_fee.is_some() {
+            mask |= 0b11;
+        }
+        if self.compute_unit_limit.is_some() {
+            mask |= 1 << 2;
+        }
+        if self.loaded_accounts_data_size_limit.is_some() {
+            mask |= 1 << 3;
+        }
+        if self.heap_size.is_some() {
+            mask |= 1 << 4;
+        }
+        mask
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        if let Some(heap) = self.heap_size
+            && (!heap.is_multiple_of(1024)
+                || !(V1_MIN_HEAP_SIZE..=V1_MAX_HEAP_SIZE).contains(&heap))
+        {
+            return Err(Error::InvalidTxConfig);
+        }
+        Ok(())
+    }
+
+    /// Appends the `ConfigValues` (in mask-bit order, little-endian).
+    fn write_values(&self, buf: &mut Vec<u8>) {
+        if let Some(v) = self.priority_fee {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(v) = self.compute_unit_limit {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(v) = self.loaded_accounts_data_size_limit {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(v) = self.heap_size {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    /// Reads the `ConfigValues` selected by `mask`, advancing `pos`.
+    fn read_values(mask: u32, data: &[u8], pos: &mut usize) -> Result<SolanaTxConfig, Error> {
+        if mask & !V1_KNOWN_CONFIG_BITS != 0 {
+            return Err(Error::InvalidTxConfig);
+        }
+        // the priority fee spans two bits: both or neither
+        if matches!(mask & 0b11, 0b01 | 0b10) {
+            return Err(Error::InvalidTxConfig);
+        }
+        let mut cfg = SolanaTxConfig::default();
+        if mask & 0b11 != 0 {
+            cfg.priority_fee = Some(u64::from_le_bytes(take_array(data, pos)?));
+        }
+        if mask & (1 << 2) != 0 {
+            cfg.compute_unit_limit = Some(u32::from_le_bytes(take_array(data, pos)?));
+        }
+        if mask & (1 << 3) != 0 {
+            cfg.loaded_accounts_data_size_limit = Some(u32::from_le_bytes(take_array(data, pos)?));
+        }
+        if mask & (1 << 4) != 0 {
+            cfg.heap_size = Some(u32::from_le_bytes(take_array(data, pos)?));
+        }
+        Ok(cfg)
+    }
+}
+
+/// Copies the next `N` bytes out of `data`, advancing `pos`.
+fn take_array<const N: usize>(data: &[u8], pos: &mut usize) -> Result<[u8; N], Error> {
+    let bytes = data.get(*pos..*pos + N).ok_or(Error::UnexpectedEof)?;
+    *pos += N;
+    let mut out = [0u8; N];
+    out.copy_from_slice(bytes);
+    Ok(out)
+}
+
+/// A v1 message (SIMD-0385): fixed-width counts, fee and resource requests in
+/// the header, no address lookup tables, and signatures *after* the message
+/// in the serialized transaction.
+#[derive(Debug, Clone, Default)]
+pub struct SolanaMessageV1 {
+    /// Header.
+    pub header: SolanaMessageHeader,
+    /// Fee and resource requests.
+    pub config: SolanaTxConfig,
+    /// Recent blockhash (the "lifetime specifier").
+    pub recent_blockhash: SolanaKey,
+    /// Account keys (at most 64, no duplicates, fee payer first).
+    pub account_keys: Vec<SolanaKey>,
+    /// Compiled instructions (at most 64).
+    pub instructions: Vec<SolanaCompiledInstruction>,
+}
+
+/// A Solana transaction: legacy, v0 or v1. `message_v1` takes precedence over
+/// `message_v0`, which takes precedence over the legacy `message`.
 #[derive(Debug, Clone, Default)]
 pub struct SolanaTx {
     /// Signatures (64 bytes each; empty = unsigned slot).
@@ -266,6 +396,8 @@ pub struct SolanaTx {
     pub message: SolanaMessage,
     /// v0 message (when present, the transaction is versioned).
     pub message_v0: Option<SolanaMessageV0>,
+    /// v1 message (when present, the transaction uses the SIMD-0385 format).
+    pub message_v1: Option<SolanaMessageV1>,
 }
 
 struct AccountInfo {
@@ -385,6 +517,7 @@ pub fn new_solana_tx(
             instructions: compiled,
         },
         message_v0: None,
+        message_v1: None,
     })
 }
 
@@ -408,23 +541,63 @@ pub fn new_solana_tx_v0(
             instructions: compiled,
             address_table_lookups: lookups,
         }),
+        message_v1: None,
+    })
+}
+
+/// Compiles instructions into a v1 transaction (SIMD-0385) with the given fee
+/// and resource requests. ComputeBudget instructions are unnecessary (and
+/// ignored by the network) in this format; use `config` instead.
+pub fn new_solana_tx_v1(
+    fee_payer: SolanaKey,
+    recent_blockhash: SolanaKey,
+    config: SolanaTxConfig,
+    instructions: &[SolanaInstruction],
+) -> Result<SolanaTx, Error> {
+    let (account_keys, index, header) = compile_accounts(fee_payer, instructions)?;
+    let compiled = compile_instructions(instructions, &index);
+    let message = SolanaMessageV1 {
+        header,
+        config,
+        recent_blockhash,
+        account_keys,
+        instructions: compiled,
+    };
+    message.validate()?;
+    let num_signers = header.num_required_signatures as usize;
+    Ok(SolanaTx {
+        signatures: vec![Vec::new(); num_signers],
+        message: SolanaMessage::default(),
+        message_v0: None,
+        message_v1: Some(message),
     })
 }
 
 impl SolanaTx {
-    fn message_bytes(&self) -> Vec<u8> {
-        match &self.message_v0 {
+    /// The bytes that are signed: the message, or for v1 everything before the
+    /// signatures.
+    fn message_bytes(&self) -> Result<Vec<u8>, Error> {
+        if let Some(m) = &self.message_v1 {
+            return m.to_bytes();
+        }
+        Ok(match &self.message_v0 {
             Some(m) => m.to_bytes(),
             None => self.message.to_bytes(),
-        }
+        })
     }
     fn header(&self) -> SolanaMessageHeader {
+        if let Some(m) = &self.message_v1 {
+            return m.header;
+        }
         match &self.message_v0 {
             Some(m) => m.header,
             None => self.message.header,
         }
     }
     fn account_keys(&self) -> &[SolanaKey] {
+        if let Some(m) = &self.message_v1 {
+            return &m.account_keys;
+        }
         match &self.message_v0 {
             Some(m) => &m.account_keys,
             None => &self.message.account_keys,
@@ -434,7 +607,7 @@ impl SolanaTx {
     /// Signs the transaction message with the given Ed25519 seeds, matching each
     /// to its signature slot by public key.
     pub fn sign(&mut self, seeds: &[[u8; 32]]) -> Result<(), Error> {
-        let msg = self.message_bytes();
+        let msg = self.message_bytes()?;
         let num_signers = self.header().num_required_signatures as usize;
         let account_keys: Vec<SolanaKey> = self.account_keys().to_vec();
         if num_signers > account_keys.len() {
@@ -453,7 +626,7 @@ impl SolanaTx {
 
     /// Verifies all required signatures.
     pub fn verify(&self) -> Result<(), Error> {
-        let msg = self.message_bytes();
+        let msg = self.message_bytes()?;
         let num_signers = self.header().num_required_signatures as usize;
         if num_signers > self.account_keys().len() {
             return Err(Error::InvalidHeader);
@@ -484,25 +657,38 @@ impl SolanaTx {
         Ok(self.signatures[0].clone())
     }
 
-    /// Serializes the transaction.
+    /// Serializes the transaction. A v1 transaction carries exactly
+    /// `num_required_signatures` signatures after the message and must fit in
+    /// [`SOLANA_V1_MAX_TX_SIZE`] bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let msg = self.message_bytes();
-        let mut buf = encode_compact_u16(self.signatures.len());
-        for sig in &self.signatures {
-            if sig.is_empty() {
-                buf.extend(core::iter::repeat_n(0u8, 64));
-            } else if sig.len() != 64 {
-                return Err(Error::InvalidSignature);
-            } else {
-                buf.extend_from_slice(sig);
+        let msg = self.message_bytes()?;
+        if let Some(m) = &self.message_v1 {
+            let required = m.header.num_required_signatures as usize;
+            if self.signatures.len() < required {
+                return Err(Error::MissingSignatures);
             }
+            if self.signatures.len() > required {
+                return Err(Error::InvalidData);
+            }
+            let mut buf = msg;
+            write_signatures(&mut buf, &self.signatures)?;
+            if buf.len() > SOLANA_V1_MAX_TX_SIZE {
+                return Err(Error::TooLarge);
+            }
+            return Ok(buf);
         }
+        let mut buf = encode_compact_u16(self.signatures.len());
+        write_signatures(&mut buf, &self.signatures)?;
         buf.extend_from_slice(&msg);
         Ok(buf)
     }
 
-    /// Parses a transaction from bytes.
+    /// Parses a transaction from bytes (legacy, v0 or v1; a v1 transaction is
+    /// recognized by its leading [`SOLANA_V1_PREFIX`] byte).
     pub fn from_bytes(data: &[u8]) -> Result<SolanaTx, Error> {
+        if data.first() == Some(&SOLANA_V1_PREFIX) {
+            return Self::from_bytes_v1(data);
+        }
         let mut pos = 0;
         let sig_count = read_len(data, &mut pos)?;
         if sig_count > 256 {
@@ -532,6 +718,42 @@ impl SolanaTx {
         }
         Ok(tx)
     }
+
+    fn from_bytes_v1(data: &[u8]) -> Result<SolanaTx, Error> {
+        if data.len() > SOLANA_V1_MAX_TX_SIZE {
+            return Err(Error::TooLarge);
+        }
+        let mut pos = 0;
+        let message = SolanaMessageV1::read(data, &mut pos)?;
+        let required = message.header.num_required_signatures as usize;
+        let mut signatures = Vec::with_capacity(required);
+        for _ in 0..required {
+            signatures.push(take_array::<64>(data, &mut pos)?.to_vec());
+        }
+        if pos != data.len() {
+            return Err(Error::TrailingData);
+        }
+        Ok(SolanaTx {
+            signatures,
+            message: SolanaMessage::default(),
+            message_v0: None,
+            message_v1: Some(message),
+        })
+    }
+}
+
+/// Appends signatures, writing an all-zero signature for each empty slot.
+fn write_signatures(buf: &mut Vec<u8>, signatures: &[Vec<u8>]) -> Result<(), Error> {
+    for sig in signatures {
+        if sig.is_empty() {
+            buf.extend(core::iter::repeat_n(0u8, 64));
+        } else if sig.len() != 64 {
+            return Err(Error::InvalidSignature);
+        } else {
+            buf.extend_from_slice(sig);
+        }
+    }
+    Ok(())
 }
 
 fn write_message_common(
@@ -785,5 +1007,144 @@ impl SolanaMessageV0 {
             instructions,
             address_table_lookups: lookups,
         })
+    }
+}
+
+impl SolanaMessageV1 {
+    /// Checks the SIMD-0385 sanitization rules: at most 12 signatures, 64
+    /// addresses and 64 instructions; a writable fee payer; enough addresses
+    /// for the header; no duplicate addresses; a valid heap size; and every
+    /// instruction referencing a non-fee-payer program and in-range accounts.
+    pub fn validate(&self) -> Result<(), Error> {
+        let h = &self.header;
+        let num_keys = self.account_keys.len();
+        if h.num_required_signatures as usize > V1_MAX_SIGNATURES
+            || self.instructions.len() > V1_MAX_INSTRUCTIONS
+            || num_keys > V1_MAX_ADDRESSES
+        {
+            return Err(Error::TooLarge);
+        }
+        if num_keys < h.num_required_signatures as usize + h.num_readonly_unsigned as usize
+            || h.num_readonly_signed >= h.num_required_signatures
+        {
+            return Err(Error::InvalidHeader);
+        }
+        for (i, k) in self.account_keys.iter().enumerate() {
+            if self.account_keys[..i].contains(k) {
+                return Err(Error::DuplicateKey);
+            }
+        }
+        self.config.validate()?;
+        for ix in &self.instructions {
+            // the fee payer (index 0) can never be the program
+            if ix.program_id_index == 0 {
+                return Err(Error::IndexOutOfRange);
+            }
+            if ix.account_indices.len() > u8::MAX as usize || ix.data.len() > u16::MAX as usize {
+                return Err(Error::TooLarge);
+            }
+        }
+        validate_instruction_indexes(&self.instructions, num_keys)
+    }
+
+    /// Serializes the message (with version prefix 0x81), after [`validate`](Self::validate).
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+        self.validate()?;
+        let mut buf = vec![SOLANA_V1_PREFIX];
+        buf.push(self.header.num_required_signatures);
+        buf.push(self.header.num_readonly_signed);
+        buf.push(self.header.num_readonly_unsigned);
+        buf.extend_from_slice(&self.config.mask().to_le_bytes());
+        buf.extend_from_slice(&self.recent_blockhash.0);
+        buf.push(self.instructions.len() as u8);
+        buf.push(self.account_keys.len() as u8);
+        for k in &self.account_keys {
+            buf.extend_from_slice(&k.0);
+        }
+        self.config.write_values(&mut buf);
+        for ix in &self.instructions {
+            buf.push(ix.program_id_index);
+            buf.push(ix.account_indices.len() as u8);
+            buf.extend_from_slice(&(ix.data.len() as u16).to_le_bytes());
+        }
+        for ix in &self.instructions {
+            buf.extend_from_slice(&ix.account_indices);
+            buf.extend_from_slice(&ix.data);
+        }
+        Ok(buf)
+    }
+
+    /// Parses a v1 message from the start of `data` (trailing bytes, such as
+    /// a transaction's signatures, are ignored).
+    pub fn from_bytes(data: &[u8]) -> Result<SolanaMessageV1, Error> {
+        Self::read(data, &mut 0)
+    }
+
+    /// Parses a v1 message at `pos`, leaving `pos` just after it.
+    fn read(data: &[u8], pos: &mut usize) -> Result<SolanaMessageV1, Error> {
+        let start = *pos;
+        if data.len() < start + V1_FIXED_HEADER_LEN {
+            return Err(Error::UnexpectedEof);
+        }
+        match data[start] {
+            SOLANA_V1_PREFIX => {}
+            v if v & 0x80 == 0 => return Err(Error::NotVersioned),
+            v => return Err(Error::UnsupportedVersion(v & 0x7f)),
+        }
+        let header = SolanaMessageHeader {
+            num_required_signatures: data[start + 1],
+            num_readonly_signed: data[start + 2],
+            num_readonly_unsigned: data[start + 3],
+        };
+        *pos = start + 4;
+        let mask = u32::from_le_bytes(take_array(data, pos)?);
+        let recent_blockhash = SolanaKey(take_array(data, pos)?);
+        let ix_count = data[*pos] as usize;
+        let key_count = data[*pos + 1] as usize;
+        *pos += 2;
+        if ix_count > V1_MAX_INSTRUCTIONS || key_count > V1_MAX_ADDRESSES {
+            return Err(Error::TooLarge);
+        }
+        let mut account_keys = Vec::with_capacity(key_count);
+        for _ in 0..key_count {
+            account_keys.push(SolanaKey(take_array(data, pos)?));
+        }
+        let config = SolanaTxConfig::read_values(mask, data, pos)?;
+        let mut headers = Vec::with_capacity(ix_count);
+        for _ in 0..ix_count {
+            let h: [u8; 4] = take_array(data, pos)?;
+            headers.push((
+                h[0],
+                h[1] as usize,
+                u16::from_le_bytes([h[2], h[3]]) as usize,
+            ));
+        }
+        let mut instructions = Vec::with_capacity(ix_count);
+        for (program_id_index, acc_count, data_len) in headers {
+            let account_indices = data
+                .get(*pos..*pos + acc_count)
+                .ok_or(Error::UnexpectedEof)?
+                .to_vec();
+            *pos += acc_count;
+            let ix_data = data
+                .get(*pos..*pos + data_len)
+                .ok_or(Error::UnexpectedEof)?
+                .to_vec();
+            *pos += data_len;
+            instructions.push(SolanaCompiledInstruction {
+                program_id_index,
+                account_indices,
+                data: ix_data,
+            });
+        }
+        let message = SolanaMessageV1 {
+            header,
+            config,
+            recent_blockhash,
+            account_keys,
+            instructions,
+        };
+        message.validate()?;
+        Ok(message)
     }
 }
