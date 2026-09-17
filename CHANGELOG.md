@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/KarpelesLab/outscript-rs/compare/v0.2.1...v0.3.0) - 2026-09-17
+
+### Other
+
+- [**breaking**] taproot script trees, script-path spends, all sighash types
+- taproot script trees, script-path signing and finalization
+- Taproot sighash: all hash types, annex and script path
+- Taproot script trees: leaf/branch hashes, merkle roots, control blocks
+
 ## [0.2.1](https://github.com/KarpelesLab/outscript-rs/compare/v0.2.0...v0.2.1) - 2026-09-17
 
 ### Other
