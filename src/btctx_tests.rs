@@ -523,6 +523,19 @@ fn raw_tx_matches_btctx() {
 /// script type both support, including a PSBT signed by two parties in turn.
 #[test]
 fn psbt_workflow_matches_btctx_sign() {
+    psbt_matches_btctx_sign(0);
+}
+
+/// The same, opted into the unified sighash through the PSBT sighash type.
+#[test]
+fn psbt_unified_matches_btctx_sign() {
+    psbt_matches_btctx_sign(0x21); // ALL|UNIFIED
+    psbt_matches_btctx_sign(0xa3); // SINGLE|ANYONECANPAY|UNIFIED
+}
+
+/// Signs one input of each scheme with `BtcTx::sign` and through a PSBT, with
+/// sighash `hash_type` (0 for the default), and compares the results.
+fn psbt_matches_btctx_sign(hash_type: u32) {
     use crate::psbt::Psbt;
 
     let k1 = key("eb696a065ef48a2192da5b28b694f87544b30fae8327c4510137a922f32c6dcf");
@@ -588,7 +601,8 @@ fn psbt_workflow_matches_btctx_sign() {
         reference
             .sign(&[BtcTxSign::new(sk, sign_scheme)
                 .amount(90_000)
-                .prev_script(spent_script.clone())])
+                .prev_script(spent_script.clone())
+                .sighash(hash_type)])
             .unwrap();
 
         // PSBT: create, add UTXO and scripts, sign, finalize, extract
@@ -612,6 +626,12 @@ fn psbt_workflow_matches_btctx_sign() {
             psbt = Psbt::parse(&psbt)
                 .unwrap()
                 .set_input_record_to_vec(0, &[0x05], &ws)
+                .unwrap();
+        }
+        if hash_type != 0 {
+            psbt = Psbt::parse(&psbt)
+                .unwrap()
+                .set_input_record_to_vec(0, &[0x03], &hash_type.to_le_bytes())
                 .unwrap();
         }
 
@@ -1340,4 +1360,190 @@ fn unified_sighash_rejects() {
         }),
         Err(Error::PrevOutCount)
     );
+}
+
+/// `BtcTx::sign` opts individual inputs into the unified sighash: their
+/// signatures verify against it and carry its hash type, while the other
+/// inputs keep their usual algorithm.
+#[test]
+fn sign_unified_mixed_inputs() {
+    use crate::btcraw::UnifiedSpend;
+    use crate::crypto::secp256k1::parse_der_signature;
+    use crate::pushbytes::parse_push_bytes;
+
+    let k = key("eb696a065ef48a2192da5b28b694f87544b30fae8327c4510137a922f32c6dcf");
+    let pk = k.public_key();
+    let s = Script::new(pk.clone());
+    let spk = |scheme| s.generate(scheme).unwrap();
+
+    let mut tx = BtcTx {
+        version: 2,
+        locktime: 900_000,
+        ..Default::default()
+    };
+    for i in 0..4u8 {
+        tx.inputs.push(BtcTxInput {
+            txid: [i + 1; 32],
+            vout: i.into(),
+            sequence: 0xffff_fffd,
+            ..Default::default()
+        });
+    }
+    tx.add_output("bc1q0yy3juscd3zfavw76g4h3eqdqzda7qyf58rj4m", 80_000)
+        .unwrap();
+    let entries = [
+        ("p2pkh", 0x21, 10_000),              // ALL|UNIFIED
+        ("p2wpkh", 0, 20_000),                // legacy BIP-143
+        ("p2wsh:p2pkh", 0x82 | 0x20, 30_000), // NONE|ANYONECANPAY|UNIFIED
+        ("p2tr", 0x22, 40_000),               // NONE|UNIFIED
+    ];
+    let keys: Vec<BtcTxSign> = entries
+        .iter()
+        .map(|&(scheme, sighash, amount)| {
+            BtcTxSign::new(&k, scheme)
+                .amount(amount)
+                .prev_script(spk(scheme))
+                .sighash(sighash)
+        })
+        .collect();
+    tx.sign(&keys).unwrap();
+
+    // input n's ECDSA signature verifies against `digest` and ends in `hash_type`
+    let ecdsa_ok = |n: usize, digest: &[u8; 32], hash_type: u8| {
+        let inp = &tx.inputs[n];
+        let sig = match inp.witnesses.first() {
+            Some(sig) => sig.as_slice(),
+            None => parse_push_bytes(&inp.script).unwrap().0,
+        };
+        let (der, flag) = sig.split_at(sig.len() - 1);
+        assert_eq!(flag, [hash_type], "input {n}");
+        let (r, s) = parse_der_signature(der).unwrap();
+        pk.verify(digest, &r, &s)
+    };
+
+    let p2pkh = spk("p2pkh");
+    let digest = tx
+        .unified_sighash(&keys, 0, 0x21, &UnifiedSpend::Legacy(&p2pkh))
+        .unwrap();
+    assert!(ecdsa_ok(0, &digest, 0x21));
+    assert_ne!(digest, tx.legacy_sighash(0, &p2pkh, 0x21).unwrap());
+
+    let pk_hash = crate::hash::hash160(&pk.serialize_compressed());
+    let digest = tx.segwit_v0_midstate().sighash(
+        &tx.inputs[1].raw(),
+        &crate::btcraw::p2pkh_script_code(&pk_hash),
+        20_000,
+        1,
+    );
+    assert!(ecdsa_ok(1, &digest, 1));
+
+    let digest = tx
+        .unified_sighash(&keys, 2, 0xa2, &UnifiedSpend::SegwitV0(&p2pkh))
+        .unwrap();
+    assert!(ecdsa_ok(2, &digest, 0xa2));
+
+    let wit = &tx.inputs[3].witnesses;
+    assert_eq!((wit.len(), wit[0].len(), wit[0][64]), (1, 65, 0x22));
+    let digest = tx
+        .unified_sighash(&keys, 3, 0x22, &UnifiedSpend::KEY_PATH)
+        .unwrap();
+    let output_key: [u8; 32] = spk("p2tr")[2..].try_into().unwrap();
+    assert!(bip340_verify(
+        &output_key,
+        &digest,
+        wit[0][..64].try_into().unwrap()
+    ));
+}
+
+#[test]
+fn sign_unified_rejects() {
+    let k = key("eb696a065ef48a2192da5b28b694f87544b30fae8327c4510137a922f32c6dcf");
+    let s = Script::new(k.public_key());
+    let mut tx = BtcTx {
+        version: 2,
+        ..Default::default()
+    };
+    for i in 0..2u8 {
+        tx.inputs.push(BtcTxInput {
+            txid: [i + 1; 32],
+            ..Default::default()
+        });
+    }
+    tx.add_output("bc1q0yy3juscd3zfavw76g4h3eqdqzda7qyf58rj4m", 1_000)
+        .unwrap();
+    let entry = |scheme: &str, sighash| {
+        BtcTxSign::new(&k, scheme)
+            .amount(5_000)
+            .prev_script(s.generate(scheme).unwrap())
+            .sighash(sighash)
+    };
+    let sign = |keys: &[BtcTxSign]| tx.clone().sign(keys);
+
+    assert!(sign(&[entry("p2wpkh", 0x21), entry("p2pkh", 0)]).is_ok());
+    // every spent output is committed to
+    let mut missing = entry("p2pkh", 0);
+    missing.prev_script.clear();
+    assert_eq!(
+        sign(&[entry("p2wpkh", 0x21), missing]),
+        Err(Error::MissingPrevScript(1))
+    );
+    // SINGLE needs an output at the input's index
+    assert_eq!(
+        sign(&[entry("p2wpkh", 0), entry("p2wpkh", 0x23)]),
+        Err(Error::OutputIndex)
+    );
+    // taproot only takes the hash types BIP-341 defines
+    assert_eq!(
+        sign(&[entry("p2tr", 0x20), entry("p2tr", 0)]),
+        Err(Error::UnsupportedSighash)
+    );
+    // the Bitcoin Cash fork id bit is not combined with it
+    assert_eq!(
+        sign(&[entry("p2pkh", 0x61), entry("p2pkh", 0)]),
+        Err(Error::UnsupportedSighash)
+    );
+}
+
+/// A tapscript spend opted into the unified sighash commits to the leaf as
+/// script type 3.
+#[test]
+fn sign_unified_tapscript() {
+    use crate::btcraw::{TapScriptPath, UnifiedSpend};
+    use crate::taproot::{TAPSCRIPT_LEAF_VERSION, tapleaf_hash};
+    let TapTreeFixture {
+        mut tx,
+        spk,
+        scripts,
+        control_blocks,
+        ..
+    } = tap_tree_fixture();
+    let probe = [BtcTxSign::without_key("p2tr")
+        .amount(100_000)
+        .prev_script(spk.clone())];
+
+    let k = SecpPrivateKey::from_bytes(&[2; 32]).unwrap();
+    tx.sign(&[BtcTxSign::new(&k, "p2tr")
+        .amount(100_000)
+        .prev_script(spk.clone())
+        .sighash(0x21)
+        .tap_leaf(scripts[0].clone(), control_blocks[0].clone())])
+        .unwrap();
+    let w = &tx.inputs[0].witnesses;
+    assert_eq!((w.len(), w[0].len(), w[0][64]), (3, 65, 0x21));
+    let path = TapScriptPath::new(tapleaf_hash(TAPSCRIPT_LEAF_VERSION, &scripts[0]));
+    let spend = UnifiedSpend::Taproot {
+        annex: None,
+        script_path: Some(path),
+    };
+    let digest = tx.unified_sighash(&probe, 0, 0x21, &spend).unwrap();
+    assert!(bip340_verify(
+        &k.xonly_public_key(),
+        &digest,
+        w[0][..64].try_into().unwrap()
+    ));
+    // not the key-path message
+    let key_path = tx
+        .unified_sighash(&probe, 0, 0x21, &UnifiedSpend::KEY_PATH)
+        .unwrap();
+    assert_ne!(digest, key_path);
 }

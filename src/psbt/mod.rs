@@ -9,7 +9,10 @@
 //!   [`Psbt::set_witness_utxo`] or [`Psbt::add_input_bip32_derivation`].
 //! - **Signer**: [`Psbt::sign_to_slice`] / [`Psbt::sign_input_to_slice`] with
 //!   any [`PsbtSigner`] (P2PKH, P2PK, bare and P2SH multisig, P2WPKH, P2WSH,
-//!   their P2SH-nested forms, and P2TR key path).
+//!   their P2SH-nested forms, and P2TR key path). An input whose
+//!   `PSBT_IN_SIGHASH_TYPE` sets
+//!   [`SIGHASH_UNIFIED`](crate::btcraw::SIGHASH_UNIFIED) is signed under the
+//!   unified opt-in signature hash.
 //! - **Combiner**: [`Psbt::combine_to_slice`].
 //! - **Finalizer**: [`Psbt::finalize_to_slice`].
 //! - **Extractor**: [`Psbt::extract_tx_to_slice`].

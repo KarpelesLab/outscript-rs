@@ -3,8 +3,9 @@
 
 use super::{Error, MapEdit, MapLoc, NewRecord, Psbt, input, write_map};
 use crate::btcraw::{
-    self, RawTxIn, RawTxOut, SegwitV0Midstate, TapScriptPath, TapSighash, TaprootMidstate,
-    legacy_sighash_of, segwit_v0_midstate_of, taproot_midstate_of, taproot_sighash_of,
+    self, RawTxIn, RawTxOut, SIGHASH_UNIFIED, SegwitV0Midstate, TapScriptPath, TapSighash,
+    TaprootMidstate, UnifiedSpend, legacy_sighash_of, segwit_v0_midstate_of, taproot_midstate_of,
+    taproot_sighash_of, unified_sighash_of,
 };
 use crate::crypto::secp256k1::{
     DerSignature, SecpPrivateKey, SecpPublicKey, taproot_tweak_with_root,
@@ -279,6 +280,31 @@ impl<'a> SignCtx<'_, 'a> {
         })
     }
 
+    /// The digest a taproot signature on input `index` commits to: the unified
+    /// sighash if `hash_type` opts in, BIP-341 otherwise.
+    fn taproot_digest(
+        &mut self,
+        index: usize,
+        res: &Resolved<'_>,
+        hash_type: u8,
+        script_path: Option<TapScriptPath>,
+    ) -> Result<[u8; 32], Error> {
+        let mid = self.taproot()?;
+        let tx = self.psbt.unsigned_tx();
+        if hash_type & SIGHASH_UNIFIED != 0 {
+            let spend = UnifiedSpend::Taproot {
+                annex: None,
+                script_path,
+            };
+            return unified_sighash_of(&tx, &mid, index, res.utxo, hash_type, &spend);
+        }
+        let mut opts = TapSighash::new(hash_type);
+        if let Some(leaf) = script_path {
+            opts = opts.with_script_path(leaf);
+        }
+        taproot_sighash_of(&tx, &mid, index, res.utxo, &opts)
+    }
+
     /// Signs input `index` wherever the signer's key is involved (an empty
     /// set if it is not).
     fn sign_input(&mut self, index: usize, signer: &dyn PsbtSigner) -> Result<SignedSet, Error> {
@@ -310,7 +336,7 @@ impl<'a> SignCtx<'_, 'a> {
             let x_only: [u8; 32] = comp[1..].try_into().unwrap();
             let hash_type = match inp.sighash_type() {
                 None => 0,
-                Some(t @ (0x00..=0x03 | 0x81..=0x83)) => t as u8,
+                Some(t @ (0x00..=0x03 | 0x81..=0x83 | 0x21..=0x23 | 0xa1..=0xa3)) => t as u8,
                 Some(_) => return Err(Error::UnsupportedSighash),
             };
             let mut signer_failed = false;
@@ -324,14 +350,7 @@ impl<'a> SignCtx<'_, 'a> {
                     .ok()
                     == Some(output_key)
             {
-                let mid = self.taproot()?;
-                let sighash = taproot_sighash_of(
-                    &psbt.unsigned_tx(),
-                    &mid,
-                    index,
-                    res.utxo,
-                    &TapSighash::new(hash_type),
-                )?;
+                let sighash = self.taproot_digest(index, &res, hash_type, None)?;
                 match signer.sign_taproot_with_root(&sighash, root.as_ref()) {
                     Ok(sig) => set.push_schnorr(&[&[input::TAP_KEY_SIG as u8]], &sig, hash_type),
                     Err(_) => signer_failed = true,
@@ -362,14 +381,8 @@ impl<'a> SignCtx<'_, 'a> {
                 if inp.tap_script_sig(&x_only, &leaf_hash).is_some() {
                     continue;
                 }
-                let mid = self.taproot()?;
-                let sighash = taproot_sighash_of(
-                    &psbt.unsigned_tx(),
-                    &mid,
-                    index,
-                    res.utxo,
-                    &TapSighash::new(hash_type).with_script_path(TapScriptPath::new(leaf_hash)),
-                )?;
+                let path = TapScriptPath::new(leaf_hash);
+                let sighash = self.taproot_digest(index, &res, hash_type, Some(path))?;
                 match signer.sign_schnorr(&sighash) {
                     Ok(sig) => set.push_schnorr(
                         &[&[input::TAP_SCRIPT_SIG as u8], &x_only, &leaf_hash],
@@ -405,10 +418,27 @@ impl<'a> SignCtx<'_, 'a> {
             },
             Kind::P2tr(_) => unreachable!("handled above"),
         };
-        if inp.sighash_type().unwrap_or(1) != 1 {
-            return Err(Error::UnsupportedSighash);
-        }
-        let digest = if segwit {
+        let hash_type = match inp.sighash_type().unwrap_or(1) {
+            1 => 1,
+            t @ 0..=0xff if t & u32::from(SIGHASH_UNIFIED) != 0 => t as u8,
+            _ => return Err(Error::UnsupportedSighash),
+        };
+        let digest = if hash_type & SIGHASH_UNIFIED != 0 {
+            let spend = if segwit {
+                UnifiedSpend::SegwitV0(script_code)
+            } else {
+                UnifiedSpend::Legacy(script_code)
+            };
+            let mid = self.taproot()?;
+            unified_sighash_of(
+                &psbt.unsigned_tx(),
+                &mid,
+                index,
+                res.utxo,
+                hash_type,
+                &spend,
+            )?
+        } else if segwit {
             let tx = psbt.unsigned_tx();
             self.segwit
                 .get_or_insert_with(|| segwit_v0_midstate_of(&tx))
@@ -419,7 +449,7 @@ impl<'a> SignCtx<'_, 'a> {
         };
         let der = signer.sign_ecdsa(&digest).map_err(|_| Error::Signer)?;
         let mut value = InlineBytes::from_slice(&der).ok_or(Error::Signer)?;
-        value.push(0x01).unwrap();
+        value.push(hash_type).unwrap();
         let mut k = InlineBytes::from_slice(&[input::PARTIAL_SIG as u8]).unwrap();
         k.extend_from_slice(key).unwrap();
         Ok(Some(Signed { key: k, value }))
@@ -458,7 +488,9 @@ impl<'a> Psbt<'a> {
     /// script path for each tapscript leaf that pushes its x-only key and has a
     /// valid control block, up to 8 leaves per input and call; leaves the key
     /// already signed are skipped. The input's sighash type is honoured (any
-    /// BIP-341 type for taproot, `SIGHASH_ALL` otherwise).
+    /// BIP-341 type for taproot, `SIGHASH_ALL` otherwise), and a type setting
+    /// [`SIGHASH_UNIFIED`] signs under the unified opt-in sighash, which needs
+    /// the UTXO of every input.
     ///
     /// Inputs that are already finalized, lack the UTXO/script data to sign,
     /// or do not involve the key are left unchanged. An input whose data fails

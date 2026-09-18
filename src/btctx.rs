@@ -16,8 +16,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::address::parse_bitcoin_based_address;
 use crate::btcamount::BtcAmount;
 use crate::btcraw::{
-    PrevOut, RawTx, RawTxIn, RawTxOut, SegwitV0Midstate, TapScriptPath, TapSighash,
-    TaprootMidstate, taproot_sighash_of,
+    PrevOut, RawTx, RawTxIn, RawTxOut, SIGHASH_UNIFIED, SegwitV0Midstate, TapScriptPath,
+    TapSighash, TaprootMidstate, UnifiedSpend, taproot_sighash_of, unified_sighash_of,
 };
 use crate::btcvarint::BtcVarInt;
 use crate::crypto::SignerError;
@@ -145,9 +145,11 @@ pub struct BtcTxSign<'a> {
     /// Value of the input being spent (required for segwit and taproot).
     pub amount: BtcAmount,
     /// Sighash flag. 0 defaults to `SIGHASH_ALL`, except for taproot where it
-    /// is `SIGHASH_DEFAULT`; taproot accepts every BIP-341 type.
+    /// is `SIGHASH_DEFAULT`; taproot accepts every BIP-341 type. Setting
+    /// [`SIGHASH_UNIFIED`] opts into the unified sighash (see [`BtcTx::sign`]).
     pub sighash: u32,
-    /// scriptPubKey of the output being spent (required for taproot).
+    /// scriptPubKey of the output being spent (required for taproot, and for
+    /// every input once any input uses the unified sighash).
     pub prev_script: Vec<u8>,
     /// Taproot: the merkle root of the script tree the output commits to, for
     /// a key-path spend of such an output (`None` for a BIP-86 output).
@@ -198,7 +200,7 @@ impl<'a> BtcTxSign<'a> {
         self.amount = BtcAmount(amount);
         self
     }
-    /// Sets the previous scriptPubKey (taproot).
+    /// Sets the previous scriptPubKey (taproot, unified sighash).
     pub fn prev_script(mut self, script: Vec<u8>) -> Self {
         self.prev_script = script;
         self
@@ -212,13 +214,22 @@ fn signer_pubkey_script(key: &dyn Signer, name: &str) -> Result<Vec<u8>, Error> 
 
 impl BtcTx {
     /// Signs the transaction. Requires one signing entry per input.
+    ///
+    /// A `sighash` with [`SIGHASH_UNIFIED`] (0x20) set signs that input under
+    /// the unified opt-in signature hash (Bitcoin Knots
+    /// `doc/unified-sighash.md`) rather than the legacy, BIP-143 or BIP-341
+    /// one, whatever the scheme. It commits to every spent output, so every
+    /// entry then needs its `amount` and `prev_script`.
     pub fn sign(&mut self, keys: &[BtcTxSign]) -> Result<(), Error> {
         if self.inputs.is_empty() || self.inputs.len() != keys.len() {
             return Err(Error::KeyCount);
         }
 
-        let mut midstate: Option<SegwitV0Midstate> = None;
-        let mut taproot_parts: Option<TaprootSighashParts> = None;
+        let mut cache = SighashCache {
+            keys,
+            segwit: None,
+            taproot: None,
+        };
 
         for (n, k) in keys.iter().enumerate() {
             let mut sighash = k.sighash;
@@ -230,7 +241,7 @@ impl BtcTx {
             match k.scheme.as_str() {
                 "p2pk" => {
                     let script_code = signer_pubkey_script(key, "p2pk")?;
-                    let digest = self.legacy_sighash(n, &script_code, sighash)?;
+                    let digest = self.ecdsa_digest(&mut cache, n, &script_code, false, sighash)?;
                     let mut sig: Vec<u8> = key.sign_ecdsa_der(&digest)?.into();
                     sig.push((sighash & 0xff) as u8);
                     self.inputs[n].script = push_bytes(&sig);
@@ -238,12 +249,11 @@ impl BtcTx {
                 "p2pkh" | "p2pukh" => {
                     if sighash & 0x40 == 0x40 {
                         // bitcoin-cash forkid: same preimage as segwit
-                        let mid = *midstate.get_or_insert_with(|| self.segwit_v0_midstate());
-                        self.p2wpkh_sign(n, k, sighash, &mid)?;
+                        self.p2wpkh_sign(&mut cache, n, k, sighash)?;
                         continue;
                     }
                     let script_code = signer_pubkey_script(key, &k.scheme)?;
-                    let digest = self.legacy_sighash(n, &script_code, sighash)?;
+                    let digest = self.ecdsa_digest(&mut cache, n, &script_code, false, sighash)?;
                     let mut sig: Vec<u8> = key.sign_ecdsa_der(&digest)?.into();
                     sig.push((sighash & 0xff) as u8);
                     let pubkey = if k.scheme == "p2pkh" {
@@ -256,19 +266,13 @@ impl BtcTx {
                     self.inputs[n].script = script;
                 }
                 "p2wpkh" | "p2sh:p2wpkh" => {
-                    let mid = *midstate.get_or_insert_with(|| self.segwit_v0_midstate());
-                    self.p2wpkh_sign(n, k, sighash, &mid)?;
+                    self.p2wpkh_sign(&mut cache, n, k, sighash)?;
                 }
                 "p2wsh" | "p2wsh:p2pk" | "p2wsh:p2puk" | "p2wsh:p2pkh" | "p2wsh:p2pukh" => {
-                    let mid = *midstate.get_or_insert_with(|| self.segwit_v0_midstate());
-                    self.p2wsh_sign(n, k, sighash, &mid)?;
+                    self.p2wsh_sign(&mut cache, n, k, sighash)?;
                 }
                 "p2tr" => {
-                    if taproot_parts.is_none() {
-                        taproot_parts = Some(self.taproot_sighash_parts_from_keys(keys)?);
-                    }
-                    let parts = taproot_parts.as_ref().unwrap();
-                    self.p2tr_sign(n, k, parts)?;
+                    self.p2tr_sign(&mut cache, n, k)?;
                 }
                 _ => return Err(Error::UnsupportedScheme),
             }
@@ -276,12 +280,63 @@ impl BtcTx {
         Ok(())
     }
 
+    /// The digest an ECDSA signature on input `n` commits to: the unified
+    /// sighash if `sighash` opts in, otherwise BIP-143 for segwit inputs and
+    /// the legacy one for the rest.
+    fn ecdsa_digest(
+        &self,
+        cache: &mut SighashCache<'_, '_>,
+        n: usize,
+        script_code: &[u8],
+        segwit: bool,
+        sighash: u32,
+    ) -> Result<[u8; 32], Error> {
+        if sighash & u32::from(SIGHASH_UNIFIED) != 0 {
+            // 0x40 is the Bitcoin Cash fork id, whose digests differ
+            let hash_type = match u8::try_from(sighash) {
+                Ok(t) if t & 0x40 == 0 => t,
+                _ => return Err(Error::UnsupportedSighash),
+            };
+            let spend = if segwit {
+                UnifiedSpend::SegwitV0(script_code)
+            } else {
+                UnifiedSpend::Legacy(script_code)
+            };
+            return self.unified_digest(cache, n, hash_type, &spend);
+        }
+        if segwit {
+            let mid = *cache
+                .segwit
+                .get_or_insert_with(|| self.segwit_v0_midstate());
+            let amount = cache.keys[n].amount.0;
+            return Ok(mid.sighash(&self.inputs[n].raw(), script_code, amount, sighash));
+        }
+        self.legacy_sighash(n, script_code, sighash)
+    }
+
+    /// The unified sighash of input `n`, through the cached midstate.
+    fn unified_digest(
+        &self,
+        cache: &mut SighashCache<'_, '_>,
+        n: usize,
+        hash_type: u8,
+        spend: &UnifiedSpend<'_>,
+    ) -> Result<[u8; 32], Error> {
+        let mid = cache.taproot(self)?;
+        let k = &cache.keys[n];
+        let prevout = PrevOut {
+            amount: k.amount.0,
+            script: &k.prev_script,
+        };
+        self.with_raw(|raw| unified_sighash_of(raw, &mid, n, prevout, hash_type, spend))
+    }
+
     fn p2wpkh_sign(
         &mut self,
+        cache: &mut SighashCache<'_, '_>,
         n: usize,
         k: &BtcTxSign,
         sighash: u32,
-        mid: &SegwitV0Midstate,
     ) -> Result<(), Error> {
         let key = k.key.ok_or(Error::MissingKey)?;
         let pubkey = if k.scheme == "p2pukh" {
@@ -291,7 +346,7 @@ impl BtcTx {
         };
         let pk_hash = hash160(&pubkey);
         let script_code = p2pkh_script_code(&pk_hash);
-        let digest = mid.sighash(&self.inputs[n].raw(), &script_code, k.amount.0, sighash);
+        let digest = self.ecdsa_digest(cache, n, &script_code, true, sighash)?;
         let mut sig: Vec<u8> = key.sign_ecdsa_der(&digest)?.into();
         sig.push((sighash & 0xff) as u8);
 
@@ -318,10 +373,10 @@ impl BtcTx {
 
     fn p2wsh_sign(
         &mut self,
+        cache: &mut SighashCache<'_, '_>,
         n: usize,
         k: &BtcTxSign,
         sighash: u32,
-        mid: &SegwitV0Midstate,
     ) -> Result<(), Error> {
         let key = k.key.ok_or(Error::MissingKey)?;
         let (inner_scheme, witness_script): (&str, Vec<u8>) = if k.scheme == "p2wsh" {
@@ -331,7 +386,7 @@ impl BtcTx {
             (inner, signer_pubkey_script(key, inner)?)
         };
 
-        let digest = mid.sighash(&self.inputs[n].raw(), &witness_script, k.amount.0, sighash);
+        let digest = self.ecdsa_digest(cache, n, &witness_script, true, sighash)?;
         let mut sig: Vec<u8> = key.sign_ecdsa_der(&digest)?.into();
         sig.push((sighash & 0xff) as u8);
 
@@ -794,14 +849,33 @@ impl BtcTx {
         self.with_raw(|raw| taproot_sighash_of(raw, &parts, idx, prevout, opts))
     }
 
+    /// Computes the unified opt-in digest of input `idx` (see
+    /// [`RawTx::unified_sighash`]). Each entry in `keys` must have its
+    /// `prev_script` and `amount` set.
+    pub fn unified_sighash(
+        &self,
+        keys: &[BtcTxSign],
+        idx: usize,
+        hash_type: u8,
+        spend: &UnifiedSpend<'_>,
+    ) -> Result<[u8; 32], Error> {
+        let parts = self.taproot_sighash_parts_from_keys(keys)?;
+        let k = keys.get(idx).ok_or(Error::InputIndex)?;
+        let prevout = PrevOut {
+            amount: k.amount.0,
+            script: &k.prev_script,
+        };
+        self.with_raw(|raw| unified_sighash_of(raw, &parts, idx, prevout, hash_type, spend))
+    }
+
     fn p2tr_sign(
         &mut self,
+        cache: &mut SighashCache<'_, '_>,
         n: usize,
         k: &BtcTxSign,
-        parts: &TaprootSighashParts,
     ) -> Result<(), Error> {
         let hash_type = match k.sighash {
-            t @ (0x00..=0x03 | 0x81..=0x83) => t as u8,
+            t @ (0x00..=0x03 | 0x81..=0x83 | 0x21..=0x23 | 0xa1..=0xa3) => t as u8,
             _ => return Err(Error::UnsupportedSighash),
         };
         let key = k.key.ok_or(Error::MissingKey)?;
@@ -831,7 +905,16 @@ impl BtcTx {
             }
             opts = opts.with_script_path(TapScriptPath::new(cb.leaf_hash(script)));
         }
-        let sighash = self.with_raw(|raw| taproot_sighash_of(raw, parts, n, prevout, &opts))?;
+        let sighash = if hash_type & SIGHASH_UNIFIED != 0 {
+            let spend = UnifiedSpend::Taproot {
+                annex: None,
+                script_path: opts.script_path,
+            };
+            self.unified_digest(cache, n, hash_type, &spend)?
+        } else {
+            let parts = cache.taproot(self)?;
+            self.with_raw(|raw| taproot_sighash_of(raw, &parts, n, prevout, &opts))?
+        };
         let mut sig = match &k.tap_leaf {
             Some(_) => key.sign_schnorr(&sighash)?,
             None => key.sign_taproot_with_root(&sighash, k.tap_merkle_root.as_ref())?,
@@ -846,6 +929,26 @@ impl BtcTx {
         };
         self.inputs[n].script = Vec::new();
         Ok(())
+    }
+}
+
+/// Midstates shared by the inputs of one [`BtcTx::sign`] call, computed on
+/// first use.
+struct SighashCache<'k, 'a> {
+    keys: &'k [BtcTxSign<'a>],
+    segwit: Option<SegwitV0Midstate>,
+    taproot: Option<TaprootSighashParts>,
+}
+
+impl SighashCache<'_, '_> {
+    /// The BIP-341 aggregates, shared with the unified sighash.
+    fn taproot(&mut self, tx: &BtcTx) -> Result<TaprootSighashParts, Error> {
+        if let Some(parts) = self.taproot {
+            return Ok(parts);
+        }
+        Ok(*self
+            .taproot
+            .insert(tx.taproot_sighash_parts_from_keys(self.keys)?))
     }
 }
 

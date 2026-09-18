@@ -103,6 +103,30 @@ and [`BtcTx::taproot_sighash`] to compute the tweaked key and sighash offline.
 Every BIP-341 sighash type is supported (`.sighash(0x83)` for
 `SINGLE|ANYONECANPAY`, and so on).
 
+#### Unified opt-in sighash
+
+Setting bit `0x20` (`btcraw::SIGHASH_UNIFIED`) in an input's sighash signs it
+under the unified signature hash that Bitcoin Knots specifies
+([`doc/unified-sighash.md`](https://github.com/bitcoinknots/bitcoin/blob/v29.4.1.knots20260508/doc/unified-sighash.md)).
+It is one BIP-341-style message for every script type (bare/P2SH, segwit v0,
+taproot key path and tapscript) and every hash type. It commits to every spent
+output, so each entry needs `amount` and `prev_script`. It applies only on a
+chain that activates it; elsewhere such signatures are invalid.
+
+```rust
+use outscript::btcraw::SIGHASH_UNIFIED;
+
+let all = u32::from(SIGHASH_UNIFIED) | 0x01; // ALL|UNIFIED
+tx.sign(&[
+    BtcTxSign::new(&key0, "p2wpkh").amount(50_000).prev_script(spk0).sighash(all),
+    BtcTxSign::new(&key1, "p2tr").amount(70_000).prev_script(spk1).sighash(all),
+]).unwrap();
+```
+
+A PSBT input whose `PSBT_IN_SIGHASH_TYPE` sets the bit is signed the same
+way. `RawTx::unified_sighash` computes the digest directly, including the annex
+and codeseparator position.
+
 ### Taproot script trees
 
 The `taproot` module builds script trees without allocating. A tree is a
@@ -396,7 +420,7 @@ Without `alloc` you still get:
   `encode_address_to_slice` to render them, and `decode_*_address` to parse
   Bitcoin-family, EVM, Massa, Solana and Cardano addresses.
 - **Transaction signing** — `psbt::Psbt` (the full BIP-174 workflow),
-  `btcraw::RawTx` (legacy, BIP-143 and taproot sighashes, serialization,
+  `btcraw::RawTx` (legacy, BIP-143, taproot and unified sighashes, serialization,
   txid) and `evmraw::RawEvmTx` (legacy/EIP-2930/
   EIP-1559 signing, encoding, hash, sender recovery).
 - **Utilities** — Solana keys/PDAs/compact-u16, EVM ABI selectors and ERC-20
