@@ -12,6 +12,10 @@
 //! `SIGHASH_ALL` (including the Bitcoin Cash `ALL|FORKID` flag, which shares
 //! the BIP-143 preimage). Taproot supports every BIP-341 hash type, the annex
 //! and script-path spends through [`RawTx::taproot_sighash`].
+//!
+//! The unified opt-in sighash ([`RawTx::unified_sighash`]), selected by
+//! [`SIGHASH_UNIFIED`] in the hash type, covers every script type and hash
+//! type.
 
 pub use crate::Error;
 
@@ -343,8 +347,37 @@ impl<'a> RawTx<'a> {
         taproot_sighash_of(self, midstate, index, prevout, opts)
     }
 
-    /// Precomputes the BIP-341 hashes shared by every input's taproot sighash.
-    /// `prevouts` are the outputs spent by each input, in order.
+    /// The unified opt-in signature hash of input `index` (see
+    /// [`UnifiedSpend`]), for a `hash_type` that sets [`SIGHASH_UNIFIED`] (see
+    /// [`is_unified_hash_type`]).
+    ///
+    /// `midstate` comes from [`taproot_midstate`](Self::taproot_midstate) over
+    /// the same `prevouts` (the outputs the inputs spend, in order): the
+    /// aggregates are BIP-341's, and computing them once serves every input.
+    ///
+    /// Signatures over it are made as usual for the script type: DER ECDSA
+    /// plus the hash type byte for bare, P2SH and segwit v0, and BIP-340 plus
+    /// the hash type byte (always 65 bytes) for taproot. Fails with
+    /// [`Error::OutputIndex`] for `SIGHASH_SINGLE` without an output at
+    /// `index`.
+    pub fn unified_sighash(
+        &self,
+        midstate: &TaprootMidstate,
+        prevouts: &[PrevOut<'_>],
+        index: usize,
+        hash_type: u8,
+        spend: &UnifiedSpend<'_>,
+    ) -> Result<[u8; 32], Error> {
+        if prevouts.len() != self.inputs.len() {
+            return Err(Error::PrevOutCount);
+        }
+        let prevout = *prevouts.get(index).ok_or(Error::InputIndex)?;
+        unified_sighash_of(self, midstate, index, prevout, hash_type, spend)
+    }
+
+    /// Precomputes the BIP-341 hashes shared by every input's taproot sighash
+    /// (and unified sighash). `prevouts` are the outputs spent by each input,
+    /// in order.
     pub fn taproot_midstate(&self, prevouts: &[PrevOut<'_>]) -> Result<TaprootMidstate, Error> {
         taproot_midstate_of(self, prevouts.iter().copied())
     }
@@ -614,6 +647,166 @@ pub(crate) fn taproot_sighash_of<T: TxSource + ?Sized>(
         h.put(&sha);
     }
     if let Some(leaf) = opts.script_path {
+        h.put(&leaf.leaf_hash);
+        h.put(&[0x00]); // key_version
+        h.put(&leaf.codesep_pos.to_le_bytes());
+    }
+    Ok(h.0.finalize())
+}
+
+/// The hash type bit selecting the unified opt-in signature hash specified by
+/// Bitcoin Knots (`doc/unified-sighash.md`, v29.4.1.knots20260508).
+pub const SIGHASH_UNIFIED: u8 = 0x20;
+
+/// What a unified sighash commits to about the script being executed: its
+/// script type (the byte BIP-341 uses for the spend type) and per-type data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnifiedSpend<'a> {
+    /// Script type 0, a bare or P2SH input, with its scriptCode: the
+    /// scriptPubKey or redeem script from the last executed `OP_CODESEPARATOR`
+    /// on, with the signature being checked removed (the legacy
+    /// `FindAndDelete`, a no-op when signing).
+    Legacy(&'a [u8]),
+    /// Script type 1, a segwit v0 input, with its BIP-143 scriptCode: the
+    /// implied P2PKH script for P2WPKH, the witness script for P2WSH.
+    SegwitV0(&'a [u8]),
+    /// Script type 2 (key path) or 3 (tapscript, with `script_path`), a
+    /// taproot input.
+    Taproot {
+        /// The annex (the last witness item when it starts with 0x50), if any.
+        annex: Option<&'a [u8]>,
+        /// The executed leaf, for a script-path spend.
+        script_path: Option<TapScriptPath>,
+    },
+}
+
+impl UnifiedSpend<'_> {
+    /// A taproot key-path spend without an annex.
+    pub const KEY_PATH: UnifiedSpend<'static> = UnifiedSpend::Taproot {
+        annex: None,
+        script_path: None,
+    };
+
+    fn script_type(&self) -> u8 {
+        match self {
+            UnifiedSpend::Legacy(_) => 0,
+            UnifiedSpend::SegwitV0(_) => 1,
+            UnifiedSpend::Taproot { script_path, .. } => 2 + script_path.is_some() as u8,
+        }
+    }
+}
+
+/// Reports whether `hash_type` opts `spend` into the unified sighash: it sets
+/// [`SIGHASH_UNIFIED`], and for taproot is otherwise one BIP-341 defines
+/// (`ALL`, `NONE` or `SINGLE`, optionally with `ANYONECANPAY`). Bare, P2SH and
+/// segwit v0 commit to any byte, reading its low five bits as the legacy
+/// algorithm does.
+pub fn is_unified_hash_type(hash_type: u8, spend: &UnifiedSpend<'_>) -> bool {
+    hash_type & SIGHASH_UNIFIED != 0
+        && match spend {
+            UnifiedSpend::Legacy(_) | UnifiedSpend::SegwitV0(_) => true,
+            UnifiedSpend::Taproot { .. } => matches!(hash_type & 0x7f, 0x21..=0x23),
+        }
+}
+
+/// The unified sighash of input `index` of `tx`, whose spent output is
+/// `prevout` (see [`RawTx::unified_sighash`]).
+pub(crate) fn unified_sighash_of<T: TxSource + ?Sized>(
+    tx: &T,
+    mid: &TaprootMidstate,
+    index: usize,
+    prevout: PrevOut<'_>,
+    hash_type: u8,
+    spend: &UnifiedSpend<'_>,
+) -> Result<[u8; 32], Error> {
+    if !is_unified_hash_type(hash_type, spend) {
+        return Err(Error::UnsupportedSighash);
+    }
+    let index32 = mid.check(index)?;
+    let anyone_can_pay = hash_type & 0x80 != 0;
+    // outputs are read as the legacy algorithm reads them: anything but NONE
+    // and SINGLE signs them all
+    let (none, single) = (hash_type & 0x1f == 2, hash_type & 0x1f == 3);
+    let annex = match spend {
+        UnifiedSpend::Taproot { annex, .. } => *annex,
+        _ => None,
+    };
+    if let Some(annex) = annex
+        && annex.first() != Some(&0x50)
+    {
+        return Err(Error::InvalidData);
+    }
+
+    // unlike the legacy algorithms, SINGLE needs an output at the input's index
+    let mut sha_single_output = None;
+    if single {
+        let mut i = 0;
+        tx.for_each_output(&mut |o| {
+            if i == index {
+                sha_single_output = Some(sha256_with(|s| put_output(s, o)));
+            }
+            i += 1;
+        });
+        if sha_single_output.is_none() {
+            return Err(Error::OutputIndex);
+        }
+    }
+
+    let tag = sha256_once(b"UnifiedSighash");
+    let mut h = HashSink(Sha256::new());
+    h.put(&tag);
+    h.put(&tag);
+    h.put(&[0x00, hash_type]); // epoch, hash_type
+    h.put(&mid.version.to_le_bytes());
+    h.put(&mid.locktime.to_le_bytes());
+    h.put(&[0x00]); // locktime is five bytes here
+    if !anyone_can_pay {
+        h.put(&mid.sha_prevouts);
+        h.put(&mid.sha_amounts);
+        h.put(&mid.sha_scriptpubkeys);
+        h.put(&mid.sha_sequences);
+    }
+    if !none && !single {
+        h.put(&mid.sha_outputs);
+    }
+    h.put(&[spend.script_type()]);
+    if anyone_can_pay {
+        let mut i = 0;
+        tx.for_each_input(&mut |input| {
+            if i == index {
+                put_outpoint(&mut h, input);
+                put_output(&mut h, &prevout); // amount, then scriptPubKey
+                h.put(&input.sequence.to_le_bytes());
+            }
+            i += 1;
+        });
+    } else {
+        h.put(&index32.to_le_bytes());
+    }
+    match spend {
+        UnifiedSpend::Legacy(code) | UnifiedSpend::SegwitV0(code) => {
+            put_varint(&mut h, code.len());
+            h.put(code);
+        }
+        UnifiedSpend::Taproot { .. } => match annex {
+            Some(annex) => {
+                h.put(&[0x01]);
+                h.put(&sha256_with(|s| {
+                    put_varint(s, annex.len());
+                    s.put(annex);
+                }));
+            }
+            None => h.put(&[0x00]),
+        },
+    }
+    if let Some(sha) = sha_single_output {
+        h.put(&sha);
+    }
+    if let UnifiedSpend::Taproot {
+        script_path: Some(leaf),
+        ..
+    } = spend
+    {
         h.put(&leaf.leaf_hash);
         h.put(&[0x00]); // key_version
         h.put(&leaf.codesep_pos.to_le_bytes());

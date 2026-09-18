@@ -1166,3 +1166,178 @@ fn p2tr_script_path_spend() {
         Err(Error::UnsupportedScript)
     );
 }
+
+// --- unified opt-in sighash ---
+
+/// The unified sighash of input `index` of `tx`, spending `prevouts`.
+fn unified_sighash(
+    tx: &BtcTx,
+    prevouts: &[crate::btcraw::PrevOut<'_>],
+    index: usize,
+    hash_type: u8,
+    spend: &crate::btcraw::UnifiedSpend<'_>,
+) -> Result<[u8; 32], Error> {
+    tx.with_raw(|raw| {
+        let mid = raw.taproot_midstate(prevouts)?;
+        raw.unified_sighash(&mid, prevouts, index, hash_type, spend)
+    })
+}
+
+/// The Bitcoin Knots unified sighash vectors (`src/test/data/unified_sighash.json`
+/// at v29.4.1.knots20260508): scriptCode, raw transaction, input index, hash
+/// type, script type, spent outputs, expected sighash. Tapscript vectors carry
+/// the leaf script and use no annex and no `OP_CODESEPARATOR`.
+#[test]
+fn unified_sighash_vectors() {
+    use crate::btcraw::{PrevOut, RawTxOut, TapScriptPath, UnifiedSpend};
+    use crate::taproot::{TAPSCRIPT_LEAF_VERSION, tapleaf_hash};
+
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("../testdata/unified_sighash.json")).unwrap();
+    let vectors = vectors.as_array().unwrap();
+    let mut count = 0;
+    for v in &vectors[1..] {
+        let script_code = hex::decode(v[0].as_str().unwrap()).unwrap();
+        let tx = parse(v[1].as_str().unwrap());
+        let index = v[2].as_u64().unwrap() as usize;
+        let hash_type = v[3].as_u64().unwrap() as u8;
+        let spent: Vec<(u64, Vec<u8>)> = v[5]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| {
+                let amount = o[0].as_u64().unwrap();
+                (amount, hex::decode(o[1].as_str().unwrap()).unwrap())
+            })
+            .collect();
+        let prevouts: Vec<PrevOut<'_>> = spent
+            .iter()
+            .map(|(amount, script)| RawTxOut {
+                amount: *amount,
+                script,
+            })
+            .collect();
+        let spend = match v[4].as_u64().unwrap() {
+            0 => UnifiedSpend::Legacy(&script_code),
+            1 => UnifiedSpend::SegwitV0(&script_code),
+            2 => UnifiedSpend::KEY_PATH,
+            3 => UnifiedSpend::Taproot {
+                annex: None,
+                script_path: Some(TapScriptPath::new(tapleaf_hash(
+                    TAPSCRIPT_LEAF_VERSION,
+                    &script_code,
+                ))),
+            },
+            t => panic!("script type {t}"),
+        };
+        let got = unified_sighash(&tx, &prevouts, index, hash_type, &spend).unwrap();
+        assert_eq!(hex::encode(got), v[6].as_str().unwrap(), "vector {v}");
+        count += 1;
+    }
+    assert_eq!(count, 166);
+}
+
+/// Annex and codeseparator commitments, which the Knots vectors leave at their
+/// defaults. Expected values from `UnifiedSignatureHash` in Knots'
+/// `test/functional/test_framework/script.py`.
+#[test]
+fn unified_sighash_annex_codesep() {
+    use crate::btcraw::{RawTxOut, TapScriptPath, UnifiedSpend};
+    use crate::taproot::{TAPSCRIPT_LEAF_VERSION, tapleaf_hash};
+
+    let tx = parse(
+        "01000000013412a79af62f112c6d1f07ae37b7dd832c16a9938ca13710c4aa7a86149e7e900100000000000000000260e5cc01000000001514b4d551c269e842436b426b506591e35a6eaa426b857d7c0100000000151427cc20ce3a0f64b433d81e4eecc43d1bc5fda29f00000000",
+    );
+    let spk = hex::decode("512054ffb854f30027cd78f146ff92904a4d008bcae625ccda02e63d32d1cbd29c13")
+        .unwrap();
+    let prevouts = [RawTxOut {
+        amount: 26_954_754,
+        script: &spk,
+    }];
+    let leaf = hex::decode("2067a20cd4a6079ec4187547c0f3bed18dec272baf2342876e7175fc15345af793ac")
+        .unwrap();
+    let annex = [0x50, 0xaa, 0xbb, 0xcc];
+    let path = TapScriptPath::new(tapleaf_hash(TAPSCRIPT_LEAF_VERSION, &leaf)).with_codesep_pos(7);
+    let script = UnifiedSpend::Taproot {
+        annex: Some(&annex),
+        script_path: Some(path),
+    };
+    let key = UnifiedSpend::Taproot {
+        annex: Some(&annex),
+        script_path: None,
+    };
+    for (hash_type, spend, want) in [
+        (
+            0x21,
+            script,
+            "4840e8478ab8b57cc4b65e28abbfcdb0201b8ca6905fc8499579eecab07dc3ae",
+        ),
+        (
+            0x21,
+            key,
+            "ff155493bb308bff9fbc9d05207e316daf3aaf9592d1acc96f40e965615126e4",
+        ),
+        (
+            0xa3,
+            script,
+            "cd3c0c8b4d92816b088f579c6ccceaa719cd0070a2238047c8f5b8d2d75a6c04",
+        ),
+        (
+            0xa3,
+            key,
+            "a060fcdb5e4b3a3acf1dcaf136e49ca0d6cbeca02a404d122371cdb0f1113c61",
+        ),
+    ] {
+        let got = unified_sighash(&tx, &prevouts, 0, hash_type, &spend).unwrap();
+        assert_eq!(hex::encode(got), want, "hash type {hash_type:#x}");
+    }
+}
+
+#[test]
+fn unified_sighash_rejects() {
+    use crate::btcraw::{RawTxOut, UnifiedSpend};
+
+    // two inputs, one output
+    let mut tx = parse(BIP143_TX);
+    tx.outputs.truncate(1);
+    let spk = [0x51];
+    let prevouts = [RawTxOut {
+        amount: 1,
+        script: &spk,
+    }; 2];
+    let legacy = UnifiedSpend::Legacy(&[]);
+    let key = UnifiedSpend::KEY_PATH;
+    let sighash =
+        |index, hash_type, spend| unified_sighash(&tx, &prevouts, index, hash_type, spend);
+
+    assert!(sighash(1, 0x21, &legacy).is_ok());
+    // SINGLE needs an output at the input's index
+    assert!(sighash(0, 0x23, &legacy).is_ok());
+    assert_eq!(sighash(1, 0x23, &legacy), Err(Error::OutputIndex));
+    assert_eq!(sighash(1, 0xa3, &key), Err(Error::OutputIndex));
+    // the opt-in bit is required
+    assert_eq!(sighash(0, 0x01, &legacy), Err(Error::UnsupportedSighash));
+    assert_eq!(sighash(0, 0x01, &key), Err(Error::UnsupportedSighash));
+    // bare, P2SH and segwit v0 commit to any byte; taproot to defined types only
+    for t in [0x20, 0x24, 0x3f, 0x61, 0xff] {
+        assert!(sighash(0, t, &legacy).is_ok(), "{t:#x}");
+        assert_eq!(
+            sighash(0, t, &key),
+            Err(Error::UnsupportedSighash),
+            "{t:#x}"
+        );
+    }
+    let bad_annex = UnifiedSpend::Taproot {
+        annex: Some(&[0x51]),
+        script_path: None,
+    };
+    assert_eq!(sighash(0, 0x21, &bad_annex), Err(Error::InvalidData));
+    assert_eq!(sighash(2, 0x21, &legacy), Err(Error::InputIndex));
+    assert_eq!(
+        tx.with_raw(|raw| {
+            let mid = raw.taproot_midstate(&prevouts).unwrap();
+            raw.unified_sighash(&mid, &prevouts[..1], 0, 0x21, &legacy)
+        }),
+        Err(Error::PrevOutCount)
+    );
+}
