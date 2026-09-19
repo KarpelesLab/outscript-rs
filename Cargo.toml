@@ -20,7 +20,7 @@ name = "outscript"
 # Chains are opt-in: each chain feature enables its modules, formats and
 # address codecs, and pulls in only the curve arithmetic it needs. The default
 # enables every chain.
-default = ["std", "bitcoin", "evm", "solana", "cardano", "massa"]
+default = ["std", "bitcoin", "evm", "solana", "cardano", "massa", "bcur", "bbqr"]
 std = [
     "alloc",
     "purecrypto/std",
@@ -53,6 +53,16 @@ cardano = ["ed25519", "purecrypto/kdf"]
 # Massa: addresses.
 massa = ["ed25519"]
 
+# --- transports (chain-independent text encodings for moving PSBTs and other
+# payloads between devices, typically as QR codes; only the strings are
+# handled here) ---
+# Blockchain Commons Uniform Resources (BCR-2020-005): bytewords, single-part
+# `ur:` strings and (with `alloc`) multi-part fountain encoding/decoding.
+bcur = []
+# Coinkite BBQr: headers, hex/base32 parts, zlib (raw deflate) payloads and
+# (with `alloc`) splitting and joining.
+bbqr = ["dep:minizlib"]
+
 # --- curves (enabled by the chains above; usable on their own for the raw
 # `crypto` helpers) ---
 secp256k1 = ["purecrypto/hazmat-secp256k1"]
@@ -65,6 +75,7 @@ num-traits = { version = "0.2", default-features = false, optional = true }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
 serde_json = { version = "1", default-features = false, features = ["alloc", "raw_value"], optional = true }
 hex = { version = "0.4", default-features = false, features = ["alloc"], optional = true }
+minizlib = { version = "0.1.1", default-features = false, features = ["decompress", "compress", "stored", "fixed", "dynamic"], optional = true }
 
 [dev-dependencies]
 hex = "0.4"

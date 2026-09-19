@@ -339,6 +339,66 @@ Native tokens are added via `CardanoOutput.assets` (`CardanoAsset { policy_id,
 asset_name, amount }`). Plutus scripts, certificates, staking actions and
 metadata are out of scope.
 
+### Moving PSBTs around: UR and BBQr
+
+Air-gapped signers take PSBTs in and out as QR codes, in one of two text
+encodings. Both are implemented down to the strings — what goes into the QR
+codes, or comes out of a scanner — and need no chain feature.
+
+**Uniform Resources** (`bcur`, [BCR-2020-005]) carry CBOR as bytewords. Long
+payloads become a fountain-coded stream of parts: the receiver needs no
+particular one of them, only enough of them.
+
+```rust
+use outscript::bcur::{self, Decoder, Encoder};
+
+// a PSBT travels as a CBOR byte string, in fragments of at most 200 bytes
+let cbor = bcur::bytes_to_cbor(&psbt);
+let mut encoder = Encoder::new(bcur::TYPE_CRYPTO_PSBT, &cbor, 200)?;
+// "ur:crypto-psbt/1-3/lpadaxcs...": show these in a loop until the other
+// side is done; uppercase them for smaller QR codes
+let part = encoder.next_part().to_ascii_uppercase();
+
+// the other way: feed whatever the scanner sees, in any order, any case
+let mut decoder = Decoder::new();
+while !decoder.receive(&scan()?)? {}
+assert_eq!(decoder.ur_type(), Some("crypto-psbt"));
+let psbt = bcur::cbor_to_bytes(decoder.message().unwrap())?;
+```
+
+Short payloads are single-part (`bcur::encode` / `bcur::decode`), and
+`bcur::bytewords` has the three bytewords styles on their own.
+
+**BBQr** (`bbqr`, [Coinkite's specification][BBQr]) cuts a file into numbered
+parts, in hex, base32, or compressed then base32. Every part has to be
+received, in any order.
+
+```rust
+use outscript::bbqr::{self, FileType, Joiner};
+
+// parts of at most 2132 characters: a version 27 QR code. Compressed if
+// that makes the file smaller, as base32 otherwise.
+let parts = bbqr::split(&psbt, FileType::PSBT, 2132)?; // "B$ZP0300..."
+
+let mut joiner = Joiner::new();
+while !joiner.receive(&scan()?)? {
+    println!("{} of {}", joiner.received_part_count(), joiner.part_count());
+}
+let (file_type, psbt) = joiner.finish()?;
+```
+
+Compressed data stays within the 1 KiB window the specification asks for, so
+that hardware wallets can decompress it. The compressor ([minizlib]) is a small
+one: close to zlib on the likes of PSBTs, where little repeats, and a long way
+behind on very repetitive files. Anything zlib produces is decompressed.
+
+Both decoders bound what untrusted parts can make them allocate
+(`Decoder::with_limits`, `Joiner::with_max_len`).
+
+[BCR-2020-005]: https://github.com/BlockchainCommons/Research/blob/master/papers/bcr-2020-005-ur.md
+[BBQr]: https://github.com/coinkite/BBQr/blob/master/BBQr.md
+[minizlib]: https://crates.io/crates/minizlib
+
 ### Block rewards
 
 ```rust
@@ -359,6 +419,14 @@ from `purecrypto`. All chains are enabled by default.
 | `solana` | addresses, program-derived addresses, `SolanaTx` | `ed25519` |
 | `cardano` | Shelley addresses, BIP32-Ed25519 derivation, `CardanoTx` | `ed25519` |
 | `massa` | addresses | `ed25519` |
+
+The transports are features too, independent of any chain and enabled by
+default:
+
+| Feature | Enables | Dependency |
+|---------|---------|------------|
+| `bcur` | Uniform Resources: bytewords, `ur:` strings, fountain encoder and decoder | |
+| `bbqr` | BBQr: parts, splitting and joining, compression | `minizlib` |
 
 The `secp256k1` and `ed25519` features can also be enabled on their own for
 the raw `crypto` helpers and the matching `PubKey` variant. Formats and
@@ -399,7 +467,7 @@ tiers are:
 | Features | Available |
 |----------|-----------|
 | `std` (default) | everything, plus `std::io` adapters (`BtcTx::read_from`, `BtcVarInt::read_from`/`write_to`) |
-| `alloc` | everything else: `Out`/`Script`, address parsing, all transaction types, RLP/CBOR, JSON |
+| `alloc` | everything else: `Out`/`Script`, address parsing, all transaction types, RLP/CBOR, JSON, multi-part UR and BBQr |
 | none | a heap-free core (below) |
 
 Disabling the default features also disables every chain, so name the ones
@@ -426,6 +494,10 @@ Without `alloc` you still get:
 - **Utilities** — Solana keys/PDAs/compact-u16, EVM ABI selectors and ERC-20
   calldata, `BtcAmount` parsing/formatting, script guessing, and base58,
   bech32/CashAddr, EIP-55, pushdata and varint codecs.
+- **Transports** — one part at a time: `bcur` bytewords, `Ur::parse` and
+  single-part URs; `bbqr` headers, `encode_part_to_slice` /
+  `decode_part_to_slice`, and `deflate_to_slice` / `inflate_to_slice`. The
+  fountain code and the splitting and joining of whole files need `alloc`.
 
 Results come back in caller buffers or small inline values:
 

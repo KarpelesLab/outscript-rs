@@ -14,7 +14,7 @@
 //! Everything in the crate reports failures as [`Error`], which each module
 //! re-exports (`psbt::Error`, `btctx::Error` and `outscript::Error` are the
 //! same type), so `?` composes across modules. The self-contained codecs
-//! ([`base58`], [`base64`], [`bech32`], `cbor`, `rlp`,
+//! ([`base58`], [`base64`], [`bech32`], `bcur`, `bbqr`, `cbor`, `rlp`,
 //! `crypto::secp256k1` and Solana's compact-u16) keep their own
 //! small error types, which convert into [`Error`].
 //!
@@ -48,6 +48,16 @@
 //! - `secp256k1` / `ed25519`: the raw [`crypto`] helpers and the matching
 //!   [`PubKey`] variant, without any chain.
 //!
+//! So are the transports, which move PSBTs and other payloads between devices
+//! as text, usually shown as QR codes (rendering and scanning those is not
+//! this crate's business). They need no chain, and are on by default:
+//!
+//! - `bcur`: Uniform Resources (`ur:crypto-psbt/...`) — bytewords and
+//!   single-part URs, and (with `alloc`) multi-part fountain encoding and
+//!   decoding.
+//! - `bbqr`: BBQr (`B$ZP0500...`) — headers, hex/base32 parts and compression,
+//!   and (with `alloc`) splitting and joining.
+//!
 //! The runtime environment is selected separately:
 //!
 //! - `std` (default): implies `alloc`, and adds `std::io` adapters
@@ -76,7 +86,9 @@
 //!   `btcguess` script heuristics;
 //! - caller-buffer codecs: [`base58`], [`base64`], [`bech32`] (segwit, CashAddr and generic
 //!   bech32), `eip55_to_slice`, [`encode_base58_addr_to_slice`],
-//!   [`pushbytes`] and [`BtcVarInt`].
+//!   [`pushbytes`] and [`BtcVarInt`];
+//! - transports, a part at a time: `bcur` bytewords, UR parsing and
+//!   single-part URs; `bbqr` headers, parts and compression.
 
 #![cfg_attr(not(any(feature = "std", test)), no_std)]
 
@@ -96,6 +108,10 @@ mod prelude {
 pub mod address;
 pub mod base58;
 pub mod base64;
+#[cfg(feature = "bbqr")]
+pub mod bbqr;
+#[cfg(feature = "bcur")]
+pub mod bcur;
 pub mod bech32;
 #[cfg(feature = "bitcoin")]
 pub mod btcguess;

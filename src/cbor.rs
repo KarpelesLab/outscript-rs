@@ -80,7 +80,8 @@ impl core::fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
-fn write_head(out: &mut Vec<u8>, major: u8, value: u64) {
+/// Writes the head of an item: its major type and argument, in shortest form.
+pub(crate) fn write_head(out: &mut Vec<u8>, major: u8, value: u64) {
     let mt = major << 5;
     if value < 24 {
         out.push(mt | value as u8);
@@ -183,8 +184,9 @@ impl Cbor {
     }
 }
 
-/// Reads the major type and argument of a CBOR head, advancing `pos`.
-fn read_head(data: &[u8], pos: &mut usize) -> Result<(u8, u64, bool), Error> {
+/// Reads the major type and argument of a CBOR head, advancing `pos`. The
+/// flag tells an indefinite length.
+pub(crate) fn read_head(data: &[u8], pos: &mut usize) -> Result<(u8, u64, bool), Error> {
     if *pos >= data.len() {
         return Err(Error::UnexpectedEof);
     }
