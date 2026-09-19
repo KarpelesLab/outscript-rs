@@ -59,6 +59,8 @@ pub enum Error {
     InvalidChunk,
     /// The data is not a definite-length array.
     ExpectedArray,
+    /// Arrays and maps are nested deeper than [`MAX_DEPTH`].
+    NestingTooDeep,
 }
 
 impl core::fmt::Display for Error {
@@ -74,6 +76,7 @@ impl core::fmt::Display for Error {
             Error::UnexpectedBreak => f.write_str("unexpected CBOR break"),
             Error::InvalidChunk => f.write_str("invalid chunk in indefinite-length CBOR string"),
             Error::ExpectedArray => f.write_str("expected a definite-length CBOR array"),
+            Error::NestingTooDeep => f.write_str("CBOR items nested too deep"),
         }
     }
 }
@@ -144,10 +147,11 @@ impl Cbor {
     /// Decodes a single CBOR value from `data`, returning it and the number of
     /// bytes consumed. Only the subset emitted by [`Cbor::encode`] is supported
     /// (unsigned ints, byte strings, arrays, maps, bool and null); other types
-    /// produce an error.
+    /// produce an error, and so do arrays and maps nested deeper than
+    /// [`MAX_DEPTH`].
     pub fn decode(data: &[u8]) -> Result<(Cbor, usize), Error> {
         let mut pos = 0;
-        let v = decode_value(data, &mut pos)?;
+        let v = decode_value(data, &mut pos, 0)?;
         Ok((v, pos))
     }
 
@@ -207,56 +211,64 @@ pub(crate) fn read_head(data: &[u8], pos: &mut usize) -> Result<(u8, u64, bool),
 }
 
 fn read_uint(data: &[u8], pos: &mut usize, n: usize) -> Result<u64, Error> {
-    if *pos + n > data.len() {
-        return Err(Error::UnexpectedEof);
-    }
-    let mut v = 0u64;
-    for &b in &data[*pos..*pos + n] {
-        v = (v << 8) | b as u64;
-    }
-    *pos += n;
-    Ok(v)
+    let bytes = take(data, pos, n as u64)?;
+    Ok(bytes.iter().fold(0, |v, &b| (v << 8) | b as u64))
 }
 
-fn decode_value(data: &[u8], pos: &mut usize) -> Result<Cbor, Error> {
+/// The `len` bytes at `pos`, which is advanced past them. `len` is whatever
+/// the data claims: it may be past the end of the data, or of `usize`.
+fn take<'a>(data: &'a [u8], pos: &mut usize, len: u64) -> Result<&'a [u8], Error> {
+    let end = usize::try_from(len)
+        .ok()
+        .and_then(|len| pos.checked_add(len))
+        .ok_or(Error::UnexpectedEof)?;
+    let bytes = data.get(*pos..end).ok_or(Error::UnexpectedEof)?;
+    *pos = end;
+    Ok(bytes)
+}
+
+/// Checks the number of items a container claims against what is left of the
+/// data, as each takes a byte at least, so that a few bytes cannot ask for
+/// memory or time beyond their own length. Returns the count.
+fn check_count(data: &[u8], pos: usize, count: u64) -> Result<usize, Error> {
+    match usize::try_from(count) {
+        Ok(count) if count <= data.len().saturating_sub(pos) => Ok(count),
+        _ => Err(Error::UnexpectedEof),
+    }
+}
+
+/// How deep [`Cbor::decode`] follows arrays and maps into one another: well
+/// past what transactions need, and short of what the stack can take, as
+/// values are decoded, encoded and dropped recursively.
+pub const MAX_DEPTH: usize = 64;
+
+fn decode_value(data: &[u8], pos: &mut usize, depth: usize) -> Result<Cbor, Error> {
     let (major, arg, indefinite) = read_head(data, pos)?;
+    if indefinite && matches!(major, 0 | 2 | 4 | 5) {
+        return Err(Error::UnsupportedIndefiniteLength);
+    }
+    if matches!(major, 4 | 5) && depth >= MAX_DEPTH {
+        return Err(Error::NestingTooDeep);
+    }
     match major {
-        0 => {
-            if indefinite {
-                return Err(Error::UnsupportedIndefiniteLength);
-            }
-            Ok(Cbor::Uint(arg))
-        }
-        2 => {
-            if indefinite {
-                return Err(Error::UnsupportedIndefiniteLength);
-            }
-            let n = arg as usize;
-            if *pos + n > data.len() {
-                return Err(Error::UnexpectedEof);
-            }
-            let b = data[*pos..*pos + n].to_vec();
-            *pos += n;
-            Ok(Cbor::Bytes(b))
-        }
+        0 => Ok(Cbor::Uint(arg)),
+        2 => Ok(Cbor::Bytes(take(data, pos, arg)?.to_vec())),
         4 => {
-            if indefinite {
-                return Err(Error::UnsupportedIndefiniteLength);
-            }
-            let mut items = Vec::with_capacity(arg as usize);
-            for _ in 0..arg {
-                items.push(decode_value(data, pos)?);
+            let count = check_count(data, *pos, arg)?;
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                items.push(decode_value(data, pos, depth + 1)?);
             }
             Ok(Cbor::Array(items))
         }
         5 => {
-            if indefinite {
-                return Err(Error::UnsupportedIndefiniteLength);
-            }
-            let mut entries = Vec::with_capacity(arg as usize);
-            for _ in 0..arg {
-                let k = decode_value(data, pos)?;
-                let v = decode_value(data, pos)?;
+            // two items an entry
+            let items = arg.checked_mul(2).ok_or(Error::UnexpectedEof)?;
+            let count = check_count(data, *pos, items)? / 2;
+            let mut entries = Vec::with_capacity(count);
+            for _ in 0..count {
+                let k = decode_value(data, pos, depth + 1)?;
+                let v = decode_value(data, pos, depth + 1)?;
                 entries.push((k, v));
             }
             Ok(Cbor::Map(entries))
@@ -271,68 +283,96 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Result<Cbor, Error> {
     }
 }
 
+/// A container being scanned, by what it still expects.
+enum Open {
+    /// This many more items: those of an array, the keys and values of a map,
+    /// or the one item of a tag.
+    Items(u64),
+    /// Items until a break code. In a map (`pairs`), the break cannot come
+    /// between a key and its value (`mid_pair`).
+    UntilBreak { pairs: bool, mid_pair: bool },
+}
+
 /// Advances `pos` past one complete CBOR data item, supporting every major type
 /// including tags and indefinite-length strings, arrays and maps. Used to carve
 /// real transactions into their raw top-level elements without fully decoding
 /// the (Plutus-laden) contents.
+///
+/// Items may be nested to any depth: the containers being scanned are kept on
+/// the heap, not on the stack. On error, `pos` is left as it was.
 pub fn scan_item(data: &[u8], pos: &mut usize) -> Result<(), Error> {
-    if *pos >= data.len() {
-        return Err(Error::UnexpectedEof);
-    }
-    let ib = data[*pos];
-    let major = ib >> 5;
-    let info = ib & 0x1f;
-    let (_, arg, indefinite) = read_head(data, pos)?;
+    let mut at = *pos;
+    // The containers the current item is in, the innermost last.
+    let mut open: Vec<Open> = Vec::new();
+    loop {
+        let closes = matches!(
+            open.last(),
+            Some(Open::UntilBreak {
+                mid_pair: false,
+                ..
+            })
+        ) && data.get(at) == Some(&0xff);
+        if closes {
+            // the break code completes the innermost container
+            at += 1;
+            open.pop();
+        } else {
+            let (major, arg, indefinite) = read_head(data, &mut at)?;
+            let container = match major {
+                0 | 1 => None, // integers: all in the head
+                2 | 3 if indefinite => {
+                    scan_indefinite_chunks(data, &mut at, major)?;
+                    None
+                }
+                2 | 3 => {
+                    take(data, &mut at, arg)?;
+                    None
+                }
+                4 | 5 if indefinite => Some(Open::UntilBreak {
+                    pairs: major == 5,
+                    mid_pair: false,
+                }),
+                4 | 5 => {
+                    // a map has two items an entry
+                    let items = arg.checked_mul(major as u64 - 3);
+                    let items = items.ok_or(Error::UnexpectedEof)?;
+                    check_count(data, at, items)?;
+                    (items > 0).then_some(Open::Items(items))
+                }
+                6 => Some(Open::Items(1)), // tag: one tagged item follows
+                // simple values and floats are all in the head, which leaves
+                // the break code, here where none is expected
+                7 if indefinite => return Err(Error::UnexpectedBreak),
+                7 => None,
+                _ => return Err(Error::UnsupportedMajorType(major)),
+            };
+            if let Some(container) = container {
+                // its items come next
+                open.push(container);
+                continue;
+            }
+        }
 
-    match major {
-        0 | 1 => Ok(()), // integers: head already consumed
-        2 | 3 => {
-            // byte / text string
-            if indefinite {
-                // sequence of definite-length chunks of the same major type
-                scan_indefinite_chunks(data, pos, major)
-            } else {
-                let n = arg as usize;
-                if *pos + n > data.len() {
-                    return Err(Error::UnexpectedEof);
+        // An item is complete, and with it every container it was the last of.
+        loop {
+            match open.last_mut() {
+                None => {
+                    *pos = at;
+                    return Ok(());
                 }
-                *pos += n;
-                Ok(())
-            }
-        }
-        4 => {
-            // array
-            if indefinite {
-                scan_until_break(data, pos, 1)
-            } else {
-                for _ in 0..arg {
-                    scan_item(data, pos)?;
+                Some(Open::UntilBreak { pairs, mid_pair }) => {
+                    *mid_pair = *pairs && !*mid_pair;
+                    break;
                 }
-                Ok(())
-            }
-        }
-        5 => {
-            // map
-            if indefinite {
-                scan_until_break(data, pos, 2)
-            } else {
-                for _ in 0..arg {
-                    scan_item(data, pos)?; // key
-                    scan_item(data, pos)?; // value
+                Some(Open::Items(left)) => {
+                    *left -= 1;
+                    if *left > 0 {
+                        break;
+                    }
+                    open.pop();
                 }
-                Ok(())
             }
         }
-        6 => scan_item(data, pos), // tag: one tagged item follows
-        7 => {
-            // simple values / floats; floats carry payload in the head argument,
-            // which read_head already consumed. info 24 (simple) also consumed.
-            if info == 31 {
-                return Err(Error::UnexpectedBreak);
-            }
-            Ok(())
-        }
-        _ => Err(Error::UnsupportedMajorType(major)),
     }
 }
 
@@ -340,10 +380,7 @@ pub fn scan_item(data: &[u8], pos: &mut usize) -> Result<(), Error> {
 /// break code (0xff). `major` is the expected chunk major type (2 or 3).
 fn scan_indefinite_chunks(data: &[u8], pos: &mut usize, major: u8) -> Result<(), Error> {
     loop {
-        if *pos >= data.len() {
-            return Err(Error::UnexpectedEof);
-        }
-        if data[*pos] == 0xff {
+        if data.get(*pos) == Some(&0xff) {
             *pos += 1;
             return Ok(());
         }
@@ -351,28 +388,7 @@ fn scan_indefinite_chunks(data: &[u8], pos: &mut usize, major: u8) -> Result<(),
         if m != major || indef {
             return Err(Error::InvalidChunk);
         }
-        let n = arg as usize;
-        if *pos + n > data.len() {
-            return Err(Error::UnexpectedEof);
-        }
-        *pos += n;
-    }
-}
-
-/// Scans items until a break code, where each logical entry consumes
-/// `items_per_entry` data items (1 for arrays, 2 for maps).
-fn scan_until_break(data: &[u8], pos: &mut usize, items_per_entry: usize) -> Result<(), Error> {
-    loop {
-        if *pos >= data.len() {
-            return Err(Error::UnexpectedEof);
-        }
-        if data[*pos] == 0xff {
-            *pos += 1;
-            return Ok(());
-        }
-        for _ in 0..items_per_entry {
-            scan_item(data, pos)?;
-        }
+        take(data, pos, arg)?;
     }
 }
 
@@ -384,8 +400,9 @@ pub fn split_array_items(data: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     if major != 4 || indefinite {
         return Err(Error::ExpectedArray);
     }
-    let mut items = Vec::with_capacity(arg as usize);
-    for _ in 0..arg {
+    let count = check_count(data, pos, arg)?;
+    let mut items = Vec::with_capacity(count);
+    for _ in 0..count {
         let start = pos;
         scan_item(data, &mut pos)?;
         items.push(data[start..pos].to_vec());
@@ -396,6 +413,162 @@ pub fn split_array_items(data: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A head for `major` claiming 2^64-1 of whatever it counts.
+    fn huge(major: u8) -> [u8; 9] {
+        let mut head = [0xff; 9];
+        head[0] = major << 5 | 27;
+        head
+    }
+
+    /// Lengths and counts are claims: nothing is allocated, skipped or looped
+    /// over on their word alone.
+    #[test]
+    fn hostile_lengths_are_errors() {
+        for major in [2, 4, 5] {
+            assert_eq!(Cbor::decode(&huge(major)), Err(Error::UnexpectedEof));
+            // and just past the end
+            assert_eq!(
+                Cbor::decode(&[major << 5 | 2, 0x00]),
+                Err(Error::UnexpectedEof)
+            );
+        }
+        for count in [1u64 << 60, 1 << 40, 1 << 31, 9] {
+            let mut data = vec![0x9b];
+            data.extend_from_slice(&count.to_be_bytes());
+            data.extend_from_slice(&[0; 8]);
+            assert_eq!(Cbor::decode(&data), Err(Error::UnexpectedEof));
+            assert_eq!(split_array_items(&data), Err(Error::UnexpectedEof));
+            assert_eq!(scan_item(&data, &mut 0), Err(Error::UnexpectedEof));
+            data[0] = 0xbb; // a map, of twice as many items
+            assert_eq!(Cbor::decode(&data), Err(Error::UnexpectedEof));
+            assert_eq!(scan_item(&data, &mut 0), Err(Error::UnexpectedEof));
+        }
+
+        for major in [2, 3, 4, 5] {
+            let mut pos = 0;
+            assert_eq!(scan_item(&huge(major), &mut pos), Err(Error::UnexpectedEof));
+            assert_eq!(pos, 0);
+
+            let mut in_array = vec![0x81];
+            in_array.extend_from_slice(&huge(major));
+            assert_eq!(split_array_items(&in_array), Err(Error::UnexpectedEof));
+        }
+        for major in [2, 3] {
+            // a chunk of an indefinite-length string
+            let mut data = vec![major << 5 | 31];
+            data.extend_from_slice(&huge(major));
+            data.push(0xff);
+            assert_eq!(scan_item(&data, &mut 0), Err(Error::UnexpectedEof));
+        }
+        // a length that wraps `pos` around to within the data
+        let mut data = vec![0x00];
+        data.extend_from_slice(&huge(2));
+        let mut pos = 1;
+        assert_eq!(scan_item(&data, &mut pos), Err(Error::UnexpectedEof));
+        assert_eq!(pos, 1);
+        assert_eq!(read_uint(&[1, 2], &mut 1, 8), Err(Error::UnexpectedEof));
+
+        // counts that are true are fine, however many
+        let mut data = vec![0x99, 0x27, 0x10]; // 10000
+        data.resize(10003, 0x00);
+        assert_eq!(Cbor::decode(&data).unwrap().1, 10003);
+        assert_eq!(split_array_items(&data).unwrap().len(), 10000);
+        let mut data = vec![0xb9, 0x13, 0x88]; // 5000 entries
+        data.resize(10003, 0x00);
+        assert_eq!(Cbor::decode(&data).unwrap().0.as_map().unwrap().len(), 5000);
+    }
+
+    /// `depth` arrays in one another, around a 0.
+    fn nested(opening: &[u8], depth: usize, closing: &[u8]) -> Vec<u8> {
+        let mut data = opening.repeat(depth);
+        data.push(0x00);
+        data.extend(closing.repeat(depth));
+        data
+    }
+
+    #[test]
+    fn nesting_is_bounded_or_free() {
+        // decoding stops at MAX_DEPTH
+        let (value, len) = Cbor::decode(&nested(&[0x81], MAX_DEPTH, &[])).unwrap();
+        assert_eq!(len, MAX_DEPTH + 1);
+        let mut depth = 0;
+        let mut inner = &value;
+        while let Some([item]) = inner.as_array() {
+            inner = item;
+            depth += 1;
+        }
+        assert_eq!((depth, inner), (MAX_DEPTH, &Cbor::Uint(0)));
+        assert_eq!(value.encode(), nested(&[0x81], MAX_DEPTH, &[]));
+        for opening in [&[0x81][..], &[0xa1, 0x00], &[0xa1, 0x00, 0x81]] {
+            assert_eq!(
+                Cbor::decode(&nested(opening, MAX_DEPTH + 1, &[])),
+                Err(Error::NestingTooDeep)
+            );
+            assert_eq!(
+                Cbor::decode(&nested(opening, 1_000_000, &[])),
+                Err(Error::NestingTooDeep)
+            );
+        }
+
+        // scanning goes as deep as the data does, without a stack to overflow
+        for (opening, closing) in [
+            (&[0x81][..], &[][..]),         // arrays
+            (&[0xa1, 0x00], &[]),           // maps, as values
+            (&[0xa1, 0x81], &[0x00]),       // maps, as keys
+            (&[0xc0], &[]),                 // tags
+            (&[0xd8, 0x79, 0x9f], &[0xff]), // Plutus constructors
+            (&[0x9f], &[0xff]),             // indefinite-length arrays
+            (&[0xbf, 0x00], &[0xff]),       // and maps
+        ] {
+            let data = nested(opening, 1_000_000, closing);
+            let mut pos = 0;
+            assert_eq!(scan_item(&data, &mut pos), Ok(()));
+            assert_eq!(pos, data.len());
+            // and notices what is missing at the bottom of it
+            let mut pos = 0;
+            let cut = &data[..opening.len() * 1_000_000];
+            assert_eq!(scan_item(cut, &mut pos), Err(Error::UnexpectedEof));
+            assert_eq!(pos, 0);
+        }
+    }
+
+    #[test]
+    fn scan_tracks_containers() {
+        for (data, expected) in [
+            (&[0x80][..], Ok(1)),                           // []
+            (&[0xa0], Ok(1)),                               // {}
+            (&[0x9f, 0xff], Ok(2)),                         // [_ ]
+            (&[0xbf, 0xff], Ok(2)),                         // {_ }
+            (&[0x82, 0x80, 0xa0], Ok(3)),                   // [[], {}]
+            (&[0x82, 0x01, 0x02, 0x03], Ok(3)),             // stops after the item
+            (&[0xa1, 0x01, 0x82, 0x02, 0x03], Ok(5)),       // {1: [2, 3]}
+            (&[0xbf, 0x01, 0x9f, 0x02, 0xff, 0xff], Ok(6)), // {_ 1: [_ 2]}
+            (&[0xc2, 0x42, 0x01, 0x00], Ok(4)),             // 2(h'0100')
+            (&[0x5f, 0x41, 0x01, 0x40, 0xff], Ok(5)),       // (_ h'01', h'')
+            (&[0xf9, 0x3e, 0x00], Ok(3)),                   // 1.5
+            (&[0x82, 0x01], Err(Error::UnexpectedEof)),
+            (&[0xa1, 0x01], Err(Error::UnexpectedEof)),
+            (&[0x9f, 0x01], Err(Error::UnexpectedEof)),
+            (&[0xc2], Err(Error::UnexpectedEof)),
+            (&[0xff], Err(Error::UnexpectedBreak)),
+            (&[0x82, 0x01, 0xff], Err(Error::UnexpectedBreak)),
+            (&[0xc2, 0xff], Err(Error::UnexpectedBreak)),
+            // a break between a key and its value
+            (&[0xbf, 0x01, 0xff], Err(Error::UnexpectedBreak)),
+            (&[0xbf, 0x01, 0x02, 0x03, 0xff], Err(Error::UnexpectedBreak)),
+            (&[0x5f, 0x61, 0x61, 0xff], Err(Error::InvalidChunk)),
+            (&[0x5f, 0x5f, 0xff, 0xff], Err(Error::InvalidChunk)),
+            (&[0x1c], Err(Error::ReservedAdditionalInfo(28))),
+        ] {
+            let mut pos = 0;
+            let result = scan_item(data, &mut pos).map(|()| pos);
+            assert_eq!(result, expected, "{data:x?}");
+            if expected.is_err() {
+                assert_eq!(pos, 0, "{data:x?}");
+            }
+        }
+    }
 
     #[test]
     fn encodes_shortest_uint() {
