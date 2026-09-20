@@ -26,7 +26,8 @@ pub trait PsbtSigner {
     /// The public key. For taproot, the internal (untweaked) key.
     fn public_key(&self) -> SecpPublicKey;
     /// A DER-encoded low-S ECDSA signature over `digest` (without the sighash
-    /// byte).
+    /// byte). External signers can build the return value with
+    /// [`DerSignature::from_rs_low_s`] or [`DerSignature::from_der`].
     fn sign_ecdsa(&self, digest: &[u8; 32]) -> Result<DerSignature, SignerError>;
     /// A BIP-340 signature over a taproot key-path `sighash` with the key
     /// tweaked for an empty script tree (BIP-86). Unsupported by default.

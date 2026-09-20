@@ -31,6 +31,11 @@ const HALF_ORDER: [u8; 32] = [
     0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
 ];
 
+/// Whether a big-endian 32-byte value is a valid non-zero secp256k1 scalar.
+fn is_valid_scalar_be(v: &[u8; 32]) -> bool {
+    v.iter().any(|&b| b != 0) && v[..] < ORDER[..]
+}
+
 fn is_over_half_order(s_be: &[u8; 32]) -> bool {
     // Equal-length big-endian comparison is numeric comparison.
     s_be[..] > HALF_ORDER[..]
@@ -328,9 +333,66 @@ pub struct DerSignature {
 }
 
 impl DerSignature {
+    /// DER-encodes the big-endian `(r, s)` pair of an ECDSA signature, as
+    /// produced by an external signer (HSM, TSS, remote service).
+    ///
+    /// `r` and `s` are taken as is: use
+    /// [`from_rs_low_s`](Self::from_rs_low_s) for a signature that must
+    /// satisfy Bitcoin's low-S rule. Both values must be non-zero and below
+    /// the group order.
+    pub fn from_rs(r_be: &[u8; 32], s_be: &[u8; 32]) -> Result<Self, Error> {
+        if !is_valid_scalar_be(r_be) || !is_valid_scalar_be(s_be) {
+            return Err(Error::Malformed);
+        }
+        Ok(der_encode(r_be, s_be))
+    }
+
+    /// Like [`from_rs`](Self::from_rs), but negates `s` to `n - s` when it is
+    /// over half the group order, so the result satisfies the low-S rule
+    /// required for Bitcoin (BIP-62) signatures.
+    ///
+    /// Note that negating `s` flips the recovery id, which this type does not
+    /// carry.
+    pub fn from_rs_low_s(r_be: &[u8; 32], s_be: &[u8; 32]) -> Result<Self, Error> {
+        if !is_valid_scalar_be(r_be) || !is_valid_scalar_be(s_be) {
+            return Err(Error::Malformed);
+        }
+        if !is_over_half_order(s_be) {
+            return Ok(der_encode(r_be, s_be));
+        }
+        let s = Scalar::from_bytes_be(s_be)
+            .map_err(|_| Error::Malformed)?
+            .negate()
+            .to_bytes_be();
+        Ok(der_encode(r_be, &s))
+    }
+
+    /// Wraps an already DER-encoded signature, e.g. one returned by an
+    /// external signer or read back from a transaction.
+    ///
+    /// The encoding is validated ([`parse_der_signature`]) and kept verbatim,
+    /// so a non-canonical but parsable encoding round-trips unchanged; encode
+    /// through [`from_rs`](Self::from_rs) for a canonical result. The sighash
+    /// byte, if any, must not be included.
+    pub fn from_der(sig: &[u8]) -> Result<Self, Error> {
+        parse_der_signature(sig)?;
+        let mut buf = [0u8; 72];
+        buf[..sig.len()].copy_from_slice(sig);
+        Ok(DerSignature {
+            buf,
+            len: sig.len() as u8,
+        })
+    }
+
     /// The encoded signature bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len as usize]
+    }
+
+    /// The signature's `(r, s)` pair, big-endian.
+    pub fn to_rs(&self) -> ([u8; 32], [u8; 32]) {
+        // The buffer always holds a signature this module parsed or encoded.
+        parse_der_signature(self.as_bytes()).expect("DerSignature holds a valid encoding")
     }
 }
 
@@ -700,6 +762,44 @@ mod tests {
         assert!(recover_public_key(&r, &s, 2, &msg).is_err());
         let (sum, carry) = add_be(&[0u8; 32], &ORDER);
         assert_eq!((sum, carry), (ORDER, false));
+    }
+
+    #[test]
+    fn der_signature_from_external_signer() {
+        // A signer producing (r, s) externally reaches the same encoding as
+        // the in-crate signing path.
+        let sk = SecpPrivateKey::from_bytes(&[0x42; 32]).unwrap();
+        let digest = [0x9au8; 32];
+        let sig = sk.sign_der(&digest);
+        let (r, s) = sig.to_rs();
+        assert_eq!(DerSignature::from_rs(&r, &s).unwrap(), sig);
+        assert_eq!(DerSignature::from_der(sig.as_bytes()).unwrap(), sig);
+        assert_eq!(DerSignature::from_rs_low_s(&r, &s).unwrap(), sig);
+
+        // High-S input is normalized to the same low-S signature; taken as is
+        // by from_rs.
+        let high_s = Scalar::from_bytes_be(&s).unwrap().negate().to_bytes_be();
+        assert!(is_over_half_order(&high_s));
+        assert_eq!(DerSignature::from_rs_low_s(&r, &high_s).unwrap(), sig);
+        assert_ne!(DerSignature::from_rs(&r, &high_s).unwrap(), sig);
+    }
+
+    #[test]
+    fn der_signature_rejects_bad_input() {
+        let ok = [0x01u8; 32];
+        let n = ORDER;
+        assert!(DerSignature::from_rs(&[0u8; 32], &ok).is_err());
+        assert!(DerSignature::from_rs(&ok, &[0u8; 32]).is_err());
+        assert!(DerSignature::from_rs(&n, &ok).is_err());
+        assert!(DerSignature::from_rs(&ok, &n).is_err());
+        assert!(DerSignature::from_rs_low_s(&ok, &n).is_err());
+        assert!(DerSignature::from_der(&[]).is_err());
+        assert!(DerSignature::from_der(&[0x30, 0x02, 0x02, 0x00]).is_err());
+        // A signature with the sighash byte appended is not a bare signature.
+        let sk = SecpPrivateKey::from_bytes(&[0x42; 32]).unwrap();
+        let mut with_hashtype = sk.sign_der(&[1u8; 32]).as_bytes().to_vec();
+        with_hashtype.push(0x01);
+        assert!(DerSignature::from_der(&with_hashtype).is_err());
     }
 
     fn h(s: &str) -> Vec<u8> {

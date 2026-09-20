@@ -39,6 +39,8 @@ pub trait Signer {
         None
     }
     /// Produces a DER-encoded low-S ECDSA signature over the 32-byte digest.
+    /// External signers can build the return value with
+    /// [`DerSignature::from_rs_low_s`] or [`DerSignature::from_der`].
     fn sign_ecdsa_der(&self, _digest: &[u8; 32]) -> Result<DerSignature, SignerError> {
         Err(SignerError)
     }
