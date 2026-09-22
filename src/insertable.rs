@@ -4,7 +4,7 @@
 use crate::prelude::*;
 
 use crate::hash::{HashFn, hash_chain};
-#[cfg(feature = "bitcoin")]
+#[cfg(any(feature = "bitcoin", feature = "zcash"))]
 use crate::hash::{ripemd160_vec, sha256_vec};
 use crate::pushbytes::push_bytes;
 use crate::script::Script;
@@ -84,7 +84,7 @@ pub(crate) fn push(inner: Insertable) -> Insertable {
 pub(crate) fn ihash(inner: Insertable, fns: &[HashFn]) -> Insertable {
     Insertable::Hash(Box::new(inner), fns.to_vec())
 }
-#[cfg(feature = "bitcoin")]
+#[cfg(any(feature = "bitcoin", feature = "zcash"))]
 pub(crate) fn ihash160(inner: Insertable) -> Insertable {
     ihash(inner, &[sha256_vec, ripemd160_vec])
 }

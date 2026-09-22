@@ -28,10 +28,12 @@ use crate::hash::blake3_vec;
 use crate::hash::ether_hash;
 #[cfg(all(feature = "alloc", feature = "evm"))]
 use crate::hash::ether_hash_vec;
+#[cfg(any(feature = "bitcoin", feature = "zcash"))]
+use crate::hash::hash160;
+#[cfg(feature = "bitcoin")]
+use crate::hash::sha256_once;
 #[cfg(all(feature = "alloc", feature = "bitcoin"))]
 use crate::hash::sha256_vec;
-#[cfg(feature = "bitcoin")]
-use crate::hash::{hash160, sha256_once};
 use crate::inline::InlineBytes;
 // `Format` plus the constructors `format_def` uses for the enabled chains.
 #[cfg(feature = "alloc")]
@@ -110,7 +112,7 @@ pub fn generate_script(pubkey: &PubKey, name: &str) -> Result<ScriptBytes, Error
         "pubkey:comp" => script_of(&[&comp()?]),
         "pubkey:uncomp" => script_of(&[&uncomp()?]),
         "pubkey:ed25519" => script_of(&[&ed()?]),
-        #[cfg(feature = "bitcoin")]
+        #[cfg(any(feature = "bitcoin", feature = "zcash"))]
         "p2pkh" => script_of(&[&[0x76, 0xa9, 0x14], &hash160(&comp()?), &[0x88, 0xac]]),
         #[cfg(feature = "bitcoin")]
         "p2pukh" => script_of(&[&[0x76, 0xa9, 0x14], &hash160(&uncomp()?), &[0x88, 0xac]]),
@@ -154,7 +156,7 @@ pub fn generate_script(pubkey: &PubKey, name: &str) -> Result<ScriptBytes, Error
 #[cfg(feature = "alloc")]
 pub fn format_def(name: &str) -> Option<Format> {
     match name {
-        #[cfg(feature = "bitcoin")]
+        #[cfg(any(feature = "bitcoin", feature = "zcash"))]
         "p2pkh" => Some(vec![
             b(&[0x76, 0xa9]),
             push(ihash160(lookup("pubkey:comp"))),
@@ -246,7 +248,7 @@ pub fn format_def(name: &str) -> Option<Format> {
 
 /// All built-in format names of the enabled chains (enumerated by `get_outs`).
 pub const ALL_FORMATS: &[&str] = &[
-    #[cfg(feature = "bitcoin")]
+    #[cfg(any(feature = "bitcoin", feature = "zcash"))]
     "p2pkh",
     #[cfg(feature = "bitcoin")]
     "p2pukh",
@@ -310,6 +312,8 @@ pub fn formats_per_network(network: &str) -> Option<&'static [&'static str]> {
         "litecoin" => Some(&["p2wpkh", "p2sh:p2wpkh", "p2puk", "p2pk", "p2pukh", "p2pkh"]),
         #[cfg(feature = "bitcoin")]
         "dogecoin" => Some(&["p2puk", "p2pk", "p2pukh", "p2pkh"]),
+        #[cfg(feature = "zcash")]
+        "zcash" | "zcash-testnet" => Some(&["p2pkh"]),
         #[cfg(feature = "evm")]
         "evm" => Some(&["eth"]),
         #[cfg(feature = "massa")]

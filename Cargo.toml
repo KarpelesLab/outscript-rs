@@ -20,7 +20,7 @@ name = "outscript"
 # Chains are opt-in: each chain feature enables its modules, formats and
 # address codecs, and pulls in only the curve arithmetic it needs. The default
 # enables every chain.
-default = ["std", "bitcoin", "evm", "solana", "cardano", "massa", "bcur", "bbqr"]
+default = ["std", "bitcoin", "evm", "solana", "cardano", "massa", "zcash", "bcur", "bbqr"]
 std = [
     "alloc",
     "purecrypto/std",
@@ -52,6 +52,8 @@ solana = ["ed25519"]
 cardano = ["ed25519", "purecrypto/kdf"]
 # Massa: addresses.
 massa = ["ed25519"]
+# Zcash: transparent addresses and v5 (ZIP-225/244) transaction signing.
+zcash = ["secp256k1"]
 
 # --- transports (chain-independent text encodings for moving PSBTs and other
 # payloads between devices, typically as QR codes; only the strings are

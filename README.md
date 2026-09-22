@@ -29,6 +29,7 @@ All cryptography is provided by the pure-Rust
 | Massa | AU (user) / AS (smart contract) | - |
 | Solana | Base58 (32 bytes) | `SolanaTx` |
 | Cardano | Shelley bech32 (addr / addr_test / stake) | `CardanoTx` |
+| Zcash (transparent) | t1 / t3 base58check (tm / t2 on testnet) | `zcashtx::ZcashTx` (v5, ZIP-244) |
 
 ## Usage
 
@@ -339,6 +340,41 @@ Native tokens are added via `CardanoOutput.assets` (`CardanoAsset { policy_id,
 asset_name, amount }`). Plutus scripts, certificates, staking actions and
 metadata are out of scope.
 
+### Zcash transactions (transparent)
+
+Zcash's transparent side is Bitcoin-like: P2PKH outputs and ECDSA scriptSigs.
+What differs is the v5 header and the ZIP-244 digests, personalized
+BLAKE2b-256 trees rather than double SHA-256. `zcashtx::ZcashTx` borrows its
+transparent inputs and outputs, and any Sapling or Orchard bundle as raw
+bytes, so a transparent input can be signed inside a transaction built by a
+shielded wallet too (the digests only hash the bundles' fields). Everything
+runs without `alloc`.
+
+```rust
+use outscript::zcashtx::{ZcashTx, ZcashTxIn, ZcashTxOut, branch};
+
+let inputs = [ZcashTxIn { txid: prev_txid, vout: 1, ..Default::default() }];
+let outputs = [ZcashTxOut { amount: 90_000, script: &dest_script }];
+let tx = ZcashTx {
+    consensus_branch_id: branch::NU6_2,   // the upgrade in force when mined
+    expiry_height: current_height + 40,
+    inputs: &inputs,
+    outputs: &outputs,
+    ..Default::default()
+};
+// what each input spends: its amount and scriptPubKey
+let prevouts = [ZcashTxOut { amount: 100_000, script: &my_script }];
+let signed = tx.sign(&[&key], &prevouts)?;   // one key per input, SIGHASH_ALL
+let txid = tx.txid()?;
+```
+
+`sighash` gives any ZIP-244 signature digest (all hash types, with or without
+`ANYONECANPAY`, and the shielded one), `sign_input_to_slice` one scriptSig,
+and `parse_into` reads a v5 transaction back. Shielded spends and outputs are
+not produced: that needs the Sapling/Orchard provers. Addresses go through
+`decode_zcash_address` / `parse_zcash_address`, and `encode_address_to_slice`
+with the `zcash` or `zcash-testnet` network.
+
 ### Moving PSBTs around: UR and BBQr
 
 Air-gapped signers take PSBTs in and out as QR codes, in one of two text
@@ -419,6 +455,7 @@ from `purecrypto`. All chains are enabled by default.
 | `solana` | addresses, program-derived addresses, `SolanaTx` | `ed25519` |
 | `cardano` | Shelley addresses, BIP32-Ed25519 derivation, `CardanoTx` | `ed25519` |
 | `massa` | addresses | `ed25519` |
+| `zcash` | transparent addresses, `zcashtx` (v5 transactions, ZIP-244 ids and sighashes, signing) | `secp256k1` |
 
 The transports are features too, independent of any chain and enabled by
 default:
@@ -477,7 +514,7 @@ you need:
 # heap-free core only
 outscript = { version = "0.1", default-features = false, features = ["bitcoin", "evm"] }
 # full API on no_std targets with an allocator
-outscript = { version = "0.1", default-features = false, features = ["alloc", "bitcoin", "evm", "solana", "cardano", "massa"] }
+outscript = { version = "0.1", default-features = false, features = ["alloc", "bitcoin", "evm", "solana", "cardano", "massa", "zcash"] }
 ```
 
 Without `alloc` you still get:
@@ -488,9 +525,10 @@ Without `alloc` you still get:
   `encode_address_to_slice` to render them, and `decode_*_address` to parse
   Bitcoin-family, EVM, Massa, Solana and Cardano addresses.
 - **Transaction signing** — `psbt::Psbt` (the full BIP-174 workflow),
-  `btcraw::RawTx` (legacy, BIP-143, taproot and unified sighashes, serialization,
-  txid) and `evmraw::RawEvmTx` (legacy/EIP-2930/
-  EIP-1559 signing, encoding, hash, sender recovery).
+  `btcraw::RawTx` (legacy, BIP-143, taproot and unified sighashes,
+  serialization, txid), `zcashtx::ZcashTx` (v5 serialization, ZIP-244 ids
+  and sighashes, signing) and `evmraw::RawEvmTx` (legacy/EIP-2930/EIP-1559
+  signing, encoding, hash, sender recovery).
 - **Utilities** — Solana keys/PDAs/compact-u16, EVM ABI selectors and ERC-20
   calldata, `BtcAmount` parsing/formatting, script guessing, and base58,
   bech32/CashAddr, EIP-55, pushdata and varint codecs.

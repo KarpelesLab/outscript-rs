@@ -45,6 +45,8 @@
 //! - `cardano`: Shelley addresses, BIP32-Ed25519 derivation and (with
 //!   `alloc`) `CardanoTx`. Implies `ed25519`.
 //! - `massa`: addresses. Implies `ed25519`.
+//! - `zcash`: transparent addresses, and `zcashtx` (v5 transactions:
+//!   ZIP-244 ids and signature digests, signing). Implies `secp256k1`.
 //! - `secp256k1` / `ed25519`: the raw [`crypto`] helpers and the matching
 //!   [`PubKey`] variant, without any chain.
 //!
@@ -80,7 +82,8 @@
 //!   control blocks), `psbt` (BIP-174 creator, updater, signer, combiner,
 //!   finalizer and extractor, including taproot script paths) and `evmraw`
 //!   (legacy/EIP-2930/EIP-1559 signing, encoding, hashing and sender
-//!   recovery);
+//!   recovery), `zcashtx` (v5 transaction serialization, ZIP-244 ids and
+//!   sighashes, signing);
 //! - `solana` keys, program-derived addresses and compact-u16; `evmabi`
 //!   selectors, words and ERC-20 calldata; `BtcAmount` parsing/formatting;
 //!   `btcguess` script heuristics;
@@ -141,6 +144,10 @@ pub mod solana;
 pub mod solana_addr;
 #[cfg(feature = "bitcoin")]
 pub mod taproot;
+#[cfg(feature = "zcash")]
+pub mod zcash;
+#[cfg(feature = "zcash")]
+pub mod zcashtx;
 
 #[cfg(all(feature = "alloc", feature = "bitcoin"))]
 pub mod btctx;
@@ -165,7 +172,7 @@ pub mod rlp;
 mod btcamount;
 mod btcvarint;
 mod error;
-#[cfg(any(feature = "bitcoin", feature = "evm"))]
+#[cfg(any(feature = "bitcoin", feature = "evm", feature = "zcash"))]
 mod sink;
 
 #[cfg(feature = "bitcoin")]
@@ -198,6 +205,8 @@ pub use pushbytes::{parse_push_bytes, push_bytes_to_slice};
 pub use script::{ALL_FORMATS, ScriptBytes, formats_per_network, generate_script};
 #[cfg(feature = "solana")]
 pub use solana_addr::decode_solana_address;
+#[cfg(feature = "zcash")]
+pub use zcash::decode_zcash_address;
 
 #[cfg(feature = "alloc")]
 pub use address::encode_base58_addr;
@@ -240,6 +249,8 @@ pub use reward::{block_reward, cumulative_reward};
 pub use script::{Script, format_def};
 #[cfg(all(feature = "alloc", feature = "solana"))]
 pub use solana_addr::parse_solana_address;
+#[cfg(all(feature = "alloc", feature = "zcash"))]
+pub use zcash::parse_zcash_address;
 
 #[cfg(all(
     test,
@@ -265,3 +276,5 @@ mod btctx_tests;
 mod cardano_tests;
 #[cfg(all(test, feature = "alloc", feature = "solana"))]
 mod solana_tests;
+#[cfg(all(test, feature = "alloc", feature = "zcash"))]
+mod zcash_tests;

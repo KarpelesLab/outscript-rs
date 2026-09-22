@@ -78,7 +78,7 @@ fn prefixed_base58check(prefix: &[u8], data: &[u8], out: &mut [u8]) -> Result<us
 /// [`MAX_ADDRESS_LEN`] bytes always suffice for built-in formats. Formats of
 /// chains that are not enabled fail with [`Error::UnsupportedFormat`].
 #[cfg_attr(
-    not(any(feature = "bitcoin", feature = "cardano")),
+    not(any(feature = "bitcoin", feature = "cardano", feature = "zcash")),
     allow(unused_variables)
 )]
 pub fn encode_address_to_slice(
@@ -103,6 +103,15 @@ pub fn encode_address_to_slice(
             Some((1, rest)) => prefixed_base58check(b"AS", rest, out),
             _ => Err(Error::InvalidScript),
         },
+        #[cfg(feature = "zcash")]
+        "p2pkh" | "p2sh" if network.starts_with("zcash") => {
+            let (p2sh, hash) = match script {
+                [0x76, 0xa9, 0x14, hash @ .., 0x88, 0xac] if hash.len() == 20 => (false, hash),
+                [0xa9, 0x14, hash @ .., 0x87] if hash.len() == 20 => (true, hash),
+                _ => return Err(Error::InvalidScript),
+            };
+            crate::zcash::encode_to_slice(p2sh, hash, network, out)
+        }
         #[cfg(feature = "bitcoin")]
         "p2pkh" | "p2pukh" | "p2sh" => {
             let (p2sh, inner) = if base == "p2sh" {
@@ -239,7 +248,8 @@ impl DecodedAddress {
             feature = "evm",
             feature = "solana",
             feature = "cardano",
-            feature = "massa"
+            feature = "massa",
+            feature = "zcash"
         )),
         allow(dead_code)
     )]
