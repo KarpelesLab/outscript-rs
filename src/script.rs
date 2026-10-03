@@ -24,9 +24,9 @@ use crate::hash::blake2b224_vec;
 use crate::hash::blake3_256;
 #[cfg(all(feature = "alloc", feature = "massa"))]
 use crate::hash::blake3_vec;
-#[cfg(feature = "evm")]
+#[cfg(any(feature = "evm", feature = "tron"))]
 use crate::hash::ether_hash;
-#[cfg(all(feature = "alloc", feature = "evm"))]
+#[cfg(all(feature = "alloc", any(feature = "evm", feature = "tron")))]
 use crate::hash::ether_hash_vec;
 #[cfg(any(feature = "bitcoin", feature = "zcash"))]
 use crate::hash::hash160;
@@ -132,6 +132,9 @@ pub fn generate_script(pubkey: &PubKey, name: &str) -> Result<ScriptBytes, Error
         }
         #[cfg(feature = "evm")]
         "eth" => script_of(&[&ether_hash(&uncomp()?)]),
+        // the same account hash as `eth` behind the 0x41 address prefix
+        #[cfg(feature = "tron")]
+        "tron" => script_of(&[&[crate::tron::ADDRESS_PREFIX], &ether_hash(&uncomp()?)]),
         #[cfg(feature = "massa")]
         "massa_pubkey" => script_of(&[&[0x00], &ed()?]),
         #[cfg(feature = "massa")]
@@ -226,6 +229,11 @@ pub fn format_def(name: &str) -> Option<Format> {
         ]),
         #[cfg(feature = "evm")]
         "eth" => Some(vec![ihash(lookup("pubkey:uncomp"), &[ether_hash_vec])]),
+        #[cfg(feature = "tron")]
+        "tron" => Some(vec![
+            b(&[crate::tron::ADDRESS_PREFIX]),
+            ihash(lookup("pubkey:uncomp"), &[ether_hash_vec]),
+        ]),
         #[cfg(feature = "massa")]
         "massa_pubkey" => Some(vec![b(&[0x00]), lookup("pubkey:ed25519")]),
         #[cfg(feature = "massa")]
@@ -282,6 +290,8 @@ pub const ALL_FORMATS: &[&str] = &[
     "p2wsh:p2wpkh",
     #[cfg(feature = "evm")]
     "eth",
+    #[cfg(feature = "tron")]
+    "tron",
     #[cfg(feature = "massa")]
     "massa_pubkey",
     #[cfg(feature = "massa")]
@@ -316,6 +326,8 @@ pub fn formats_per_network(network: &str) -> Option<&'static [&'static str]> {
         "zcash" | "zcash-testnet" => Some(&["p2pkh"]),
         #[cfg(feature = "evm")]
         "evm" => Some(&["eth"]),
+        #[cfg(feature = "tron")]
+        "tron" => Some(&["tron"]),
         #[cfg(feature = "massa")]
         "massa" => Some(&["massa"]),
         #[cfg(feature = "solana")]

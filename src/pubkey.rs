@@ -12,7 +12,7 @@ use crate::crypto::secp256k1::SecpPublicKey;
 /// A public key understood by outscript: either secp256k1 or Ed25519.
 ///
 /// Each variant exists only with its curve feature (`secp256k1`, enabled by
-/// the `bitcoin` and `evm` chains; `ed25519`, enabled by `solana`, `cardano`
+/// the `bitcoin`, `evm`, `zcash` and `tron` chains; `ed25519`, enabled by `solana`, `cardano`
 /// and `massa`).
 ///
 /// Non-exhaustive: more key/curve types may be added as new chains are
@@ -20,7 +20,7 @@ use crate::crypto::secp256k1::SecpPublicKey;
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum PubKey {
-    /// A secp256k1 public key (Bitcoin, EVM, ...).
+    /// A secp256k1 public key (Bitcoin, EVM, Zcash, Tron).
     #[cfg(feature = "secp256k1")]
     Secp256k1(SecpPublicKey),
     /// A raw 32-byte Ed25519 public key (Solana, Cardano, Massa).

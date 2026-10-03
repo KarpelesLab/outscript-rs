@@ -1,5 +1,5 @@
-//! Address parsing and encoding across Bitcoin-family, EVM, Massa and Solana
-//! networks (port of `address.go`, `eip55.go`).
+//! Address parsing and encoding across Bitcoin-family, EVM, Tron, Massa and
+//! Solana networks (port of `address.go`, `eip55.go`).
 
 pub use crate::Error;
 
@@ -16,6 +16,8 @@ use crate::hash::sha256_once;
 #[cfg(feature = "bitcoin")]
 use crate::pushbytes::parse_push_bytes;
 use crate::script::ScriptBytes;
+#[cfg(feature = "tron")]
+use crate::tron::ADDRESS_PREFIX as TRON_ADDRESS_PREFIX;
 
 #[cfg(feature = "alloc")]
 use crate::out::Out;
@@ -95,6 +97,13 @@ pub fn encode_address_to_slice(
         "cardano" => crate::cardano::cardano_address_from_raw_to_slice(script, network, out),
         #[cfg(feature = "evm")]
         "eth" | "evm" => eip55_to_slice(script, out).ok_or(Error::BufferTooSmall),
+        #[cfg(feature = "tron")]
+        "tron" => match script {
+            [TRON_ADDRESS_PREFIX, hash @ ..] if hash.len() == 20 => {
+                Ok(encode_base58_addr_to_slice(TRON_ADDRESS_PREFIX, hash, out)?)
+            }
+            _ => Err(Error::InvalidScript),
+        },
         #[cfg(feature = "massa")]
         "massa_pubkey" => prefixed_base58check(b"P", script, out),
         #[cfg(feature = "massa")]
@@ -234,8 +243,8 @@ pub fn encode_base58_addr(version: u8, buf: &[u8]) -> String {
 pub struct DecodedAddress {
     /// Format name, e.g. "p2pkh", "p2wsh", "eth", "cardano".
     pub format: &'static str,
-    /// The output script (for EVM, Massa, Solana and Cardano: the raw address
-    /// payload, as produced by [`generate_script`](crate::script::generate_script)).
+    /// The output script (for EVM, Tron, Massa, Solana and Cardano: the raw
+    /// address payload, as produced by [`generate_script`](crate::script::generate_script)).
     pub script: ScriptBytes,
     /// The networks the address is valid on.
     pub networks: &'static [&'static str],
@@ -249,7 +258,8 @@ impl DecodedAddress {
             feature = "solana",
             feature = "cardano",
             feature = "massa",
-            feature = "zcash"
+            feature = "zcash",
+            feature = "tron"
         )),
         allow(dead_code)
     )]

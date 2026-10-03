@@ -3,8 +3,8 @@
 //! It supports Bitcoin and Bitcoin-like cryptocurrency output script formats
 //! (P2PKH, P2SH, P2WPKH, P2WSH, P2PK, P2TR, etc.), EVM-based networks (Ethereum
 //! and compatible chains), and other blockchains such as Litecoin, Dogecoin,
-//! Namecoin, Monacoin, Electraproto, Dash, Bitcoin Cash, Massa, Solana and
-//! Cardano.
+//! Namecoin, Monacoin, Electraproto, Dash, Bitcoin Cash, Zcash, Tron, Massa,
+//! Solana and Cardano.
 //!
 //! This is a Rust port of the Go library `github.com/KarpelesLab/outscript`. All
 //! cryptography is provided by the `purecrypto` crate.
@@ -47,6 +47,9 @@
 //! - `massa`: addresses. Implies `ed25519`.
 //! - `zcash`: transparent addresses, and `zcashtx` (v5 transactions:
 //!   ZIP-244 ids and signature digests, signing). Implies `secp256k1`.
+//! - `tron`: `T...` addresses, and `trontx` (protobuf transactions: TRX,
+//!   TRC-10 and smart-contract/TRC-20 calls, ids, signing, parsing). Implies
+//!   `secp256k1`.
 //! - `secp256k1` / `ed25519`: the raw [`crypto`] helpers and the matching
 //!   [`PubKey`] variant, without any chain.
 //!
@@ -83,7 +86,8 @@
 //!   finalizer and extractor, including taproot script paths) and `evmraw`
 //!   (legacy/EIP-2930/EIP-1559 signing, encoding, hashing and sender
 //!   recovery), `zcashtx` (v5 transaction serialization, ZIP-244 ids and
-//!   sighashes, signing);
+//!   sighashes, signing), `trontx` (protobuf encoding and parsing, ids,
+//!   signing, signer recovery);
 //! - `solana` keys, program-derived addresses and compact-u16; `evmabi`
 //!   selectors, words and ERC-20 calldata; `BtcAmount` parsing/formatting;
 //!   `btcguess` script heuristics;
@@ -144,6 +148,10 @@ pub mod solana;
 pub mod solana_addr;
 #[cfg(feature = "bitcoin")]
 pub mod taproot;
+#[cfg(feature = "tron")]
+pub mod tron;
+#[cfg(feature = "tron")]
+pub mod trontx;
 #[cfg(feature = "zcash")]
 pub mod zcash;
 #[cfg(feature = "zcash")]
@@ -172,7 +180,12 @@ pub mod rlp;
 mod btcamount;
 mod btcvarint;
 mod error;
-#[cfg(any(feature = "bitcoin", feature = "evm", feature = "zcash"))]
+#[cfg(any(
+    feature = "bitcoin",
+    feature = "evm",
+    feature = "zcash",
+    feature = "tron"
+))]
 mod sink;
 
 #[cfg(feature = "bitcoin")]
@@ -205,6 +218,8 @@ pub use pushbytes::{parse_push_bytes, push_bytes_to_slice};
 pub use script::{ALL_FORMATS, ScriptBytes, formats_per_network, generate_script};
 #[cfg(feature = "solana")]
 pub use solana_addr::decode_solana_address;
+#[cfg(feature = "tron")]
+pub use tron::decode_tron_address;
 #[cfg(feature = "zcash")]
 pub use zcash::decode_zcash_address;
 
@@ -249,6 +264,8 @@ pub use reward::{block_reward, cumulative_reward};
 pub use script::{Script, format_def};
 #[cfg(all(feature = "alloc", feature = "solana"))]
 pub use solana_addr::parse_solana_address;
+#[cfg(all(feature = "alloc", feature = "tron"))]
+pub use tron::parse_tron_address;
 #[cfg(all(feature = "alloc", feature = "zcash"))]
 pub use zcash::parse_zcash_address;
 
@@ -258,7 +275,8 @@ pub use zcash::parse_zcash_address;
     feature = "evm",
     feature = "solana",
     feature = "cardano",
-    feature = "massa"
+    feature = "massa",
+    feature = "tron"
 ))]
 mod nostd_tests;
 

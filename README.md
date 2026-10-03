@@ -30,6 +30,7 @@ All cryptography is provided by the pure-Rust
 | Solana | Base58 (32 bytes) | `SolanaTx` |
 | Cardano | Shelley bech32 (addr / addr_test / stake) | `CardanoTx` |
 | Zcash (transparent) | t1 / t3 base58check (tm / t2 on testnet) | `zcashtx::ZcashTx` (v5, ZIP-244) |
+| Tron | T... base58check | `trontx::TronTx` (TRX, TRC-10, TRC-20 / smart-contract calls) |
 
 ## Usage
 
@@ -46,6 +47,7 @@ let key = SecpPrivateKey::from_bytes(&seed).unwrap();
 let s = Script::new(key.public_key());
 let addr = s.address("p2wpkh", &["bitcoin"]).unwrap(); // bc1q...
 let eth  = s.address("eth", &[]).unwrap();              // 0x...
+let trx  = s.address("tron", &[]).unwrap();             // T...
 
 // Solana / Massa (ed25519)
 let pk = ed25519::public_from_seed(&seed);
@@ -74,6 +76,10 @@ let out = parse_bitcoin_based_address("auto", "1A1zP1...").unwrap(); // auto-det
 let out = parse_evm_address("0x2AeB8ADD...").unwrap();
 let out = parse_solana_address("83astBRgu...").unwrap();
 let out = parse_massa_address("AU16f3K8u...").unwrap();
+
+// Tron (T...): the output's bytes are the 21-byte raw address (0x41 + hash)
+use outscript::parse_tron_address;
+let out = parse_tron_address("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t").unwrap();
 
 // Cardano (addr / addr_test / stake / stake_test)
 use outscript::parse_cardano_address;
@@ -375,6 +381,54 @@ not produced: that needs the Sapling/Orchard provers. Addresses go through
 `decode_zcash_address` / `parse_zcash_address`, and `encode_address_to_slice`
 with the `zcash` or `zcash-testnet` network.
 
+### Tron transactions
+
+Tron transactions are protobuf messages. Their id is the SHA-256 of the
+`raw_data`, and that id is what each signer signs, into a 65-byte recoverable
+signature. `trontx::TronTx` holds the raw data (reference block, expiration,
+timestamp, fee limit, memo) and its one contract; it serializes the fields the
+way java-tron does, so its ids match the network's. Everything runs without
+`alloc`.
+
+```rust
+use outscript::tron::{address_from_pubkey, address_from_str};
+use outscript::trontx::{
+    TronContract, TronTransfer, TronTriggerSmartContract, TronTx, trc20_transfer_data,
+};
+
+let me = address_from_pubkey(&key.public_key());
+let to = address_from_str("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t")?;
+
+// 1 TRX; the reference block is a recent block's height and id
+let tx = TronTx {
+    expiration: now_ms + 60_000,
+    timestamp: now_ms,
+    ..TronTx::new(TronContract::Transfer(TronTransfer { owner: me, to, amount: 1_000_000 }))
+}
+.with_ref_block(block_height, &block_id);
+let sig = tx.sign(&key);
+let txid = tx.txid();
+let raw = tx.encode_signed(&[sig]);   // the Transaction message, for broadcasthex
+
+// a TRC-20 transfer is a smart-contract call; fee_limit bounds the energy
+let data = trc20_transfer_data(&to, 5_000_000);          // 5 USDT (6 decimals)
+let call = TronTriggerSmartContract::new(me, usdt_contract, &data);
+let tx = TronTx {
+    fee_limit: 30_000_000,
+    ..TronTx::new(TronContract::TriggerSmartContract(call))
+};
+```
+
+Nodes build transactions too (`createtransaction` and friends return a
+`raw_data_hex`). `TronTx::parse` reads that back, so a wallet can show what it
+is about to sign, and rejects anything it could not reproduce byte for byte.
+Or sign the bytes as they are: `sign_txid(&sha256(raw_data), &key)`, then
+`transaction_to_slice` to wrap raw data and signatures for broadcast.
+`TronTx::signer` / `recover_signer` give the address behind a signature, and
+`parse_transaction` splits a signed `Transaction` into raw data and signatures.
+Addresses go through `tron::address_from_str` / `address_to_slice` (raw
+21-byte form) or `decode_tron_address` / `parse_tron_address` (as an `Out`).
+
 ### Moving PSBTs around: UR and BBQr
 
 Air-gapped signers take PSBTs in and out as QR codes, in one of two text
@@ -456,6 +510,7 @@ from `purecrypto`. All chains are enabled by default.
 | `cardano` | Shelley addresses, BIP32-Ed25519 derivation, `CardanoTx` | `ed25519` |
 | `massa` | addresses | `ed25519` |
 | `zcash` | transparent addresses, `zcashtx` (v5 transactions, ZIP-244 ids and sighashes, signing) | `secp256k1` |
+| `tron` | addresses, `trontx` (protobuf transactions: TRX, TRC-10 and smart-contract calls, ids, signing, parsing) | `secp256k1` |
 
 The transports are features too, independent of any chain and enabled by
 default:
@@ -514,7 +569,7 @@ you need:
 # heap-free core only
 outscript = { version = "0.1", default-features = false, features = ["bitcoin", "evm"] }
 # full API on no_std targets with an allocator
-outscript = { version = "0.1", default-features = false, features = ["alloc", "bitcoin", "evm", "solana", "cardano", "massa", "zcash"] }
+outscript = { version = "0.1", default-features = false, features = ["alloc", "bitcoin", "evm", "solana", "cardano", "massa", "zcash", "tron"] }
 ```
 
 Without `alloc` you still get:
@@ -523,12 +578,13 @@ Without `alloc` you still get:
   BIP32-Ed25519 derivation.
 - **Scripts and addresses** — `generate_script` for every built-in format,
   `encode_address_to_slice` to render them, and `decode_*_address` to parse
-  Bitcoin-family, EVM, Massa, Solana and Cardano addresses.
+  Bitcoin-family, EVM, Tron, Massa, Solana and Cardano addresses.
 - **Transaction signing** — `psbt::Psbt` (the full BIP-174 workflow),
   `btcraw::RawTx` (legacy, BIP-143, taproot and unified sighashes,
   serialization, txid), `zcashtx::ZcashTx` (v5 serialization, ZIP-244 ids
-  and sighashes, signing) and `evmraw::RawEvmTx` (legacy/EIP-2930/EIP-1559
-  signing, encoding, hash, sender recovery).
+  and sighashes, signing), `trontx::TronTx` (protobuf encoding and parsing,
+  ids, signing, signer recovery) and `evmraw::RawEvmTx`
+  (legacy/EIP-2930/EIP-1559 signing, encoding, hash, sender recovery).
 - **Utilities** — Solana keys/PDAs/compact-u16, EVM ABI selectors and ERC-20
   calldata, `BtcAmount` parsing/formatting, script guessing, and base58,
   bech32/CashAddr, EIP-55, pushdata and varint codecs.
@@ -575,8 +631,8 @@ let len = tx.encode_signed_to_slice(&sig, &mut raw).unwrap();
 - **Script** — holds a [`PubKey`] and evaluates named formats, caching results.
 - **Out** — a generated output script with its format name, hex and network
   flags; converts to/from human-readable addresses.
-- **Transactions** — `BtcTx`, `EvmTx`, `SolanaTx`, `CardanoTx` with binary
-  serialization, signing and hashing.
+- **Transactions** — `BtcTx`, `EvmTx`, `SolanaTx`, `CardanoTx`, `ZcashTx`,
+  `TronTx` with binary serialization, signing and hashing.
 
 ## License
 

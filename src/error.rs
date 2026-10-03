@@ -88,6 +88,9 @@ pub enum Error {
     InvalidScript,
     /// The script type is not supported for this operation.
     UnsupportedScript,
+    /// The data sets a field this crate does not model, so it could not be
+    /// reproduced byte for byte.
+    UnsupportedField,
     /// A spend needs a redeem or leaf script that was not provided.
     MissingScript,
     /// A P2SH input has no redeem script.
@@ -262,6 +265,7 @@ impl core::fmt::Display for Error {
             }
             Error::InvalidScript => f.write_str("invalid script for this format"),
             Error::UnsupportedScript => f.write_str("unsupported script type"),
+            Error::UnsupportedField => f.write_str("a field is set that is not supported"),
             Error::MissingScript => f.write_str("missing redeem or leaf script"),
             Error::MissingRedeemScript => f.write_str("P2SH input has no redeem script"),
             Error::RedeemScriptMismatch => {

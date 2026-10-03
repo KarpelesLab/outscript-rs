@@ -3,10 +3,10 @@ name = "outscript"
 version = "0.2.5"
 edition = "2024"
 rust-version = "1.89"
-description = "Generate output scripts, parse/encode addresses, and build/sign transactions across multiple cryptocurrency networks (Bitcoin, EVM, Solana, Massa, ...)."
+description = "Generate output scripts, parse/encode addresses, and build/sign transactions across multiple cryptocurrency networks (Bitcoin, EVM, Solana, Tron, ...)."
 repository = "https://github.com/KarpelesLab/outscript-rs"
 license = "MIT"
-keywords = ["bitcoin", "ethereum", "solana", "cryptocurrency", "no_std"]
+keywords = ["bitcoin", "ethereum", "solana", "tron", "no_std"]
 categories = ["cryptography::cryptocurrencies", "no-std", "no-std::no-alloc"]
 
 [lib]
@@ -20,7 +20,7 @@ name = "outscript"
 # Chains are opt-in: each chain feature enables its modules, formats and
 # address codecs, and pulls in only the curve arithmetic it needs. The default
 # enables every chain.
-default = ["std", "bitcoin", "evm", "solana", "cardano", "massa", "zcash", "bcur", "bbqr"]
+default = ["std", "bitcoin", "evm", "solana", "cardano", "massa", "zcash", "tron", "bcur", "bbqr"]
 std = [
     "alloc",
     "purecrypto/std",
@@ -54,6 +54,9 @@ cardano = ["ed25519", "purecrypto/kdf"]
 massa = ["ed25519"]
 # Zcash: transparent addresses and v5 (ZIP-225/244) transaction signing.
 zcash = ["secp256k1"]
+# Tron: addresses and `trontx` (protobuf transactions: TRX, TRC-10 and
+# smart-contract calls, ids, signing).
+tron = ["secp256k1"]
 
 # --- transports (chain-independent text encodings for moving PSBTs and other
 # payloads between devices, typically as QR codes; only the strings are

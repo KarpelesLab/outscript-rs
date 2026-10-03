@@ -7,7 +7,8 @@ use crate::crypto::secp256k1::SecpPrivateKey;
 use crate::pubkey::PubKey;
 use crate::{
     address, base58, cardano, decode_bitcoin_based_address, decode_cardano_address,
-    decode_evm_address, decode_massa_address, decode_solana_address, generate_script,
+    decode_evm_address, decode_massa_address, decode_solana_address, decode_tron_address,
+    generate_script,
 };
 
 fn arr32(s: &str) -> [u8; 32] {
@@ -48,6 +49,7 @@ fn secp256k1_addresses() {
             "ethereum",
             "0x2AeB8ADD8337360E088B7D9ce4e857b9BE60f3a7",
         ),
+        ("tron", "tron", "TDt9YtfuttvxD2Jv8F8v4JEDbnBBb1jVNt"),
         ("p2pkh", "bitcoin", "1C2yfT2NNAPPHBqXQxxBPvguht2whJWRSi"),
         (
             "p2pkh",
@@ -89,6 +91,8 @@ fn secp256k1_addresses() {
         render(&pk, fmt, net, want, |a| {
             if a.starts_with("0x") {
                 decode_evm_address(a)
+            } else if net == "tron" {
+                decode_tron_address(a)
             } else if net == "electraproto" {
                 decode_bitcoin_based_address(net, a)
             } else {

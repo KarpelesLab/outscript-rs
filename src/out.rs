@@ -78,6 +78,9 @@ impl Out {
                 .map(|(d, _)| d.to_vec()),
             #[cfg(feature = "evm")]
             "eth" => Some(self.raw.clone()),
+            // the account hash behind the address prefix
+            #[cfg(feature = "tron")]
+            "tron" if self.raw.len() == 21 => Some(self.raw[1..].to_vec()),
             #[cfg(feature = "massa")]
             "massa" => Some(self.raw.clone()),
             #[cfg(feature = "solana")]

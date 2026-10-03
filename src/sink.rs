@@ -1,7 +1,7 @@
 //! Byte sinks for streaming encoders: the same serialization code can count
 //! bytes, hash them, or write them into a caller buffer.
 
-#[cfg(any(feature = "bitcoin", feature = "evm"))]
+#[cfg(any(feature = "bitcoin", feature = "evm", feature = "tron"))]
 use purecrypto::hash::Digest;
 
 pub(crate) trait Sink {
@@ -19,10 +19,10 @@ impl Sink for Counter {
 }
 
 /// Feeds bytes into a hash.
-#[cfg(any(feature = "bitcoin", feature = "evm"))]
+#[cfg(any(feature = "bitcoin", feature = "evm", feature = "tron"))]
 pub(crate) struct HashSink<D: Digest>(pub D);
 
-#[cfg(any(feature = "bitcoin", feature = "evm"))]
+#[cfg(any(feature = "bitcoin", feature = "evm", feature = "tron"))]
 impl<D: Digest> Sink for HashSink<D> {
     fn put(&mut self, data: &[u8]) {
         self.0.update(data);
