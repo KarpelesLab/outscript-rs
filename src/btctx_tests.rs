@@ -646,7 +646,9 @@ fn psbt_matches_btctx_sign(hash_type: u32) {
         let (signed, count) = p.sign_to_vec(other).unwrap();
         assert_eq!((count, signed.as_slice()), (0, psbt.as_slice()), "{scheme}");
 
-        let (signed, count) = p.sign_to_vec(sk).unwrap();
+        // anything but ALL has to be allowed explicitly
+        let allowed = [0x00, 0x01, 0x21, 0xa3];
+        let (signed, count) = p.sign_to_vec_with_sighash_types(sk, &allowed).unwrap();
         assert_eq!(count, 1, "{scheme}");
         let signed = Psbt::parse(&signed).unwrap();
         let (finalized, count) = signed.finalize_to_vec().unwrap();
@@ -811,7 +813,15 @@ fn psbt_taproot_sighash_all() {
         .unwrap()
         .set_input_record_to_vec(0, &[0x03], &2u32.to_le_bytes())
         .unwrap();
-    let (signed, n) = Psbt::parse(&none).unwrap().sign_to_vec(&k).unwrap();
+    // ... so the signer refuses it unless the caller allows that type
+    assert_eq!(
+        Psbt::parse(&none).unwrap().sign_to_vec(&k),
+        Err(crate::psbt::Error::UnsupportedSighash)
+    );
+    let (signed, n) = Psbt::parse(&none)
+        .unwrap()
+        .sign_to_vec_with_sighash_types(&k, &[0x02])
+        .unwrap();
     assert_eq!(n, 1);
     let signed = Psbt::parse(&signed).unwrap();
     let sig = signed.input(0).unwrap().tap_key_sig().unwrap();

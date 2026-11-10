@@ -242,7 +242,8 @@ pub use cardano::{
 };
 #[cfg(all(feature = "alloc", feature = "cardano"))]
 pub use cardanotx::{
-    CardanoAsset, CardanoInput, CardanoOutput, CardanoSigner, CardanoTx, CardanoVkeyWitness,
+    CardanoAsset, CardanoInput, CardanoOutput, CardanoParsed, CardanoSigner, CardanoTx,
+    CardanoVkeyWitness,
 };
 #[cfg(all(feature = "alloc", feature = "evm"))]
 pub use evmabi::{AbiBuffer, AbiValue, evm_call};

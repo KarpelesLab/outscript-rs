@@ -131,7 +131,8 @@ tx.sign(&[
 ```
 
 A PSBT input whose `PSBT_IN_SIGHASH_TYPE` sets the bit is signed the same
-way. `RawTx::unified_sighash` computes the digest directly, including the annex
+way (`ALL|UNIFIED` by default; other unified types need the opt-in described
+under PSBT below). `RawTx::unified_sighash` computes the digest directly, including the annex
 and codeseparator position.
 
 ### Taproot script trees
@@ -210,7 +211,12 @@ implementation reproduces the BIP-174 test vectors byte for byte.
 
 Taproot inputs are signed on the key path, including outputs that commit to a
 script tree, and on the script path for every tapscript leaf the key appears
-in, with any BIP-341 sighash type. The finalizer uses the key-path signature
+in. The signer follows the input's `PSBT_IN_SIGHASH_TYPE`, which comes from
+whoever built the PSBT: by default only `DEFAULT`, `ALL` and `ALL|UNIFIED` are
+signed and anything else returns `UnsupportedSighash`. Pass an explicit
+allow-list to `sign_to_vec_with_sighash_types` (or the `_to_slice_` forms) to
+sign `NONE`, `SINGLE` or `ANYONECANPAY` types. The finalizer verifies each
+signature before using it; it uses the key-path signature
 when there is one, and otherwise spends through a `<key> OP_CHECKSIG` or
 `multi_a` leaf that has enough signatures:
 
