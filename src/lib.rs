@@ -51,10 +51,21 @@
 //! - `tron`: `T...` addresses, and `trontx` (protobuf transactions: TRX,
 //!   TRC-10 and smart-contract/TRC-20 calls, ids, signing, parsing). Implies
 //!   `secp256k1`.
-//! - `monero`: the `monero` module, on the shared `cryptonote` primitives.
+//! - `zcash-sapling`: the `sapling` module — Jubjub, ZIP-32 keys, `zs`
+//!   addresses, notes, note encryption and scanning, RedJubjub signatures
+//!   and typed Sapling bundles. Implies `zcash`.
+//! - `zcash-orchard`: the `orchard` module — Pallas/Vesta, Sinsemilla,
+//!   Poseidon, ZIP-32 keys, unified addresses, notes, note encryption and
+//!   scanning, RedPallas signatures and typed Orchard bundles. Implies
+//!   `zcash`.
+//! - `zcash-shielded`: both of the above.
+//! - `monero`: the `monero` module — addresses and subaddresses, keys and
+//!   mnemonic seeds, view-key scanning, CLSAG, and (with `alloc`)
+//!   transaction parsing, Bulletproofs+ and transaction construction.
 //!   Implies `cryptonote`.
-//! - `zano`: the `zano` module, on the shared `cryptonote` primitives.
-//!   Implies `cryptonote`.
+//! - `zano`: the `zano` module — addresses, wallet keys, output scanning,
+//!   and (with `alloc`) transaction serialization, range/asset proofs and
+//!   offline signing of unsigned transactions. Implies `cryptonote`.
 //! - `cryptonote`: what the CryptoNote family shares (the `cryptonote`
 //!   module) — Keccak hashing to scalars and points, one-time key derivation,
 //!   key images, the varint, the block-wise base58 and the address framing.

@@ -30,7 +30,10 @@ All cryptography is provided by the pure-Rust
 | Solana | Base58 (32 bytes) | `SolanaTx` |
 | Cardano | Shelley bech32 (addr / addr_test / stake) | `CardanoTx` |
 | Zcash (transparent) | t1 / t3 base58check (tm / t2 on testnet) | `zcashtx::ZcashTx` (v5, ZIP-244) |
+| Zcash (shielded) | Sapling `zs`, unified `u1` (Orchard, Sapling and transparent receivers) | `sapling` / `orchard`: keys, notes, scanning, signatures, typed bundles |
 | Tron | T... base58check | `trontx::TronTx` (TRX, TRC-10, TRC-20 / smart-contract calls) |
+| Monero | standard, integrated and subaddresses (mainnet, testnet, stagenet) | `monero::Transaction`, `monero::TransactionBuilder` (RingCT, CLSAG, Bulletproofs+) |
+| Zano | standard, integrated and auditable | `zano::Transaction`, offline signing of wallet-prepared transactions |
 
 ## Usage
 
@@ -517,8 +520,13 @@ from `purecrypto`. All chains are enabled by default.
 | `massa` | addresses | `ed25519` |
 | `zcash` | transparent addresses, `zcashtx` (v5 transactions, ZIP-244 ids and sighashes, signing) | `secp256k1` |
 | `tron` | addresses, `trontx` (protobuf transactions: TRX, TRC-10 and smart-contract calls, ids, signing, parsing) | `secp256k1` |
-| `monero` | Monero (`monero` module), on the shared `cryptonote` primitives | `ed25519` |
-| `zano` | Zano (`zano` module), on the shared `cryptonote` primitives | `ed25519` |
+| `zcash-sapling` | `sapling`: Jubjub, ZIP-32 keys, `zs` addresses, notes, note encryption and scanning, RedJubjub, typed bundles | `zcash` |
+| `zcash-orchard` | `orchard`: Pallas/Vesta, Sinsemilla, Poseidon, ZIP-32 keys, unified addresses, notes, note encryption and scanning, RedPallas, typed bundles | `zcash` |
+| `zcash-shielded` | both shielded pools | `zcash-sapling`, `zcash-orchard` |
+| `zcash-sapling-prover` | Sapling Groth16 proofs and shielded builder (not in the default set; in progress) | `zcash-sapling`, `alloc` |
+| `zcash-orchard-prover` | Orchard Halo2 proofs and shielded builder (not in the default set; in progress) | `zcash-orchard`, `alloc` |
+| `monero` | `monero`: addresses, keys, mnemonic seeds, scanning, CLSAG, and with `alloc` transactions, Bulletproofs+ and transaction building | `ed25519` |
+| `zano` | `zano`: addresses, wallet keys, scanning, and with `alloc` transactions, proofs and offline signing | `ed25519` |
 
 The transports are features too, independent of any chain and enabled by
 default:

@@ -8,7 +8,7 @@
 /// ([`base58`](crate::base58), [`base64`](crate::base64),
 /// [`bech32`](crate::bech32), `bcur`, `bbqr`, `cbor`, `rlp`,
 /// `crypto::secp256k1`, `cryptonote` and Solana's compact-u16), which convert
-/// into this one, as do the `monero` and `zano` modules.
+/// into this one, as do the `monero`, `zano`, `sapling` and `orchard` modules.
 ///
 /// Each module re-exports this type, so `psbt::Error`, `btctx::Error` and
 /// `outscript::Error` all name it.
@@ -235,6 +235,14 @@ pub enum Error {
     /// A Zano error.
     #[cfg(feature = "zano")]
     Zano(crate::zano::Error),
+
+    // --- Zcash shielded pools ---
+    /// A Zcash Sapling error.
+    #[cfg(feature = "zcash-sapling")]
+    Sapling(crate::sapling::Error),
+    /// A Zcash Orchard error.
+    #[cfg(feature = "zcash-orchard")]
+    Orchard(crate::orchard::Error),
 }
 
 impl core::fmt::Display for Error {
@@ -356,6 +364,10 @@ impl core::fmt::Display for Error {
             Error::Monero(e) => e.fmt(f),
             #[cfg(feature = "zano")]
             Error::Zano(e) => e.fmt(f),
+            #[cfg(feature = "zcash-sapling")]
+            Error::Sapling(e) => e.fmt(f),
+            #[cfg(feature = "zcash-orchard")]
+            Error::Orchard(e) => e.fmt(f),
         }
     }
 }
@@ -458,6 +470,20 @@ impl From<crate::monero::Error> for Error {
 impl From<crate::zano::Error> for Error {
     fn from(e: crate::zano::Error) -> Self {
         Error::Zano(e)
+    }
+}
+
+#[cfg(feature = "zcash-sapling")]
+impl From<crate::sapling::Error> for Error {
+    fn from(e: crate::sapling::Error) -> Self {
+        Error::Sapling(e)
+    }
+}
+
+#[cfg(feature = "zcash-orchard")]
+impl From<crate::orchard::Error> for Error {
+    fn from(e: crate::orchard::Error) -> Self {
+        Error::Orchard(e)
     }
 }
 
