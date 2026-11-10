@@ -1,6 +1,7 @@
 //! Tests for Cardano addresses and transactions, ported from `cardano_test.go`
 //! and `cardanotx_test.go`.
 
+use crate::Error;
 use crate::cardano::{
     cardano_base_address, cardano_enterprise_address, cardano_key_hash, cardano_reward_address,
     parse_cardano_address,
@@ -128,6 +129,7 @@ fn sample_tx() -> CardanoTx {
         fee: 170_000,
         ttl: 41_000_000,
         witnesses: vec![],
+        parsed: None,
     }
 }
 
@@ -205,6 +207,7 @@ fn cardano_tx_multiasset() {
         fee: 180_000,
         ttl: 0,
         witnesses: vec![],
+        parsed: None,
     };
     let enc = tx.to_bytes().unwrap();
     let decoded = CardanoTx::from_bytes(&enc).unwrap();
@@ -245,6 +248,7 @@ fn cardano_asset_amount_overflow() {
         fee: 180_000,
         ttl: 0,
         witnesses: vec![],
+        parsed: None,
     };
     assert!(tx.to_bytes().is_err());
     assert!(tx.body_bytes().is_err());
@@ -473,4 +477,280 @@ fn extended_key_zeroizes() {
     assert_eq!(key.public_key(), [0u8; 32]);
     // a clone is independent
     assert_eq!(*copy.bytes(), *xprv);
+}
+
+/// A transaction as another implementation may write it: body fields out of
+/// order, a fee that is not in shortest form, withdrawals (5) and a validity
+/// start (8), an output with a datum hash, a native script next to the vkey
+/// witnesses, a false validity flag and auxiliary data. Returns the
+/// transaction and its body.
+fn foreign_tx(witness_set: &str) -> (Vec<u8>, Vec<u8>) {
+    let body = [
+        "a6",
+        // 2: fee 170000, as a 64-bit integer
+        "02",
+        "1b0000000000029810",
+        // 0: inputs
+        "00",
+        "81825820",
+        "5c32d3c670337ad0ef69e5bf8cbd26cee7a736ee0fba41e63ec071671c1a6376",
+        "00",
+        // 8: validity interval start
+        "08",
+        "1a02000000",
+        // 1: outputs, the one with a datum hash
+        "01",
+        "8183",
+        "581d",
+        "6194991315c92eb5d8c4304e67b7e16ae36d61d34502694657811a2c8e",
+        "1a000f4240",
+        "5820",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        // 5: withdrawals {reward account: 5000000}
+        "05",
+        "a1581d",
+        "e1337b62cfff6403a06a3acbc34f8c46003c69fe79a3628cefa9c47251",
+        "1a004c4b40",
+        // 3: ttl 41000000, as a 64-bit integer
+        "03",
+        "1b0000000002719c40",
+    ]
+    .concat();
+    let body = hex::decode(body).unwrap();
+    let mut tx = vec![0x84];
+    tx.extend_from_slice(&body);
+    tx.extend_from_slice(&hex::decode(witness_set).unwrap());
+    tx.push(0xf4); // validity flag
+    tx.extend_from_slice(&hex::decode("a1016474657374").unwrap()); // {1: "test"}
+    (tx, body)
+}
+
+/// A witness set with only a native script: {1: [[0, h'22..']]}.
+const SCRIPT_WITNESS: &str = "a101818200581c\
+     22222222222222222222222222222222222222222222222222222222";
+
+#[test]
+fn cardano_parsed_tx_keeps_original_body() {
+    let (raw, body) = foreign_tx(SCRIPT_WITNESS);
+    let mut tx = CardanoTx::from_bytes(&raw).unwrap();
+    assert_eq!(tx.fee, 170_000);
+    assert_eq!(tx.ttl, 41_000_000);
+    assert_eq!(tx.inputs.len(), 1);
+    assert_eq!(tx.outputs.len(), 1);
+    assert_eq!(tx.outputs[0].amount, 1_000_000);
+    assert!(tx.witnesses.is_empty());
+    let parsed = tx.parsed.as_ref().unwrap();
+    assert_eq!(parsed.body(), &body[..]);
+    // what the fields do not show
+    assert_eq!(parsed.extra_body_keys(), &[8, 5]);
+    assert!(parsed.has_extra_witnesses());
+
+    // the id is the hash of the bytes that were given
+    let txid = blake2b_256(&body);
+    assert_eq!(tx.body_bytes().unwrap(), body);
+    assert_eq!(tx.hash().unwrap(), txid);
+    assert_eq!(tx.sign_bytes().unwrap(), txid);
+    // and not that of the fields encoded anew
+    let rebuilt = CardanoTx {
+        parsed: None,
+        ..tx.clone()
+    };
+    assert_ne!(rebuilt.hash().unwrap(), txid);
+
+    // nothing is lost on the way back
+    assert_eq!(tx.to_bytes().unwrap(), raw);
+
+    // signing signs that id, and keeps everything else as it was
+    let seed = [0x42u8; 32];
+    tx.sign(&[seed]).unwrap();
+    tx.verify().unwrap();
+    let signature: [u8; 64] = tx.witnesses[0].signature.clone().try_into().unwrap();
+    assert!(ed25519::verify(
+        &ed25519::public_from_seed(&seed),
+        &txid,
+        &signature
+    ));
+    let signed = tx.to_bytes().unwrap();
+    let items = split_array_items(&signed).unwrap();
+    assert_eq!(items.len(), 4);
+    assert_eq!(items[0], body);
+    // {0: [[vkey, signature]], 1: [[0, h'22..']]}
+    let mut witness_set = hex::decode("a20081825820").unwrap();
+    witness_set.extend_from_slice(&tx.witnesses[0].vkey);
+    witness_set.extend_from_slice(&[0x58, 0x40]);
+    witness_set.extend_from_slice(&signature);
+    witness_set.extend_from_slice(&hex::decode(SCRIPT_WITNESS).unwrap()[1..]);
+    assert_eq!(items[1], witness_set);
+    assert_eq!(items[2], [0xf4]);
+    assert_eq!(items[3], hex::decode("a1016474657374").unwrap());
+
+    let again = CardanoTx::from_bytes(&signed).unwrap();
+    assert_eq!(again.hash().unwrap(), txid);
+    assert_eq!(again.witnesses.len(), 1);
+    again.verify().unwrap();
+    assert_eq!(again.parsed, tx.parsed);
+    assert_eq!(again.to_bytes().unwrap(), signed);
+}
+
+/// The fields of a parsed transaction are a view of its body: changing them
+/// does not make another transaction be signed in its name.
+#[test]
+fn cardano_parsed_tx_fields_must_match_body() {
+    let (raw, _) = foreign_tx(SCRIPT_WITNESS);
+    let tx = CardanoTx::from_bytes(&raw).unwrap();
+    let edits: [fn(&mut CardanoTx); 5] = [
+        |tx| tx.fee += 1,
+        |tx| tx.ttl = 0,
+        |tx| tx.outputs[0].amount -= 1,
+        |tx| tx.outputs[0].address[1] ^= 1,
+        |tx| tx.inputs[0].index = 1,
+    ];
+    for edit in edits {
+        let mut edited = tx.clone();
+        edit(&mut edited);
+        assert_eq!(edited.body_bytes().err(), Some(Error::UnsupportedField));
+        assert_eq!(edited.hash().err(), Some(Error::UnsupportedField));
+        assert_eq!(edited.verify().err(), Some(Error::UnsupportedField));
+        assert_eq!(edited.to_bytes().err(), Some(Error::UnsupportedField));
+        assert_eq!(edited.sign(&[[1; 32]]).err(), Some(Error::UnsupportedField));
+        assert!(edited.witnesses.is_empty());
+
+        // letting go of the original bytes makes it a transaction of its
+        // fields alone
+        edited.parsed = None;
+        let bytes = edited.to_bytes().unwrap();
+        let rebuilt = CardanoTx::from_bytes(&bytes).unwrap();
+        assert!(
+            rebuilt
+                .parsed
+                .as_ref()
+                .unwrap()
+                .extra_body_keys()
+                .is_empty()
+        );
+        assert_eq!(rebuilt.hash().unwrap(), edited.hash().unwrap());
+    }
+}
+
+#[test]
+fn cardano_parse_rejects_ambiguous() {
+    let (raw, body) = foreign_tx(SCRIPT_WITNESS);
+    let with_body = |body: &[u8]| {
+        let mut tx = vec![0x84];
+        tx.extend_from_slice(body);
+        tx.extend_from_slice(&raw[1 + body.len()..]);
+        CardanoTx::from_bytes(&tx).map(|_| ())
+    };
+    with_body(&body).unwrap();
+
+    // a second fee, or a second of a field that is not modelled
+    for extra in ["0200", "0500", "0800"] {
+        let mut dup = body.clone();
+        dup[0] += 1;
+        dup.extend_from_slice(&hex::decode(extra).unwrap());
+        assert_eq!(with_body(&dup), Err(Error::DuplicateKey), "{extra}");
+    }
+    // the same key in another width is the same key
+    let mut dup = body.clone();
+    dup[0] += 1;
+    dup.extend_from_slice(&[0x18, 0x02, 0x00]);
+    assert_eq!(with_body(&dup), Err(Error::DuplicateKey));
+    // a key that is not an unsigned integer
+    let mut text_key = body.clone();
+    text_key[0] += 1;
+    text_key.extend_from_slice(&[0x61, 0x61, 0x00]);
+    assert_eq!(with_body(&text_key), Err(Error::InvalidData));
+    // a body with more or fewer entries than it says
+    let mut short = body.clone();
+    short[0] += 1;
+    assert!(with_body(&short).is_err());
+    let mut long = body.clone();
+    long[0] -= 1;
+    assert!(with_body(&long).is_err());
+
+    // duplicate vkey witness lists
+    let (dup, _) = foreign_tx("a200800080");
+    assert_eq!(
+        CardanoTx::from_bytes(&dup).map(|_| ()),
+        Err(Error::DuplicateKey)
+    );
+    // a witness set that is not a map
+    let (not_map, _) = foreign_tx("80");
+    assert_eq!(
+        CardanoTx::from_bytes(&not_map).map(|_| ()),
+        Err(Error::InvalidData)
+    );
+
+    // trailing bytes
+    let mut trailing = raw.clone();
+    trailing.push(0x00);
+    assert_eq!(
+        CardanoTx::from_bytes(&trailing).map(|_| ()),
+        Err(Error::TrailingData)
+    );
+    // items past the auxiliary data
+    let mut five = raw.clone();
+    five[0] = 0x85;
+    five.push(0xf6);
+    assert_eq!(
+        CardanoTx::from_bytes(&five).map(|_| ()),
+        Err(Error::InvalidData)
+    );
+    assert_eq!(
+        CardanoTx::from_bytes(&raw[..raw.len() - 1]).map(|_| ()),
+        Err(Error::Cbor(crate::cbor::Error::UnexpectedEof))
+    );
+}
+
+/// Set-tagged (#6.258) inputs and vkey witnesses, as written since Conway,
+/// parse and keep their tag.
+#[test]
+fn cardano_parse_tagged_sets() {
+    let mut tx = sample_tx();
+    tx.sign(&[[0x07u8; 32]]).unwrap();
+    let plain = tx.to_bytes().unwrap();
+    let items = split_array_items(&plain).unwrap();
+
+    // tag the inputs: a3 00 <inputs> ... -> a3 00 d9 0102 <inputs> ...
+    let mut body = items[0][..2].to_vec();
+    body.extend_from_slice(&[0xd9, 0x01, 0x02]);
+    body.extend_from_slice(&items[0][2..]);
+    // and the vkey witnesses: a1 00 <vkeys>
+    let mut witness_set = items[1][..2].to_vec();
+    witness_set.extend_from_slice(&[0xd9, 0x01, 0x02]);
+    witness_set.extend_from_slice(&items[1][2..]);
+    let mut tagged = vec![0x84];
+    tagged.extend_from_slice(&body);
+    tagged.extend_from_slice(&witness_set);
+    tagged.extend_from_slice(&[0xf5, 0xf6]);
+
+    let mut parsed = CardanoTx::from_bytes(&tagged).unwrap();
+    assert_eq!(parsed.inputs, tx.inputs);
+    assert_eq!(parsed.outputs, tx.outputs);
+    assert_eq!(parsed.witnesses.len(), 1);
+    assert_eq!(parsed.hash().unwrap(), blake2b_256(&body));
+    assert_ne!(parsed.hash().unwrap(), tx.hash().unwrap());
+    // the witness was made for the untagged body
+    assert_eq!(parsed.verify().err(), Some(Error::SignatureVerification(0)));
+    assert_eq!(parsed.to_bytes().unwrap(), tagged);
+
+    parsed.witnesses.clear();
+    parsed.sign(&[[0x07u8; 32]]).unwrap();
+    parsed.verify().unwrap();
+    let signed = parsed.to_bytes().unwrap();
+    assert_eq!(signed.len(), tagged.len());
+    assert_eq!(&signed[..1 + body.len() + 5], &tagged[..1 + body.len() + 5]);
+}
+
+/// A real transaction, with fields and witnesses this crate does not model,
+/// keeps its id and every byte.
+#[test]
+fn cardano_real_tx_round_trip() {
+    const WANT_TXID: &str = "b94c3185280a4217d5ab922619f74d768e0a7189f653c644c4f2aaccc7498217";
+    let raw = hex::decode(include_str!("../testdata/cardano_mainnet_tx.hex").trim()).unwrap();
+    let tx = CardanoTx::from_bytes(&raw).unwrap();
+    assert_eq!(hex::encode(tx.hash().unwrap()), WANT_TXID);
+    assert!(!tx.parsed.as_ref().unwrap().extra_body_keys().is_empty());
+    tx.verify().unwrap();
+    assert_eq!(tx.to_bytes().unwrap(), raw);
 }

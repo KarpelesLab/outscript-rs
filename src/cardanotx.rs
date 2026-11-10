@@ -16,19 +16,34 @@
 //! accepts any [`CardanoSigner`], including the BIP32-Ed25519 extended keys used
 //! by Cardano HD wallets (see [`crate::cardano_derive`]) and external/HSM signers.
 //!
+//! # Parsed transactions
+//!
+//! A transaction id is the hash of the body's exact bytes, and those of a
+//! transaction made elsewhere need not be the ones this crate would write:
+//! integers may not be in shortest form, the map may be ordered differently,
+//! and the body may carry fields this crate does not model (certificates,
+//! withdrawals, mint, ...). So [`CardanoTx::from_bytes`] keeps the original
+//! bytes, in [`CardanoTx::parsed`], and [`CardanoTx::hash`],
+//! [`CardanoTx::sign`], [`CardanoTx::verify`] and [`CardanoTx::to_bytes`] use
+//! them as they are: what is signed is the transaction that was given, and
+//! nothing of it is dropped when it is serialized again. See
+//! [`CardanoParsed`].
+//!
 //! Port of `cardanotx.go`.
 
 pub use crate::Error;
 
 use crate::prelude::*;
 
-use crate::cbor::{Cbor, split_array_items};
+use alloc::collections::BTreeSet;
+
+use crate::cbor::{Cbor, read_head, scan_item, split_array_items, write_head};
 use crate::crypto::SignerError;
 use crate::crypto::ed25519;
 use crate::hash::blake2b_256;
 
 /// References an unspent transaction output being spent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardanoInput {
     /// 32-byte id of the transaction that produced the output.
     pub txid: Vec<u8>,
@@ -37,7 +52,7 @@ pub struct CardanoInput {
 }
 
 /// A native-token amount within an output (multiasset value).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardanoAsset {
     /// 28-byte minting policy id (script hash).
     pub policy_id: Vec<u8>,
@@ -51,7 +66,7 @@ pub struct CardanoAsset {
 /// optional native tokens. `address` holds the raw address bytes (header byte
 /// followed by credentials), as produced by [`crate::out::Out::bytes`] for a
 /// parsed Cardano address.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardanoOutput {
     /// Raw address bytes (header + credentials).
     pub address: Vec<u8>,
@@ -104,7 +119,78 @@ pub struct CardanoVkeyWitness {
     pub signature: Vec<u8>,
 }
 
+/// What a transaction parsed by [`CardanoTx::from_bytes`] keeps of its
+/// original bytes: the exact transaction body, and everything else this crate
+/// does not model (the other entries of the witness set, the validity flag
+/// and the auxiliary data).
+///
+/// While a [`CardanoTx`] has one, its body *is* these bytes: they are what is
+/// hashed, signed, verified and serialized, not a re-encoding of `inputs`,
+/// `outputs`, `fee` and `ttl`. Those fields are then a view of the body, and
+/// a partial one:
+///
+/// - [`extra_body_keys`](Self::extra_body_keys) lists the body fields that
+///   have no counterpart in [`CardanoTx`] (certificates, withdrawals, mint,
+///   ...). A wallet showing a transaction for approval must not present
+///   `inputs`/`outputs`/`fee` as the whole of it when this is not empty.
+/// - an output's datum hash (the third field of the legacy output form) is
+///   kept in the body but not shown in [`CardanoOutput`].
+///
+/// Changing `inputs`, `outputs`, `fee` or `ttl` of a parsed transaction does
+/// not change its body: the methods that need the body then fail with
+/// [`Error::UnsupportedField`] rather than sign or serialize something other
+/// than what the fields say. To edit a parsed transaction, set
+/// [`CardanoTx::parsed`] to `None` first: the body is then encoded from the
+/// fields alone, which drops everything listed above (and the witnesses, made
+/// for another body, no longer verify).
+///
+/// `witnesses` may be changed freely: they are written in place of the vkey
+/// witnesses that were parsed, next to the preserved rest of the witness set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardanoParsed {
+    /// The transaction body, as it was.
+    body: Vec<u8>,
+    /// Body map keys other than 0..=3, in body order.
+    extra_body_keys: Vec<u64>,
+    /// Whether the vkey witnesses were wrapped in the set tag (#6.258).
+    vkeys_tagged: bool,
+    /// The witness-set entries other than the vkey witnesses (key 0): their
+    /// count, and their keys and values as they were.
+    extra_witness_count: u64,
+    extra_witnesses: Vec<u8>,
+    /// The items after the witness set (validity flag, auxiliary data): their
+    /// count, and their bytes as they were.
+    trailer_count: u64,
+    trailer: Vec<u8>,
+}
+
+impl CardanoParsed {
+    /// The exact bytes of the transaction body: what is hashed for the
+    /// transaction id and signed.
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// The keys of the body fields that [`CardanoTx`] does not model, in body
+    /// order: anything but inputs (0), outputs (1), fee (2) and ttl (3). For
+    /// instance 4 is certificates, 5 withdrawals, 7 the auxiliary data hash,
+    /// 8 the validity start and 9 mint.
+    pub fn extra_body_keys(&self) -> &[u64] {
+        &self.extra_body_keys
+    }
+
+    /// Whether the witness set has entries other than vkey witnesses (native
+    /// or Plutus scripts, datums, redeemers, bootstrap witnesses). They are
+    /// preserved on serialization.
+    pub fn has_extra_witnesses(&self) -> bool {
+        self.extra_witness_count != 0
+    }
+}
+
 /// A Cardano transaction.
+///
+/// Build one from its fields with `parsed: None` (or
+/// `..Default::default()`), or parse one with [`CardanoTx::from_bytes`].
 #[derive(Debug, Clone, Default)]
 pub struct CardanoTx {
     /// Inputs being spent.
@@ -117,6 +203,10 @@ pub struct CardanoTx {
     pub ttl: u64,
     /// Ed25519 vkey witnesses.
     pub witnesses: Vec<CardanoVkeyWitness>,
+    /// The original bytes of a transaction that was parsed, `None` for one
+    /// built from its fields. When set, the body is these bytes and not an
+    /// encoding of the fields above: see [`CardanoParsed`].
+    pub parsed: Option<CardanoParsed>,
 }
 
 /// Groups assets by policy id then asset name, summing amounts of duplicates,
@@ -213,9 +303,26 @@ impl CardanoTx {
         Ok(Cbor::Map(entries))
     }
 
-    /// Returns the canonical CBOR encoding of the transaction body.
+    /// Returns the CBOR encoding of the transaction body: the canonical
+    /// encoding of the fields for a transaction that was built, the original
+    /// bytes for one that was parsed (see [`CardanoParsed`]).
+    ///
+    /// Fails with [`Error::UnsupportedField`] if `inputs`, `outputs`, `fee`
+    /// or `ttl` of a parsed transaction were changed, as the original body no
+    /// longer says what they do.
     pub fn body_bytes(&self) -> Result<Vec<u8>, Error> {
-        Ok(self.body_map()?.encode())
+        let Some(parsed) = &self.parsed else {
+            return Ok(self.body_map()?.encode());
+        };
+        let body = parse_body(&parsed.body)?;
+        if body.inputs != self.inputs
+            || body.outputs != self.outputs
+            || body.fee != self.fee
+            || body.ttl != self.ttl
+        {
+            return Err(Error::UnsupportedField);
+        }
+        Ok(parsed.body.clone())
     }
 
     /// Returns the 32-byte blake2b-256 hash of the transaction body, which is
@@ -296,103 +403,250 @@ impl CardanoTx {
         Ok(())
     }
 
-    /// Builds the transaction_witness_set CBOR map. Returns an empty map when
-    /// there are no witnesses.
-    fn witness_set(&self) -> Cbor {
-        if self.witnesses.is_empty() {
-            return Cbor::Map(Vec::new());
+    /// Appends the transaction_witness_set CBOR map: the vkey witnesses under
+    /// key 0, when there are any, then the entries of `parsed` that are not
+    /// vkey witnesses, as they were.
+    fn write_witness_set(&self, out: &mut Vec<u8>, parsed: Option<&CardanoParsed>) {
+        let has_vkeys = !self.witnesses.is_empty();
+        let extra = parsed.map_or(0, |p| p.extra_witness_count);
+        write_head(out, 5, extra + has_vkeys as u64);
+        if has_vkeys {
+            write_head(out, 0, 0);
+            if parsed.is_some_and(|p| p.vkeys_tagged) {
+                write_head(out, 6, SET_TAG);
+            }
+            write_head(out, 4, self.witnesses.len() as u64);
+            for w in &self.witnesses {
+                write_head(out, 4, 2);
+                write_head(out, 2, w.vkey.len() as u64);
+                out.extend_from_slice(&w.vkey);
+                write_head(out, 2, w.signature.len() as u64);
+                out.extend_from_slice(&w.signature);
+            }
         }
-        let vkeys = self
-            .witnesses
-            .iter()
-            .map(|w| {
-                Cbor::Array(vec![
-                    Cbor::Bytes(w.vkey.clone()),
-                    Cbor::Bytes(w.signature.clone()),
-                ])
-            })
-            .collect();
-        Cbor::Map(vec![(Cbor::Uint(0), Cbor::Array(vkeys))])
+        if let Some(parsed) = parsed {
+            out.extend_from_slice(&parsed.extra_witnesses);
+        }
     }
 
-    /// Encodes the full transaction (body, witness set, validity flag, and null
-    /// auxiliary data) as canonical CBOR. The embedded body bytes are
+    /// Encodes the full transaction as CBOR. The embedded body bytes are
     /// byte-identical to those hashed for signing.
+    ///
+    /// A transaction that was built is written in canonical form, with a true
+    /// validity flag and null auxiliary data. One that was parsed keeps its
+    /// original body, validity flag, auxiliary data and witness-set entries
+    /// other than vkey witnesses, byte for byte; only the vkey witnesses are
+    /// written from [`CardanoTx::witnesses`].
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let body_bytes = self.body_bytes()?;
-        let transaction = Cbor::Array(vec![
-            Cbor::Raw(body_bytes),
-            self.witness_set(),
-            Cbor::Bool(true), // script validity flag; always true (no Plutus phase-2 support)
-            Cbor::Null,       // auxiliary data
-        ]);
-        Ok(transaction.encode())
+        let parsed = self.parsed.as_ref();
+        let mut out = Vec::with_capacity(body_bytes.len() + 16);
+        write_head(&mut out, 4, 2 + parsed.map_or(2, |p| p.trailer_count));
+        out.extend_from_slice(&body_bytes);
+        self.write_witness_set(&mut out, parsed);
+        match parsed {
+            Some(parsed) => out.extend_from_slice(&parsed.trailer),
+            None => {
+                // script validity flag: always true (no Plutus phase-2 support)
+                out.push(0xf5);
+                // auxiliary data: null
+                out.push(0xf6);
+            }
+        }
+        Ok(out)
     }
 
-    /// Decodes a CBOR-encoded Cardano transaction. Supports the subset produced
-    /// by [`CardanoTx::to_bytes`]: ADA/native-asset outputs in the legacy
-    /// (alonzo) array form and Ed25519 vkey witnesses.
+    /// Decodes a CBOR-encoded Cardano transaction: `[body, witness_set]`
+    /// followed by up to two more items (the validity flag and the auxiliary
+    /// data). The whole input must be the transaction: trailing bytes are an
+    /// error.
+    ///
+    /// The original bytes are kept in [`CardanoTx::parsed`] and are what
+    /// [`hash`](Self::hash), [`sign`](Self::sign), [`verify`](Self::verify)
+    /// and [`to_bytes`](Self::to_bytes) work on, so the transaction id and
+    /// the signed digest are those of the transaction that was given,
+    /// whatever its encoding and whatever fields it has. See
+    /// [`CardanoParsed`] for what the fields of the result do not show.
+    ///
+    /// Decoded into fields are the inputs, the ADA/native-asset outputs in
+    /// the legacy (alonzo) array form, the fee, the ttl and the Ed25519 vkey
+    /// witnesses. Other body fields and witness-set entries are preserved
+    /// without being decoded. A body or witness set with a duplicate key is
+    /// rejected with [`Error::DuplicateKey`].
     pub fn from_bytes(data: &[u8]) -> Result<CardanoTx, Error> {
-        let raw = split_array_items(data).map_err(Error::from)?;
-        if raw.len() < 2 {
+        let items = split_array_items(data).map_err(Error::from)?;
+        // the array is the whole of the data
+        let mut consumed = 0;
+        read_head(data, &mut consumed).map_err(Error::from)?;
+        consumed += items.iter().map(Vec::len).sum::<usize>();
+        if consumed != data.len() {
+            return Err(Error::TrailingData);
+        }
+        if !(2..=4).contains(&items.len()) {
             return Err(Error::InvalidData);
         }
 
-        let body = Cbor::decode(&raw[0]).map_err(Error::from)?.0;
-        let body = body.as_map().ok_or(Error::InvalidData)?;
-        let get = |key: u64| {
-            body.iter()
-                .find(|(k, _)| k.as_uint() == Some(key))
-                .map(|(_, v)| v)
-        };
+        let body = parse_body(&items[0])?;
 
-        let mut tx = CardanoTx::default();
-
-        if let Some(inputs) = get(0) {
-            let inputs = inputs.as_array().ok_or(Error::InvalidData)?;
-            for input in inputs {
-                let fields = input.as_array().ok_or(Error::InvalidData)?;
-                if fields.len() != 2 {
-                    return Err(Error::InvalidData);
-                }
-                let txid = fields[0].as_bytes().ok_or(Error::InvalidData)?.to_vec();
-                let index = fields[1].as_uint().ok_or(Error::InvalidData)?;
-                tx.inputs.push(CardanoInput { txid, index });
+        let mut witnesses = Vec::new();
+        let mut vkeys_tagged = false;
+        let mut extra_witness_count = 0;
+        let mut extra_witnesses = Vec::new();
+        for (key, key_and_value, value) in split_uint_map(&items[1])? {
+            if key != 0 {
+                extra_witness_count += 1;
+                extra_witnesses.extend_from_slice(key_and_value);
+                continue;
             }
-        }
-
-        if let Some(outputs) = get(1) {
-            let outputs = outputs.as_array().ok_or(Error::InvalidData)?;
-            for raw_out in outputs {
-                tx.outputs.push(decode_output(raw_out)?);
-            }
-        }
-
-        if let Some(fee) = get(2) {
-            tx.fee = fee.as_uint().ok_or(Error::InvalidData)?;
-        }
-        if let Some(ttl) = get(3) {
-            tx.ttl = ttl.as_uint().ok_or(Error::InvalidData)?;
-        }
-
-        let ws = Cbor::decode(&raw[1]).map_err(Error::from)?.0;
-        if let Some(entries) = ws.as_map()
-            && let Some((_, vkeys)) = entries.iter().find(|(k, _)| k.as_uint() == Some(0))
-        {
-            let vkeys = vkeys.as_array().ok_or(Error::InvalidData)?;
-            for vk in vkeys {
+            let (tagged, vkeys) = strip_set_tag(value);
+            vkeys_tagged = tagged;
+            let vkeys = decode_whole(vkeys)?;
+            for vk in vkeys.as_array().ok_or(Error::InvalidData)? {
                 let fields = vk.as_array().ok_or(Error::InvalidData)?;
                 if fields.len() != 2 {
                     return Err(Error::InvalidData);
                 }
                 let vkey = fields[0].as_bytes().ok_or(Error::InvalidData)?.to_vec();
                 let signature = fields[1].as_bytes().ok_or(Error::InvalidData)?.to_vec();
-                tx.witnesses.push(CardanoVkeyWitness { vkey, signature });
+                witnesses.push(CardanoVkeyWitness { vkey, signature });
             }
         }
 
-        Ok(tx)
+        let mut items = items.into_iter();
+        let raw_body = items.next().ok_or(Error::InvalidData)?;
+        let _witness_set = items.next();
+        let trailer_count = items.len() as u64;
+        let trailer = items.flatten().collect();
+
+        Ok(CardanoTx {
+            inputs: body.inputs,
+            outputs: body.outputs,
+            fee: body.fee,
+            ttl: body.ttl,
+            witnesses,
+            parsed: Some(CardanoParsed {
+                body: raw_body,
+                extra_body_keys: body.extra_keys,
+                vkeys_tagged,
+                extra_witness_count,
+                extra_witnesses,
+                trailer_count,
+                trailer,
+            }),
+        })
     }
+}
+
+/// The CBOR tag marking a set (#6.258), optional around the inputs and the
+/// vkey witnesses since Conway.
+const SET_TAG: u64 = 258;
+
+/// Removes the set tag (#6.258) from the front of an item, telling whether it
+/// was there.
+fn strip_set_tag(item: &[u8]) -> (bool, &[u8]) {
+    let mut pos = 0;
+    match read_head(item, &mut pos) {
+        Ok((6, SET_TAG, false)) => (true, &item[pos..]),
+        _ => (false, item),
+    }
+}
+
+/// Decodes `item`, which must be one CBOR value and nothing more.
+fn decode_whole(item: &[u8]) -> Result<Cbor, Error> {
+    let (value, len) = Cbor::decode(item).map_err(Error::from)?;
+    if len != item.len() {
+        return Err(Error::TrailingData);
+    }
+    Ok(value)
+}
+
+/// An entry of a map with unsigned-integer keys: the key, the bytes of the
+/// key and its value together, and those of the value alone.
+type UintMapEntry<'a> = (u64, &'a [u8], &'a [u8]);
+
+/// Splits a definite-length CBOR map with unsigned-integer keys (a
+/// transaction body or a witness set) into its entries, in the order they
+/// come, without decoding the values. The map must be the whole of `data`,
+/// and no key may come twice ([`Error::DuplicateKey`]): which of the two
+/// values a ledger or another parser would take is not something to guess.
+fn split_uint_map(data: &[u8]) -> Result<Vec<UintMapEntry<'_>>, Error> {
+    let mut pos = 0;
+    let (major, count, indefinite) = read_head(data, &mut pos).map_err(Error::from)?;
+    if major != 5 {
+        return Err(Error::InvalidData);
+    }
+    if indefinite {
+        return Err(crate::cbor::Error::UnsupportedIndefiniteLength.into());
+    }
+    let mut seen = BTreeSet::new();
+    let mut entries = Vec::new();
+    // `count` is a claim: every entry takes bytes, and running out of them
+    // ends the loop
+    for _ in 0..count {
+        let start = pos;
+        let (major, key, indefinite) = read_head(data, &mut pos).map_err(Error::from)?;
+        if major != 0 || indefinite {
+            return Err(Error::InvalidData);
+        }
+        if !seen.insert(key) {
+            return Err(Error::DuplicateKey);
+        }
+        let value = pos;
+        scan_item(data, &mut pos).map_err(Error::from)?;
+        entries.push((key, &data[start..pos], &data[value..pos]));
+    }
+    if pos != data.len() {
+        return Err(Error::TrailingData);
+    }
+    Ok(entries)
+}
+
+/// The fields of a transaction body that [`CardanoTx`] models, and the keys
+/// of those it does not.
+struct Body {
+    inputs: Vec<CardanoInput>,
+    outputs: Vec<CardanoOutput>,
+    fee: u64,
+    ttl: u64,
+    extra_keys: Vec<u64>,
+}
+
+/// Decodes the modelled fields of a transaction body (inputs, outputs, fee,
+/// ttl), noting the keys of the others without decoding their values.
+fn parse_body(raw: &[u8]) -> Result<Body, Error> {
+    let mut body = Body {
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        fee: 0,
+        ttl: 0,
+        extra_keys: Vec::new(),
+    };
+    for (key, _, value) in split_uint_map(raw)? {
+        match key {
+            0 => {
+                let inputs = decode_whole(strip_set_tag(value).1)?;
+                for input in inputs.as_array().ok_or(Error::InvalidData)? {
+                    let fields = input.as_array().ok_or(Error::InvalidData)?;
+                    if fields.len() != 2 {
+                        return Err(Error::InvalidData);
+                    }
+                    let txid = fields[0].as_bytes().ok_or(Error::InvalidData)?.to_vec();
+                    let index = fields[1].as_uint().ok_or(Error::InvalidData)?;
+                    body.inputs.push(CardanoInput { txid, index });
+                }
+            }
+            1 => {
+                let outputs = decode_whole(value)?;
+                for raw_out in outputs.as_array().ok_or(Error::InvalidData)? {
+                    body.outputs.push(decode_output(raw_out)?);
+                }
+            }
+            2 => body.fee = decode_whole(value)?.as_uint().ok_or(Error::InvalidData)?,
+            3 => body.ttl = decode_whole(value)?.as_uint().ok_or(Error::InvalidData)?,
+            _ => body.extra_keys.push(key),
+        }
+    }
+    Ok(body)
 }
 
 /// Decodes a single transaction output in the legacy (alonzo) array form
