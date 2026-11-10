@@ -374,6 +374,311 @@ fn mnemonic_vectors() {
     }
 }
 
+/// The vectors of `monero-wallet-util`'s seed tests ("test against
+/// Monero"): a mnemonic in each language with the keys the reference wallet
+/// derives from it.
+#[test]
+fn mnemonic_language_vectors() {
+    use MnemonicLanguage::*;
+    let vectors = [
+        (
+            ChineseSimplified,
+            "摇 曲 艺 武 滴 然 效 似 赏 式 祥 歌 买 疑 小 碧 堆 博 键 房 鲜 悲 付 喷 武",
+            "a5e4fff1706ef9212993a69f246f5c95ad6d84371692d63e9bb0ea112a58340d",
+            "1176c43ce541477ea2f3ef0b49b25112b084e26b8a843e1304ac4677b74cdf02",
+        ),
+        (
+            English,
+            "washing thirsty occur lectures tuesday fainted toxic adapt \
+             abnormal memoir nylon mostly building shrugged online ember northern \
+             ruby woes dauntless boil family illness inroads northern",
+            "c0af65c0dd837e666b9d0dfed62745f4df35aed7ea619b2798a709f0fe545403",
+            "513ba91c538a5a9069e0094de90e927c0cd147fa10428ce3ac1afd49f63e3b01",
+        ),
+        (
+            Dutch,
+            "setwinst riphagen vimmetje extase blief tuitelig fuiven meifeest \
+             ponywagen zesmaal ripdeal matverf codetaal leut ivoor rotten \
+             wisgerhof winzucht typograaf atrium rein zilt traktaat verzaagd setwinst",
+            "e2d2873085c447c2bc7664222ac8f7d240df3aeac137f5ff2022eaa629e5b10a",
+            "eac30b69477e3f68093d131c7fd961564458401b07f8c87ff8f6030c1a0c7301",
+        ),
+        (
+            French,
+            "poids vaseux tarte bazar poivre effet entier nuance \
+             sensuel ennui pacte osselet poudre battre alibi mouton \
+             stade paquet pliage gibier type question position projet pliage",
+            "2dd39ff1a4628a94b5c2ec3e42fb3dfe15c2b2f010154dc3b3de6791e805b904",
+            "6725b32230400a1032f31d622b44c3a227f88258939b14a7c72e00939e7bdf0e",
+        ),
+        (
+            Spanish,
+            "minero ocupar mirar evadir octubre cal logro miope \
+             opaco disco ancla litio clase cuello nasal clase \
+             fiar avance deseo mente grumo negro cordón croqueta clase",
+            "ae2c9bebdddac067d73ec0180147fc92bdf9ac7337f1bcafbbe57dd13558eb02",
+            "18deafb34d55b7a43cae2c1c1c206a3c80c12cc9d1f84640b484b95b7fec3e05",
+        ),
+        (
+            German,
+            "Kaliber Gabelung Tapir Liveband Favorit Specht Enklave Nabel \
+             Jupiter Foliant Chronik nisten löten Vase Aussage Rekord \
+             Yeti Gesetz Eleganz Alraune Künstler Almweide Jahr Kastanie Almweide",
+            "79801b7a1b9796856e2397d862a113862e1fdc289a205e79d8d70995b276db06",
+            "99f0ec556643bd9c038a4ed86edcb9c6c16032c4622ed2e000299d527a792701",
+        ),
+        (
+            Italian,
+            "cavo pancetta auto fulmine alleanza filmato diavolo prato \
+             forzare meritare litigare lezione segreto evasione votare buio \
+             licenza cliente dorso natale crescere vento tutelare vetta evasione",
+            "5e7fd774eb00fa5877e2a8b4dc9c7ffe111008a3891220b56a6e49ac816d650a",
+            "698a1dce6018aef5516e82ca0cb3e3ec7778d17dfb41a137567bfa2e55e63a03",
+        ),
+        (
+            Portuguese,
+            "agito eventualidade onus itrio holograma sodomizar objetos dobro \
+             iugoslavo bcrepuscular odalisca abjeto iuane darwinista eczema acetona \
+             cibernetico hoquei gleba driver buffer azoto megera nogueira agito",
+            "13b3115f37e35c6aa1db97428b897e584698670c1b27854568d678e729200c0f",
+            "ad1b4fd35270f5f36c4da7166672b347e75c3f4d41346ec2a06d1d0193632801",
+        ),
+        (
+            Japanese,
+            "ぜんぶ どうぐ おたがい せんきょ おうじ そんちょう じゅしん いろえんぴつ \
+             かほう つかれる えらぶ にちじょう くのう にちようび ぬまえび さんきゃく \
+             おおや ちぬき うすめる いがく せつでん さうな すいえい せつだん おおや",
+            "c56e895cdb13007eda8399222974cdbab493640663804b93cbef3d8c3df80b0b",
+            "6c3634a313ec2ee979d565c33888fd7c3502d696ce0134a8bc1a2698c7f2c508",
+        ),
+        (
+            Russian,
+            "шатер икра нация ехать получать инерция доза реальный \
+             рыжий таможня лопата душа веселый клетка атлас лекция \
+             обгонять паек наивный лыжный дурак стать ежик задача паек",
+            "7cb5492df5eb2db4c84af20766391cd3e3662ab1a241c70fc881f3d02c381f05",
+            "fcd53e41ec0df995ab43927f7c44bc3359c93523d5009fb3f5ba87431d545a03",
+        ),
+        (
+            Esperanto,
+            "ukazo klini peco etikedo fabriko imitado onklino urino \
+             pudro incidento kumuluso ikono smirgi hirundo uretro krii \
+             sparkado super speciala pupo alpinisto cvana vokegi zombio fabriko",
+            "82ebf0336d3b152701964ed41df6b6e9a035e57fc98b84039ed0bd4611c58904",
+            "cd4d120e1ea34360af528f6a3e6156063312d9cefc9aa6b5218d366c0ed6a201",
+        ),
+        (
+            Lojban,
+            "jetnu vensa julne xrotu xamsi julne cutci dakli \
+             mlatu xedja muvgau palpi xindo sfubu ciste cinri \
+             blabi darno dembi janli blabi fenki bukpu burcu blabi",
+            "e4f8c6819ab6cf792cebb858caabac9307fd646901d72123e0367ebc0a79c200",
+            "c806ce62bafaa7b2d597f1a1e2dbe4a2f96bfd804bf6f8420fc7f4a6bd700c00",
+        ),
+        // Mnemonics that are valid in two languages, for different seeds.
+        (
+            Spanish,
+            "pluma laico atraer pintor peor cerca balde buscar \
+             lancha batir nulo reloj resto gemelo nevera poder columna gol \
+             oveja latir amplio bolero feliz fuerza nevera",
+            "30303983fc8d215dd020cc6b8223793318d55c466a86e4390954f373fdc7200a",
+            "97c649143f3c147ba59aa5506cc09c7992c5c219bb26964442142bf97980800e",
+        ),
+        (
+            Spanish,
+            "pluma pluma pluma pluma pluma pluma pluma pluma \
+             pluma pluma pluma pluma pluma pluma pluma pluma \
+             pluma pluma pluma pluma pluma pluma pluma pluma pluma",
+            "b4050000b4050000b4050000b4050000b4050000b4050000b4050000b4050000",
+            "d73534f7912b395eb70ef911791a2814eb6df7ce56528eaaa83ff2b72d9f5e0f",
+        ),
+        (
+            Spanish,
+            "audio audio audio audio audio audio audio audio \
+             audio audio audio audio audio audio audio audio \
+             audio audio audio audio audio audio audio audio audio",
+            "ba000000ba000000ba000000ba000000ba000000ba000000ba000000ba000000",
+            "1437256da2c85d029b293d8c6b1d625d9374969301869b12f37186e3f906c708",
+        ),
+        (
+            English,
+            "audio audio audio audio audio audio audio audio \
+             audio audio audio audio audio audio audio audio \
+             audio audio audio audio audio audio audio audio audio",
+            "7900000079000000790000007900000079000000790000007900000079000000",
+            "20bec797ab96780ae6a045dd816676ca7ed1d7c6773f7022d03ad234b581d600",
+        ),
+    ];
+    let mut languages = std::vec::Vec::new();
+    for (language, mnemonic, spend, view) in vectors {
+        let name = language.english_name();
+        let seed =
+            seed_from_mnemonic_in(language, mnemonic).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let account = AccountKeys::from_seed(&seed).unwrap();
+        assert_eq!(*account.spend_secret(), h32(spend), "{name}");
+        assert_eq!(*account.view_secret(), h32(view), "{name}");
+
+        // Back to the same words.
+        let want: std::vec::Vec<&str> = mnemonic.split_whitespace().collect();
+        let words = seed_to_mnemonic_words_in(language, &seed);
+        assert_eq!(words.as_slice(), want.as_slice(), "{name}");
+        #[cfg(feature = "alloc")]
+        assert_eq!(*seed_to_mnemonic_in(language, &seed), want.join(" "));
+
+        // The prefixes are enough, and case does not matter.
+        let short: std::vec::Vec<std::string::String> = want
+            .iter()
+            .map(|word| word.chars().take(language.prefix_len()).collect())
+            .collect();
+        assert_eq!(
+            *seed_from_mnemonic_in(language, &short.join(" ")).unwrap(),
+            *seed,
+            "{name}"
+        );
+        for text in [mnemonic.to_uppercase(), mnemonic.to_lowercase()] {
+            assert_eq!(
+                *seed_from_mnemonic_in(language, &text).unwrap(),
+                *seed,
+                "{name}"
+            );
+        }
+
+        // Guessing the language finds it, or an earlier one in which the
+        // same words are valid too.
+        let (guessed_seed, guessed) = seed_from_mnemonic_any(mnemonic).unwrap();
+        if guessed == language {
+            assert_eq!(*guessed_seed, *seed);
+        } else {
+            assert_eq!((guessed, language), (English, Spanish), "{mnemonic}");
+            assert_ne!(*guessed_seed, *seed);
+        }
+        languages.push(language);
+    }
+    for language in MnemonicLanguage::ALL {
+        assert!(languages.contains(&language), "{language:?}");
+    }
+}
+
+/// The word lists: their size, the uniqueness of the prefixes that identify
+/// the words, and what Monero's unit tests (`mnemonics.cpp`) check.
+#[test]
+fn mnemonic_word_lists() {
+    use MnemonicLanguage::*;
+    assert_eq!(MnemonicLanguage::ALL.len(), 12);
+    let mut rng = test_rng(6);
+    for language in MnemonicLanguage::ALL {
+        let name = language.english_name();
+        assert_eq!(language.words().count(), 1626, "{name}");
+        assert!(language.word(1625).is_some() && language.word(1626).is_none());
+        let mut prefixes: std::vec::Vec<std::string::String> = language
+            .words()
+            .map(|word| {
+                assert!(!word.is_empty() && !word.contains(char::is_whitespace));
+                word.chars()
+                    .take(language.prefix_len())
+                    .flat_map(char::to_lowercase)
+                    .collect()
+            })
+            .collect();
+        prefixes.sort();
+        prefixes.dedup();
+        assert_eq!(prefixes.len(), 1626, "{name}");
+        for (index, word) in language.words().enumerate().step_by(271) {
+            assert_eq!(language.word_index(word), Some(index as u16), "{name}");
+        }
+        assert_eq!(language.word_index(""), None);
+        assert_eq!(language.word_index("\u{10ffff}"), None);
+
+        // Every seed comes back, in every language.
+        for _ in 0..2 {
+            let mut seed = [0u8; 32];
+            rng(&mut seed);
+            let words = seed_to_mnemonic_words_in(language, &seed);
+            let text = words.join(" ");
+            assert_eq!(
+                *seed_from_mnemonic_in(language, &text).unwrap(),
+                seed,
+                "{name}"
+            );
+            // The checksum word is one of the others.
+            assert!(words[..24].contains(&words[24]));
+            // A wrong checksum word.
+            let other = language.word(usize::from(seed[0])).unwrap();
+            if !same_word(language, other, words[24]) {
+                let bad = [&words[..24], &[other]].concat().join(" ");
+                assert_eq!(
+                    seed_from_mnemonic_in(language, &bad).unwrap_err(),
+                    Error::InvalidMnemonic
+                );
+            }
+        }
+        for seed in [[0u8; 32], [0xff; 32]] {
+            let text = seed_to_mnemonic_words_in(language, &seed).join(" ");
+            assert_eq!(*seed_from_mnemonic_in(language, &text).unwrap(), seed);
+        }
+    }
+    assert_eq!(English.name(), "English");
+    assert_eq!(Japanese.name(), "日本語");
+    assert_eq!(German.english_name(), "German");
+    assert_eq!(ChineseSimplified.prefix_len(), 1);
+    assert_eq!((English.prefix_len(), Japanese.prefix_len()), (3, 3));
+    assert_eq!((Spanish.prefix_len(), Lojban.prefix_len()), (4, 4));
+    // Spanish has words shorter than its prefix: only the whole word
+    // matches them.
+    assert_eq!(
+        Spanish.word_index("cal"),
+        Spanish.words().position(|w| w == "cal").map(|i| i as u16)
+    );
+    assert!(Spanish.word_index("cal").is_some());
+    assert_ne!(Spanish.word_index("cala"), Spanish.word_index("cal"));
+
+    // `language_detection_with_bad_checksum`: these words are Portuguese
+    // with the right checksum word, and nothing with another.
+    let base = "cinzento luxuriante leonardo gnostico digressao cupula fifa broxar iniquo louvor \
+                ovario dorsal ideologo besuntar decurso rosto susto lemure unheiro pagodeiro \
+                nitroglicerina eclusa mazurca bigorna";
+    let good = std::format!("{base} gnostico");
+    let (_, language) = seed_from_mnemonic_any(&good).unwrap();
+    assert_eq!(language, Portuguese);
+    let bad = std::format!("{base} luxuriante");
+    assert_eq!(
+        seed_from_mnemonic_any(&bad).unwrap_err(),
+        Error::InvalidMnemonic
+    );
+    assert_eq!(
+        seed_from_mnemonic_in(Portuguese, &bad).unwrap_err(),
+        Error::InvalidMnemonic
+    );
+
+    // `case_tolerance`: German, as written and in lower case.
+    let german = "Neubau umarmen Abart umarmen Turban feilen Brett Bargeld Episode Milchkuh \
+                  Substanz Jahr Armband Maibaum Tand Grünalge Tabak erziehen Federboa Lobrede \
+                  Tenor Leuchter Curry Diskurs Tenor";
+    let (seed, language) = seed_from_mnemonic_any(german).unwrap();
+    assert_eq!(language, German);
+    let (lower, language) = seed_from_mnemonic_any(&german.to_lowercase()).unwrap();
+    assert_eq!((language, *lower), (German, *seed));
+
+    // `partial_word_tolerance`: English words cut short.
+    let partial = "crim bam scamp gna limi woma wron tuit birth mundane donuts square cohesive \
+                   dolphin titans narrate fue saved wrap aloof magic mirr toget upda wra";
+    let (seed, language) = seed_from_mnemonic_any(partial).unwrap();
+    assert_eq!(language, English);
+    assert_eq!(*seed_from_mnemonic(partial).unwrap(), *seed);
+    // The full words start with what was typed.
+    for (word, typed) in seed_to_mnemonic_words(&seed)
+        .iter()
+        .zip(partial.split_whitespace())
+    {
+        assert!(word.starts_with(typed), "{word} {typed}");
+    }
+}
+
+/// Whether two words of a list are the same word.
+fn same_word(language: MnemonicLanguage, a: &str, b: &str) -> bool {
+    language.word_index(a) == language.word_index(b)
+}
+
 // --- scanning primitives ---
 
 /// The `derive_view_tag` vectors of Monero's `tests/crypto/tests.txt`.

@@ -133,7 +133,6 @@ mod extra;
 mod keys;
 mod legacy_sig;
 mod mnemonic;
-mod mnemonic_words;
 mod ringct;
 mod scan;
 #[cfg(feature = "alloc")]
@@ -167,9 +166,12 @@ pub use extra::{
 pub use extra::{push_additional_public_keys, push_nonce, push_payment_id, push_tx_public_key};
 pub use keys::{AccountKeys, SubaddressIndex, ViewKeys, subaddress_secret_key};
 pub use legacy_sig::{BORROMEAN_PROOF_LEN, borromean_verify, check_ring_signature};
+pub use mnemonic::{
+    MNEMONIC_WORDS, MnemonicLanguage, seed_from_mnemonic, seed_from_mnemonic_any,
+    seed_from_mnemonic_in, seed_to_mnemonic_words, seed_to_mnemonic_words_in,
+};
 #[cfg(feature = "alloc")]
-pub use mnemonic::seed_to_mnemonic;
-pub use mnemonic::{MNEMONIC_WORDS, seed_from_mnemonic, seed_to_mnemonic_words};
+pub use mnemonic::{seed_to_mnemonic, seed_to_mnemonic_in};
 pub use ringct::{H, commit, verify_balance, zero_commit};
 #[cfg(feature = "alloc")]
 pub use scan::OwnedOutput;
