@@ -19,6 +19,9 @@
 //! - **Signatures** ([`redpallas`]): spend authorization and binding
 //!   signatures.
 //! - **Bundles** ([`bundle`]): the Orchard part of a version 5 transaction.
+//! - **Proofs** (feature `zcash-orchard-prover`): `circuit` verifies and
+//!   creates the Halo 2 proofs of bundles, on the proving system of
+//!   `halo2`; `builder` builds, proves and signs whole bundles.
 //!
 //! Keys, addresses, signatures and trial decryption work on fixed-size arrays
 //! and never allocate, so they run on `no_std` targets without a heap; the
@@ -38,6 +41,8 @@
 //! ([`vesta::Point::msm_vartime`]), plus the Sinsemilla and Poseidon
 //! constants the circuit's gadgets are built from.
 
+#[cfg(feature = "zcash-orchard-prover")]
+pub mod builder;
 pub mod bundle;
 #[cfg(feature = "zcash-orchard-prover")]
 pub mod circuit;
@@ -93,6 +98,9 @@ pub enum Error {
     InvalidNote,
     /// A signature does not verify, or is not canonically encoded.
     InvalidSignature,
+    /// The proof of a bundle does not verify, or does not have the length
+    /// its number of actions implies.
+    InvalidProof,
     /// A point or field element is not canonically encoded.
     InvalidEncoding,
     /// The data ends before the structure does.
@@ -143,6 +151,7 @@ impl core::fmt::Display for Error {
             Error::InvalidAddress => "invalid Orchard address",
             Error::InvalidNote => "invalid Orchard note",
             Error::InvalidSignature => "invalid RedPallas signature",
+            Error::InvalidProof => "invalid Orchard proof",
             Error::InvalidEncoding => "non-canonical point or field element",
             Error::UnexpectedEof => "unexpected end of data",
             Error::TrailingData => "trailing data",

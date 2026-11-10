@@ -355,6 +355,46 @@ impl<'a> BundleRef<'a> {
             .verify(sighash, &Signature::from_bytes(&self.binding_sig))
     }
 
+    /// Verifies the zero-knowledge proof of the bundle with the verifying
+    /// key of the circuit version in force at the height of the
+    /// transaction (see
+    /// [`CircuitVersion`](super::circuit::CircuitVersion)). The proof must
+    /// have exactly the length the number of actions implies.
+    ///
+    /// Together with [`BundleRef::verify_signatures`] this covers what a
+    /// bundle proves by itself; that the anchor is a root of the note
+    /// commitment tree and that the nullifiers are unspent is for the
+    /// caller to check against the chain.
+    #[cfg(feature = "zcash-orchard-prover")]
+    pub fn verify_proof(&self, vk: &super::circuit::VerifyingKey) -> Result<(), Error> {
+        use super::Fp;
+        use super::pallas::Affine;
+        if self.proof.len() != super::circuit::proof_size(self.action_count()) {
+            return Err(Error::InvalidProof);
+        }
+        let anchor = Fp::from_bytes(&self.anchor).ok_or(Error::InvalidEncoding)?;
+        let disable_cross_address = vk.version().supports_cross_address_restriction();
+        let mut instances = alloc::vec::Vec::with_capacity(self.action_count());
+        for action in self.actions() {
+            let point = |bytes: &[u8; 32]| {
+                Affine::from_bytes(bytes)
+                    .filter(|p| !bool::from(p.is_identity()))
+                    .ok_or(Error::InvalidEncoding)
+            };
+            instances.push(super::circuit::Instance {
+                anchor,
+                cv_net: Affine::from_bytes(&action.cv).ok_or(Error::InvalidEncoding)?,
+                nf_old: Fp::from_bytes(&action.nullifier).ok_or(Error::InvalidEncoding)?,
+                rk: point(&action.rk)?,
+                cmx: Fp::from_bytes(&action.cmx).ok_or(Error::InvalidEncoding)?,
+                enable_spend: self.flags.spends_enabled(),
+                enable_output: self.flags.outputs_enabled(),
+                disable_cross_address,
+            });
+        }
+        super::circuit::verify_proof(vk, &instances, self.proof).map_err(|_| Error::InvalidProof)
+    }
+
     /// An owned copy of the bundle.
     #[cfg(feature = "alloc")]
     pub fn to_owned(&self) -> Bundle {
