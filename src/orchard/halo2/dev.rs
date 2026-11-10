@@ -230,7 +230,7 @@ impl MockProver {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::orchard::halo2::circuit::Layouter;
     use crate::orchard::halo2::plonk::{Constraints, Rotation, TableColumn};
@@ -238,13 +238,13 @@ mod tests {
     /// `a * b = c` with `c` public, `a` range-checked by a lookup and `b`
     /// bound to a constant.
     #[derive(Clone)]
-    struct Mul {
-        a: Value<Fp>,
-        b: Fp,
+    pub(crate) struct Mul {
+        pub(crate) a: Value<Fp>,
+        pub(crate) b: Fp,
     }
 
     #[derive(Clone)]
-    struct MulConfig {
+    pub(crate) struct MulConfig {
         advice: [Column<Advice>; 3],
         instance: Column<Instance>,
         q_mul: Selector,

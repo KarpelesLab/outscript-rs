@@ -19,13 +19,24 @@
 #![allow(dead_code)]
 
 pub mod circuit;
+mod commitment;
 #[cfg(test)]
 pub(crate) mod dev;
+mod keygen;
+mod multiopen;
 mod pdqsort;
 pub mod plonk;
+mod poly;
+#[cfg(test)]
+mod tests;
+mod transcript;
 mod value;
+mod verifier;
 
+pub use commitment::Params;
+pub use keygen::{PinnedVerificationKey, ProvingKey, VerifyingKey, keygen_pk, keygen_vk};
 pub use value::Value;
+pub use verifier::{BatchVerifier, verify_proof};
 
 /// Errors of circuit synthesis, key generation, proving and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
