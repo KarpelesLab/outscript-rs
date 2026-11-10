@@ -189,9 +189,12 @@ impl CardanoParsed {
 
 /// A Cardano transaction.
 ///
-/// Build one from its fields with `parsed: None` (or
-/// `..Default::default()`), or parse one with [`CardanoTx::from_bytes`].
+/// Build one by setting fields on [`CardanoTx::default`], or parse one with
+/// [`CardanoTx::from_bytes`]. The struct is `#[non_exhaustive]`, so it cannot
+/// be written as a struct literal outside this crate and new fields can be
+/// added without breaking callers.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct CardanoTx {
     /// Inputs being spent.
     pub inputs: Vec<CardanoInput>,

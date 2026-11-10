@@ -17,7 +17,12 @@ use crate::hash::keccak256_once;
 use crate::rlp::{self, RlpItem};
 
 /// An EVM transaction.
+///
+/// The struct is `#[non_exhaustive]`: outside this crate, start from
+/// [`EvmTx::default`] and set the fields you need, so new fields can be added
+/// without breaking callers.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EvmTx {
     /// Account nonce.
     pub nonce: u64,
