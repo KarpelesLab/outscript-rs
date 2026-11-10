@@ -857,7 +857,111 @@ fn error_conversion() {
     assert_eq!(Error::TrailingData.to_string(), "trailing data");
 }
 
+// --- the signatures of the old formats ---
+
+/// Runs the `check_ring_signature` lines of `vectors` and returns how many
+/// there were, valid and invalid.
+fn run_ring_signature_vectors(vectors: &str) -> (usize, usize) {
+    let (mut valid, mut invalid) = (0, 0);
+    for line in vectors.lines() {
+        let f: std::vec::Vec<&str> = line.split_whitespace().collect();
+        if f.first() != Some(&"check_ring_signature") {
+            continue;
+        }
+        let count: usize = f[3].parse().unwrap();
+        assert_eq!(f.len(), 6 + count, "{line}");
+        let ring: std::vec::Vec<[u8; 32]> = f[4..4 + count].iter().map(|key| h32(key)).collect();
+        let signatures: std::vec::Vec<[u8; 64]> = hex::decode(f[4 + count])
+            .unwrap()
+            .as_chunks::<64>()
+            .0
+            .to_vec();
+        assert_eq!(signatures.len(), count);
+        let expected = match f[5 + count] {
+            "true" => true,
+            "false" => false,
+            other => panic!("{other}"),
+        };
+        assert_eq!(
+            check_ring_signature(&h32(f[1]), &h32(f[2]), &ring, &signatures),
+            expected,
+            "{line}"
+        );
+        if expected {
+            valid += 1;
+        } else {
+            invalid += 1;
+        }
+    }
+    (valid, invalid)
+}
+
+/// `check_ring_signature` vectors of Monero's `tests/crypto/tests.txt`: a
+/// selection with rings of 1 to 16 keys, valid and not.
+#[test]
+fn ring_signature_vectors() {
+    let counts = run_ring_signature_vectors(include_str!("testdata/monero_ring_signatures.txt"));
+    assert_eq!(counts, (51, 51));
+    assert!(!check_ring_signature(&[0; 32], &H, &[], &[]));
+}
+
+/// All the `check_ring_signature` vectors of Monero's
+/// `tests/crypto/tests.txt`, given its path in `MONERO_CRYPTO_TESTS`.
+#[test]
+#[ignore]
+fn ring_signature_vectors_all() {
+    let Ok(path) = std::env::var("MONERO_CRYPTO_TESTS") else {
+        return;
+    };
+    let (valid, invalid) = run_ring_signature_vectors(&std::fs::read_to_string(path).unwrap());
+    assert_eq!(valid + invalid, 1024);
+    assert!(valid > 200 && invalid > 200);
+}
+
+/// Scalars of 2^255 and more, as some Borromean proofs of the chain have
+/// them, and what Monero's `slide` makes of them: the vectors of
+/// `monero-oxide` (`monero-ed25519`), taken from the chain.
+#[test]
+fn slide_scalar_vectors() {
+    use legacy_sig::slide_scalar;
+    let vectors = [
+        (
+            "cb2be144948166d0a9edb831ea586da0c376efa217871505ad77f6ff80f203f8",
+            "b8ffd6a1aee47828808ab0d4c8524cb5c376efa217871505ad77f6ff80f20308",
+        ),
+        (
+            "343d3df8a1051c15a400649c423dc4ed58bef49c50caef6ca4a618b80dee22f4",
+            "21113355bc682e6d7a9d5b3f2137a30259bef49c50caef6ca4a618b80dee2204",
+        ),
+        (
+            "c14f75d612800ca2c1dcfa387a42c9cc086c005bc94b18d204dd61342418eba7",
+            "4f473804b1d27ab2c789c80ab21d034a096c005bc94b18d204dd61342418eb07",
+        ),
+        (
+            "000102030405060708090a0b0c0d0e0f826c4f6e2329a31bc5bc320af0b2bcbb",
+            "a124cfd387f461bf3719e03965ee6877826c4f6e2329a31bc5bc320af0b2bc0b",
+        ),
+    ];
+    for (stored, recovered) in vectors {
+        assert_eq!(slide_scalar(&h32(stored)).to_bytes(), h32(recovered));
+    }
+    // Below 2^255, the value itself, reduced.
+    let mut rng = test_rng(8);
+    for _ in 0..20 {
+        let mut bytes = [0u8; 32];
+        rng(&mut bytes);
+        bytes[31] &= 0x7f;
+        assert_eq!(
+            slide_scalar(&bytes),
+            crate::cryptonote::scalar_reduce(&bytes)
+        );
+    }
+    assert_eq!(slide_scalar(&[0; 32]), Scalar::ZERO);
+}
+
 #[cfg(feature = "alloc")]
 mod build;
+#[cfg(feature = "alloc")]
+mod legacy;
 #[cfg(feature = "alloc")]
 mod with_alloc;

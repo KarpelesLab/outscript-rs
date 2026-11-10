@@ -7,21 +7,21 @@
 
 use purecrypto::ct::Choice;
 
+use super::bp_common::{
+    Accumulator, Generators, Kind, LOG_N, MAX_OUTPUTS, N, batch_invert, challenge_products, padded,
+    powers, with_generators,
+};
 use super::ringct::{Table, commit_point, h_point, inv_eight, multiexp, select_point};
 use super::{Error, random_scalar};
 use crate::cryptonote::{
-    EdwardsPoint, Hasher, Scalar, cn_fast_hash, point_from_bytes, point_from_hash, push_varint,
+    EdwardsPoint, Hasher, Scalar, cn_fast_hash, point_from_bytes, point_from_hash,
     scalar_from_bytes, scalar_from_hash, scalar_from_u64,
 };
 use crate::prelude::*;
 
 /// The most commitments (outputs) one proof can cover.
-pub const BULLETPROOF_PLUS_MAX_OUTPUTS: usize = 16;
+pub const BULLETPROOF_PLUS_MAX_OUTPUTS: usize = MAX_OUTPUTS;
 
-/// Bits of an amount.
-const N: usize = 64;
-/// `log2(N)`.
-const LOG_N: usize = 6;
 /// How many points share their doublings in a multi-scalar multiplication.
 const GROUP: usize = 32;
 
@@ -56,53 +56,25 @@ pub struct BulletproofPlus {
 ///
 /// Each is a hash to the curve, so making them takes a moment (a few
 /// thousand field operations per generator, 128 generators per commitment).
-/// [`BulletproofPlus::prove`] and [`BulletproofPlus::verify`] make the ones
-/// they need on every call; to prove or verify several proofs, make them
-/// once and use [`BulletproofPlus::prove_with`] and
-/// [`BulletproofPlus::verify_with`].
+/// With `std`, [`BulletproofPlus::prove`] and [`BulletproofPlus::verify`]
+/// make the ones they need once and keep them for the life of the process;
+/// without, they make them on every call. To control this — or to prove or
+/// verify several proofs without `std` — make them once and use
+/// [`BulletproofPlus::prove_with`], [`BulletproofPlus::verify_with`] and
+/// [`BulletproofPlus::verify_batch`].
 #[derive(Debug, Clone)]
-pub struct BulletproofPlusGenerators {
-    gi: Vec<EdwardsPoint>,
-    hi: Vec<EdwardsPoint>,
-}
-
-/// `get_exponent`: the generator number `index`,
-/// `Hp(cn_fast_hash(H || "bulletproof_plus" || varint(index)))`.
-fn generator(index: u64) -> EdwardsPoint {
-    let mut data = Vec::with_capacity(32 + 16 + 10);
-    data.extend_from_slice(&super::H);
-    data.extend_from_slice(b"bulletproof_plus");
-    push_varint(&mut data, index);
-    point_from_hash(&cn_fast_hash(&data))
-}
-
-/// The smallest power of two that is at least `outputs`, and its logarithm.
-fn padded(outputs: usize) -> Option<(usize, usize)> {
-    if outputs == 0 || outputs > BULLETPROOF_PLUS_MAX_OUTPUTS {
-        return None;
-    }
-    let m = outputs.next_power_of_two();
-    Some((m, m.trailing_zeros() as usize))
-}
+pub struct BulletproofPlusGenerators(Generators);
 
 impl BulletproofPlusGenerators {
     /// The generators for proofs over up to `outputs` commitments (at most
     /// [`BULLETPROOF_PLUS_MAX_OUTPUTS`]; more is treated as that).
     pub fn new(outputs: usize) -> Self {
-        let outputs = outputs.clamp(1, BULLETPROOF_PLUS_MAX_OUTPUTS);
-        let count = outputs.next_power_of_two() * N;
-        let mut gi = Vec::with_capacity(count);
-        let mut hi = Vec::with_capacity(count);
-        for i in 0..count as u64 {
-            hi.push(generator(2 * i));
-            gi.push(generator(2 * i + 1));
-        }
-        BulletproofPlusGenerators { gi, hi }
+        BulletproofPlusGenerators(Generators::new(Kind::Plus, outputs))
     }
 
     /// The number of commitments these generators can serve.
     pub fn max_outputs(&self) -> usize {
-        self.gi.len() / N
+        self.0.max_outputs()
     }
 }
 
@@ -163,18 +135,6 @@ fn d_vector(z_squared: &Scalar, m: usize) -> Vec<Scalar> {
     d
 }
 
-/// `x^0, x^1, ..., x^(n - 1)`.
-fn powers(x: &Scalar, n: usize) -> Vec<Scalar> {
-    let mut out = Vec::with_capacity(n);
-    let mut value = Scalar::ONE;
-    for _ in 0..n {
-        let next = value.mul(x);
-        out.push(value);
-        value = next;
-    }
-    out
-}
-
 /// `sum(a[i] * b[i] * y^(i + 1))`.
 fn weighted_inner_product(a: &[Scalar], b: &[Scalar], y: &Scalar) -> Scalar {
     let mut sum = Scalar::ZERO;
@@ -209,8 +169,9 @@ impl BulletproofPlus {
         masks: &[[u8; 32]],
         rng: &mut dyn FnMut(&mut [u8]),
     ) -> Result<Self, Error> {
-        let generators = BulletproofPlusGenerators::new(amounts.len());
-        Self::prove_with(&generators, amounts, masks, rng)
+        with_generators(Kind::Plus, amounts.len(), |generators| {
+            prove_checked(generators, amounts, masks, rng)
+        })
     }
 
     /// [`prove`](Self::prove) with generators made beforehand, which must
@@ -221,22 +182,7 @@ impl BulletproofPlus {
         masks: &[[u8; 32]],
         rng: &mut dyn FnMut(&mut [u8]),
     ) -> Result<Self, Error> {
-        let (m, log_m) = padded(amounts.len()).ok_or(Error::InvalidProof)?;
-        if masks.len() != amounts.len() || generators.max_outputs() < m {
-            return Err(Error::InvalidProof);
-        }
-        let gamma = masks
-            .iter()
-            .map(|mask| Ok(scalar_from_bytes(mask)?))
-            .collect::<Result<Vec<Scalar>, Error>>()?;
-        // A zero challenge is as likely as guessing a key: one retry is
-        // already more than will ever be needed.
-        for _ in 0..4 {
-            if let Some(proof) = prove_once(generators, amounts, &gamma, m, log_m, rng)? {
-                return Ok(proof);
-            }
-        }
-        Err(Error::BadRandomness)
+        prove_checked(&generators.0, amounts, masks, rng)
     }
 
     /// Verifies the proof against the output `commitments` of the
@@ -246,8 +192,9 @@ impl BulletproofPlus {
         if padded(commitments.len()).is_none() {
             return false;
         }
-        let generators = BulletproofPlusGenerators::new(commitments.len());
-        self.verify_with(&generators, commitments)
+        with_generators(Kind::Plus, commitments.len(), |generators| {
+            verify_one(self, generators, commitments)
+        })
     }
 
     /// [`verify`](Self::verify) with generators made beforehand, which must
@@ -257,13 +204,103 @@ impl BulletproofPlus {
         generators: &BulletproofPlusGenerators,
         commitments: &[[u8; 32]],
     ) -> bool {
-        verify_inner(self, generators, commitments).unwrap_or(false)
+        verify_one(self, &generators.0, commitments)
     }
+
+    /// Verifies several proofs at once, each against its own commitments,
+    /// in a single multi-scalar multiplication: much cheaper than verifying
+    /// them one by one, since the generators' terms are shared.
+    ///
+    /// Each proof's equation is scaled by a random weight before they are
+    /// added up, so that invalid proofs cannot cancel each other out. `rng`
+    /// fills its argument with random bytes for these weights; they must not
+    /// be predictable by whoever made the proofs (64 bytes are drawn per
+    /// proof). `generators` must serve the largest proof.
+    ///
+    /// Returns `Ok(true)` if every proof holds (or there are none),
+    /// `Ok(false)` if at least one does not — the batch does not tell which:
+    /// verify them one by one to find out. Fails with
+    /// [`Error::BadRandomness`] if `rng` yields only zeros.
+    ///
+    /// ```
+    /// use outscript::monero::{BulletproofPlus, BulletproofPlusGenerators, commit};
+    /// # use outscript::cryptonote::{cn_fast_hash, sc_reduce32};
+    /// // A stand-in for a random source. Use a cryptographically secure one.
+    /// let mut state = [7u8; 32];
+    /// let mut rng = |out: &mut [u8]| {
+    ///     for chunk in out.chunks_mut(32) {
+    ///         state = cn_fast_hash(&state);
+    ///         chunk.copy_from_slice(&state[..chunk.len()]);
+    ///     }
+    /// };
+    /// let generators = BulletproofPlusGenerators::new(1);
+    /// let masks = [sc_reduce32(&[1u8; 32]), sc_reduce32(&[2u8; 32])];
+    /// let first = BulletproofPlus::prove_with(&generators, &[5], &masks[..1], &mut rng)?;
+    /// let second = BulletproofPlus::prove_with(&generators, &[7], &masks[1..], &mut rng)?;
+    /// let commitments = [[commit(5, &masks[0])?], [commit(7, &masks[1])?]];
+    ///
+    /// let batch = [(&first, &commitments[0][..]), (&second, &commitments[1][..])];
+    /// assert!(BulletproofPlus::verify_batch(&generators, &batch, &mut rng)?);
+    /// // Proofs paired with the wrong commitments.
+    /// let batch = [(&first, &commitments[1][..]), (&second, &commitments[0][..])];
+    /// assert!(!BulletproofPlus::verify_batch(&generators, &batch, &mut rng)?);
+    /// # Ok::<(), outscript::monero::Error>(())
+    /// ```
+    pub fn verify_batch(
+        generators: &BulletproofPlusGenerators,
+        proofs: &[(&BulletproofPlus, &[[u8; 32]])],
+        rng: &mut dyn FnMut(&mut [u8]),
+    ) -> Result<bool, Error> {
+        let mut accumulator = Accumulator::new();
+        for (proof, commitments) in proofs {
+            let weight = random_scalar(rng)?;
+            if !accumulate(proof, commitments, &weight, &mut accumulator).unwrap_or(false) {
+                return Ok(false);
+            }
+        }
+        Ok(accumulator.is_identity(&generators.0))
+    }
+}
+
+/// Checks the input of a proof and makes it.
+fn prove_checked(
+    generators: &Generators,
+    amounts: &[u64],
+    masks: &[[u8; 32]],
+    rng: &mut dyn FnMut(&mut [u8]),
+) -> Result<BulletproofPlus, Error> {
+    let (m, log_m) = padded(amounts.len()).ok_or(Error::InvalidProof)?;
+    if masks.len() != amounts.len() || generators.max_outputs() < m {
+        return Err(Error::InvalidProof);
+    }
+    let gamma = masks
+        .iter()
+        .map(|mask| Ok(scalar_from_bytes(mask)?))
+        .collect::<Result<Vec<Scalar>, Error>>()?;
+    // A zero challenge is as likely as guessing a key: one retry is
+    // already more than will ever be needed.
+    for _ in 0..4 {
+        if let Some(proof) = prove_once(generators, amounts, &gamma, m, log_m, rng)? {
+            return Ok(proof);
+        }
+    }
+    Err(Error::BadRandomness)
+}
+
+/// Verifies one proof on its own (the weight of a batch of one is 1).
+pub(crate) fn verify_one(
+    proof: &BulletproofPlus,
+    generators: &Generators,
+    commitments: &[[u8; 32]],
+) -> bool {
+    let mut accumulator = Accumulator::new();
+    accumulate(proof, commitments, &Scalar::ONE, &mut accumulator).unwrap_or(false)
+        && accumulator.is_identity(generators)
 }
 
 /// One attempt at a proof: `None` if a challenge came out zero.
 fn prove_once(
-    generators: &BulletproofPlusGenerators,
+    generators: &Generators,
     amounts: &[u64],
     gamma: &[Scalar],
     m: usize,
@@ -515,10 +552,14 @@ fn compute_lr(
     multiexp(&scalars, &points, tables, true).compress()
 }
 
-fn verify_inner(
+/// Adds the terms of the verification equation of `proof`, scaled by
+/// `weight`, to `accumulator`: the proof holds if they sum to the identity.
+/// `Ok(false)` or an error if the proof cannot hold whatever the sum.
+pub(crate) fn accumulate(
     proof: &BulletproofPlus,
-    generators: &BulletproofPlusGenerators,
     commitments: &[[u8; 32]],
+    weight: &Scalar,
+    accumulator: &mut Accumulator,
 ) -> Result<bool, Error> {
     let Some((m, log_m)) = padded(commitments.len()) else {
         return Ok(false);
@@ -528,9 +569,6 @@ fn verify_inner(
     if proof.l.len() != rounds || proof.r.len() != rounds {
         return Ok(false);
     }
-    let (Some(gi), Some(hi)) = (generators.gi.get(..mn), generators.hi.get(..mn)) else {
-        return Ok(false);
-    };
     let r1 = scalar_from_bytes(&proof.r1)?;
     let s1 = scalar_from_bytes(&proof.s1)?;
     let d1 = scalar_from_bytes(&proof.d1)?;
@@ -538,7 +576,7 @@ fn verify_inner(
     // The proof is about the commitments divided by 8, and every point of
     // it is multiplied by 8 before use, which takes any torsion out.
     let inv8 = inv_eight();
-    let mut tables = new_tables();
+    let mut tables = [Table::new()];
     let mut v = Vec::with_capacity(commitments.len());
     let mut v8 = Vec::with_capacity(commitments.len());
     for commitment in commitments {
@@ -552,21 +590,25 @@ fn verify_inner(
     let Some((mut transcript, y, z)) = challenges_yz(&v, &proof.a) else {
         return Ok(false);
     };
-    let mut challenges = Vec::with_capacity(rounds);
-    let mut challenges_inv = Vec::with_capacity(rounds);
+    let mut challenges = Vec::with_capacity(rounds + 1);
     for (l, r) in proof.l.iter().zip(&proof.r) {
         let challenge = transcript_update(&mut transcript, &[l, r]);
         if challenge == Scalar::ZERO {
             return Ok(false);
         }
-        challenges_inv.push(challenge.invert());
         challenges.push(challenge);
     }
     let e = transcript_update(&mut transcript, &[&proof.a1, &proof.b]);
     if e == Scalar::ZERO {
         return Ok(false);
     }
-    let y_inv = y.invert();
+    // One inversion for y and the round challenges.
+    challenges.push(y.clone());
+    let mut challenges_inv = batch_invert(&challenges);
+    challenges.pop();
+    let Some(y_inv) = challenges_inv.pop() else {
+        return Ok(false);
+    };
 
     // y^MN by squaring (MN is a power of two), then y^(MN + 1).
     let mut y_mn = y.clone();
@@ -574,30 +616,24 @@ fn verify_inner(
         y_mn = y_mn.mul(&y_mn);
     }
     let y_mn_1 = y_mn.mul(&y);
-    let e_squared = e.mul(&e);
+    // Everything below carries the weight, through e and e^2.
+    let e_squared = e.mul(&e).mul(weight);
+    let e = e.mul(weight);
     let z_squared = z.mul(&z);
     let minus_e_squared = Scalar::ZERO.sub(&e_squared);
-
-    let mut scalars: Vec<Scalar> = Vec::with_capacity(2 * mn + 2 * rounds + m + 5);
-    let mut points: Vec<EdwardsPoint> = Vec::with_capacity(2 * mn + 2 * rounds + m + 5);
 
     // V[j]: -e^2 * y^(MN + 1) * z^(2 * (j + 1))
     let mut v_scalar = minus_e_squared.mul(&y_mn_1);
     for point in &v8 {
         v_scalar = v_scalar.mul(&z_squared);
-        scalars.push(v_scalar.clone());
-        points.push(*point);
+        accumulator.push(v_scalar.clone(), *point);
     }
     // B: -1, A1: -e, A: -e^2
-    scalars.push(Scalar::ZERO.sub(&Scalar::ONE));
-    points.push(times8(&proof.b)?);
-    scalars.push(Scalar::ZERO.sub(&e));
-    points.push(times8(&proof.a1)?);
-    scalars.push(minus_e_squared.clone());
-    points.push(times8(&proof.a)?);
+    accumulator.push(Scalar::ZERO.sub(weight), times8(&proof.b)?);
+    accumulator.push(Scalar::ZERO.sub(&e), times8(&proof.a1)?);
+    accumulator.push(minus_e_squared.clone(), times8(&proof.a)?);
     // G: d1
-    scalars.push(d1);
-    points.push(EdwardsPoint::generator());
+    accumulator.g = accumulator.g.add(&d1.mul(weight));
 
     // H: ((z^2 - z) * sum(y^1..y^MN) + y^(MN + 1) * z * sum(d)) * e^2 + r1 * y * s1,
     // with sum(d) = (2^64 - 1) * (z^2 + z^4 + ... + z^(2M)).
@@ -620,62 +656,32 @@ fn verify_inner(
         .mul(&sum_y)
         .add(&y_mn_1.mul(&z).mul(&sum_d))
         .mul(&e_squared)
-        .add(&r1.mul(&y).mul(&s1));
-    scalars.push(h_scalar);
-    points.push(h_point());
+        .add(&r1.mul(&y).mul(&s1).mul(weight));
+    accumulator.h = accumulator.h.add(&h_scalar);
 
-    // The products of the round challenges and their inverses, one per
-    // generator: entry i multiplies, for each round j, the challenge if bit
-    // (rounds - 1 - j) of i is set and its inverse otherwise.
-    let mut cache: Vec<Scalar> = vec![Scalar::ZERO; mn];
-    if let (Some(first), Some(first_inv)) = (challenges.first(), challenges_inv.first()) {
-        if let Some(slot) = cache.get_mut(0) {
-            *slot = first_inv.clone();
-        }
-        if let Some(slot) = cache.get_mut(1) {
-            *slot = first.clone();
-        }
-    }
-    for (j, (challenge, challenge_inv)) in challenges.iter().zip(&challenges_inv).enumerate() {
-        if j == 0 {
-            continue;
-        }
-        let slots = 1usize << (j + 1);
-        let mut s = slots;
-        while s >= 2 {
-            // s is even: the slots s - 1 and s - 2 both descend from slot
-            // (s - 1) / 2, which is overwritten only after them.
-            let Some(base) = cache.get((s - 1) / 2).cloned() else {
-                return Ok(false);
-            };
-            if let Some(slot) = cache.get_mut(s - 1) {
-                *slot = base.mul(challenge);
-            }
-            if let Some(slot) = cache.get_mut(s - 2) {
-                *slot = base.mul(challenge_inv);
-            }
-            s -= 2;
-        }
-    }
+    let Some(cache) = challenge_products(&challenges, &challenges_inv) else {
+        return Ok(false);
+    };
 
     // Gi[i]: e * r1 * y^-i * cache[i] + e^2 * z
     // Hi[i]: e * s1 * cache[!i] - e^2 * z - e^2 * y^(MN - i) * d[i]
+    accumulator.grow(mn);
     let e_squared_z = e_squared.mul(&z);
     let e_s1 = e.mul(&s1);
     let mut e_r1_y = e.mul(&r1);
     let mut minus_e_squared_y = minus_e_squared.mul(&y_mn);
-    for (i, ((g_point, h_point), d)) in gi.iter().zip(hi).zip(&d).enumerate() {
+    let slots = accumulator.gi.iter_mut().zip(accumulator.hi.iter_mut());
+    for (i, ((g_slot, h_slot), d)) in slots.zip(&d).enumerate() {
         let (Some(direct), Some(mirrored)) = (cache.get(i), cache.get(!i & (mn - 1))) else {
             return Ok(false);
         };
-        scalars.push(e_r1_y.mul(direct).add(&e_squared_z));
-        points.push(*g_point);
-        scalars.push(
-            e_s1.mul(mirrored)
+        *g_slot = g_slot.add(&e_r1_y.mul(direct).add(&e_squared_z));
+        *h_slot = h_slot.add(
+            &e_s1
+                .mul(mirrored)
                 .sub(&e_squared_z)
                 .add(&minus_e_squared_y.mul(d)),
         );
-        points.push(*h_point);
         e_r1_y = e_r1_y.mul(&y_inv);
         minus_e_squared_y = minus_e_squared_y.mul(&y_inv);
     }
@@ -688,12 +694,11 @@ fn verify_inner(
         .zip(&challenges)
         .zip(&challenges_inv)
     {
-        scalars.push(minus_e_squared.mul(challenge).mul(challenge));
-        points.push(times8(l)?);
-        scalars.push(minus_e_squared.mul(challenge_inv).mul(challenge_inv));
-        points.push(times8(r)?);
+        accumulator.push(minus_e_squared.mul(challenge).mul(challenge), times8(l)?);
+        accumulator.push(
+            minus_e_squared.mul(challenge_inv).mul(challenge_inv),
+            times8(r)?,
+        );
     }
-
-    let sum = multiexp(&scalars, &points, &mut tables, false);
-    Ok(sum == EdwardsPoint::identity())
+    Ok(true)
 }

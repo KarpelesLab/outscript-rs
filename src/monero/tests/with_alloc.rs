@@ -8,13 +8,13 @@ use super::*;
 
 const MAINNET: &str = include_str!("../testdata/mainnet_txs.txt");
 
-struct RealTx {
-    txid: [u8; 32],
-    bytes: Vec<u8>,
-    rings: Vec<Vec<RingMember>>,
+pub(super) struct RealTx {
+    pub(super) txid: [u8; 32],
+    pub(super) bytes: Vec<u8>,
+    pub(super) rings: Vec<Vec<RingMember>>,
 }
 
-fn mainnet_txs() -> BTreeMap<String, RealTx> {
+pub(super) fn mainnet_txs() -> BTreeMap<String, RealTx> {
     let mut txs = BTreeMap::new();
     for line in MAINNET.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
@@ -209,10 +209,8 @@ fn mainnet_bulletproofs_plus() {
     assert!(!tx.rct.bulletproofs_plus[0].verify(&[H; 17]));
 }
 
-/// The larger aggregations (8 and 16 commitments). Slow without
-/// optimisation: run with `--release`, or `--ignored`.
+/// The larger aggregations (8 and 16 commitments).
 #[test]
-#[cfg_attr(debug_assertions, ignore)]
 fn mainnet_bulletproofs_plus_large() {
     let txs = mainnet_txs();
     for name in ["rct6_1in_8out", "rct6_1in_12out_additional_keys"] {
@@ -251,15 +249,34 @@ fn mainnet_clsag() {
     // range proof differs, and the message covers it.
     let real = &txs["rct5"];
     let tx = Transaction::parse(&real.bytes).unwrap();
-    assert_eq!(
-        tx.verify_ring_signatures(&real.rings),
-        Err(Error::Unsupported)
-    );
+    assert_eq!(tx.verify_ring_signatures(&real.rings), Ok(true));
     let message = tx.signature_hash();
     for (i, clsag) in tx.rct.clsags.iter().enumerate() {
         let key_image = tx.prefix.inputs[i].key_image().unwrap();
         assert!(clsag.verify(&message, &real.rings[i], key_image, &tx.rct.pseudo_outs[i]));
     }
+}
+
+/// Every real transaction with its rings verifies in full, whatever its
+/// format.
+#[test]
+fn mainnet_verify_all_formats() {
+    let txs = mainnet_txs();
+    let mut seen = Vec::new();
+    for (name, real) in &txs {
+        if real.rings.is_empty() {
+            continue;
+        }
+        let tx = Transaction::parse(&real.bytes).unwrap();
+        assert_eq!(tx.verify(&real.rings), Ok(true), "{name}");
+        seen.push((tx.prefix.version, tx.rct.rct_type));
+    }
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen,
+        [(1, 0), (2, 1), (2, 2), (2, 3), (2, 4), (2, 5), (2, 6)]
+    );
 }
 
 /// Parsing never panics on, and rejects, truncated and corrupted
@@ -386,7 +403,8 @@ fn bulletproofs_plus_prove() {
     );
 }
 
-/// A proof over sixteen commitments. Slow without optimisation.
+/// Proofs over eight and sixteen commitments. Proving these takes a few
+/// seconds without optimisation: run with `--release`, or `--ignored`.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn bulletproofs_plus_prove_large() {

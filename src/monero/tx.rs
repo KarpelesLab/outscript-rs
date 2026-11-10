@@ -3,6 +3,9 @@
 
 use super::bulletproofs_plus::BulletproofPlus;
 use super::clsag::{Clsag, RingMember};
+use super::legacy_sig::{
+    BORROMEAN_PROOF_LEN, borromean_verify, check_ring_signature, key_image_point,
+};
 use super::ringct::verify_balance;
 use super::{Error, ringct};
 use crate::cryptonote::{Hasher, cn_fast_hash, push_varint, read_varint};
@@ -34,9 +37,8 @@ const TXOUT_TO_KEY: u8 = 0x02;
 /// Output tag of an output to a one-time key with a view tag.
 const TXOUT_TO_TAGGED_KEY: u8 = 0x03;
 
-/// The size of a Borromean range proof: 64 pairs of scalars, a scalar, and
-/// 64 commitments.
-const RANGE_SIG_LEN: usize = (64 + 64 + 1 + 64) * 32;
+/// The size of a Borromean range proof.
+const RANGE_SIG_LEN: usize = BORROMEAN_PROOF_LEN;
 
 /// An input of a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,8 +178,18 @@ impl EcdhInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RangeSig(pub Vec<u8>);
 
-/// An original Bulletproof range proof (RingCT types 3 to 5). It is parsed
-/// and serialized, not verified.
+impl RangeSig {
+    /// Whether the proof holds for `commitment`, the commitment of the
+    /// output it comes with: its amount is below 2^64
+    /// ([`borromean_verify`]).
+    pub fn verify(&self, commitment: &[u8; 32]) -> bool {
+        borromean_verify(&self.0, commitment)
+    }
+}
+
+/// An original Bulletproof range proof (RingCT types 3 to 5): one proof
+/// that the amounts of all the outputs of a transaction are below 2^64.
+/// Verified by `Bulletproof::verify`; there is no prover for it here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bulletproof {
     /// `A`.
@@ -204,8 +216,10 @@ pub struct Bulletproof {
     pub t: [u8; 32],
 }
 
-/// An MLSAG ring signature (RingCT types 1 to 4). It is parsed and
-/// serialized, not verified.
+/// An MLSAG ring signature (RingCT types 1 to 4). Verified by
+/// [`verify_simple`](Self::verify_simple) (types 2 to 4, one signature per
+/// input) and [`verify_full`](Self::verify_full) (type 1, one signature for
+/// the transaction); there is no signer for it here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mlsag {
     /// The responses: one row per ring member.
@@ -950,35 +964,90 @@ impl Transaction {
         inputs.checked_sub(outputs)
     }
 
-    /// Checks that the transaction is of the current kind — version 2,
-    /// [`RCT_TYPE_BULLETPROOF_PLUS`] — with consistent counts.
-    fn check_current(&self) -> Result<(), Error> {
+    /// Checks that the transaction has the parts its kind calls for, and
+    /// returns its RingCT type (`None` for version 1).
+    ///
+    /// Fails with [`Error::Unsupported`] for a coinbase transaction, whose
+    /// validity is a matter of the block it is in.
+    fn check_shape(&self) -> Result<Option<u8>, Error> {
         let rct = &self.rct;
-        if self.prefix.version != 2 || rct.rct_type != RCT_TYPE_BULLETPROOF_PLUS {
-            return Err(Error::Unsupported);
-        }
         let inputs = self.prefix.inputs.len();
         let outputs = self.prefix.outputs.len();
-        if inputs == 0
-            || rct.pseudo_outs.len() != inputs
-            || rct.clsags.len() != inputs
+        let spends = self
+            .prefix
+            .inputs
+            .iter()
+            .all(|input| matches!(input, Input::ToKey { .. }));
+        if !spends {
+            return Err(Error::Unsupported);
+        }
+        if inputs == 0 {
+            return Err(Error::InvalidTransaction);
+        }
+        if self.prefix.version == 1 {
+            if self.signatures.len() != inputs {
+                return Err(Error::InvalidTransaction);
+            }
+            return Ok(None);
+        }
+        let rct_type = rct.rct_type;
+        if self.prefix.version != 2 || rct_type == RCT_TYPE_NULL || !is_known_rct_type(rct_type) {
+            return Err(Error::Unsupported);
+        }
+        let ring_signatures = if has_clsags(rct_type) {
+            rct.clsags.len()
+        } else {
+            rct.mlsags.len()
+        };
+        let range_proofs_fit = if rct_type == RCT_TYPE_BULLETPROOF_PLUS {
+            rct.bulletproofs_plus.len() == 1
+        } else if has_bulletproofs(rct_type) {
+            rct.bulletproofs.len() == 1
+        } else {
+            rct.range_sigs.len() == outputs
+        };
+        let (expected_signatures, expected_pseudo_outs) = if rct_type == RCT_TYPE_FULL {
+            (1, 0)
+        } else {
+            (inputs, inputs)
+        };
+        if outputs == 0
             || rct.out_pk.len() != outputs
             || rct.ecdh_info.len() != outputs
-            || rct.bulletproofs_plus.len() != 1
+            || rct.pseudo_outs.len() != expected_pseudo_outs
+            || ring_signatures != expected_signatures
+            || !range_proofs_fit
         {
             return Err(Error::InvalidTransaction);
         }
-        Ok(())
+        Ok(Some(rct_type))
     }
 
-    /// Whether the amounts balance: the pseudo-output commitments add up to
-    /// the output commitments plus the fee
-    /// ([`verify_balance`](super::verify_balance)).
+    /// Whether the amounts balance.
     ///
-    /// Fails with [`Error::Unsupported`] for anything but a version 2
-    /// transaction of a RingCT type with pseudo-outputs (2 to 6).
+    /// For a version 2 transaction of a RingCT type with pseudo-outputs (2
+    /// to 6): the pseudo-output commitments add up to the output commitments
+    /// plus the fee ([`verify_balance`](super::verify_balance)). For a
+    /// version 1 transaction, whose amounts are in the clear: the inputs
+    /// cover the outputs (the difference is the [`fee`](Self::fee)).
+    ///
+    /// Fails with [`Error::Unsupported`] for anything else: a coinbase
+    /// transaction, or RingCT type 1, where the balance is part of what the
+    /// ring signature proves
+    /// ([`verify_ring_signatures`](Self::verify_ring_signatures)).
     pub fn verify_balance(&self) -> Result<bool, Error> {
         let rct = &self.rct;
+        if self.prefix.version == 1 {
+            let spends = self
+                .prefix
+                .inputs
+                .iter()
+                .any(|input| matches!(input, Input::ToKey { .. }));
+            if !spends {
+                return Err(Error::Unsupported);
+            }
+            return Ok(self.fee().is_some());
+        }
         if self.prefix.version != 2
             || rct.rct_type < RCT_TYPE_SIMPLE
             || !is_known_rct_type(rct.rct_type)
@@ -988,49 +1057,161 @@ impl Transaction {
         verify_balance(&rct.pseudo_outs, &rct.out_pk, rct.fee)
     }
 
-    /// Whether the Bulletproofs+ range proof of the transaction holds for
-    /// its output commitments: every output amount is below 2^64.
+    /// Whether the range proofs of the transaction hold for its output
+    /// commitments: every output amount is below 2^64. That is one
+    /// Borromean proof per output for RingCT types 1 and 2
+    /// ([`RangeSig::verify`]), one original Bulletproof for types 3 to 5
+    /// (`Bulletproof::verify`), one Bulletproof+ for type 6
+    /// ([`BulletproofPlus::verify`]).
     ///
-    /// Fails with [`Error::Unsupported`] for anything but a version 2,
-    /// [`RCT_TYPE_BULLETPROOF_PLUS`] transaction.
+    /// To check the proofs of many transactions at once, give them and the
+    /// transactions' `rct.out_pk` to [`BulletproofPlus::verify_batch`] (or
+    /// `Bulletproof::verify_batch`).
+    ///
+    /// Fails with [`Error::Unsupported`] for a transaction without RingCT
+    /// data (version 1, or coinbase), and [`Error::InvalidTransaction`] if
+    /// it does not have the proofs its type calls for.
     pub fn verify_range_proof(&self) -> Result<bool, Error> {
-        self.check_current()?;
-        let Some(proof) = self.rct.bulletproofs_plus.first() else {
-            return Err(Error::InvalidTransaction);
+        let Some(rct_type) = self.check_shape()? else {
+            return Err(Error::Unsupported);
         };
-        Ok(proof.verify(&self.rct.out_pk))
+        let rct = &self.rct;
+        if rct_type == RCT_TYPE_BULLETPROOF_PLUS {
+            let proof = rct.bulletproofs_plus.first();
+            return Ok(proof.is_some_and(|proof| proof.verify(&rct.out_pk)));
+        }
+        if has_bulletproofs(rct_type) {
+            let proof = rct.bulletproofs.first();
+            return Ok(proof.is_some_and(|proof| proof.verify(&rct.out_pk)));
+        }
+        Ok(rct
+            .range_sigs
+            .iter()
+            .zip(&rct.out_pk)
+            .all(|(proof, commitment)| proof.verify(commitment)))
     }
 
-    /// Whether the CLSAG ring signatures of the transaction hold, given the
+    /// Whether the ring signatures of the transaction hold, given the
     /// members of each input's ring: `rings[i]` lists, in the order of the
     /// input's key offsets, the public key and the commitment of each output
-    /// (as the daemon's `get_outs` returns them).
+    /// (as the daemon's `get_outs` returns them, for the input's amount —
+    /// zero in a RingCT transaction — and absolute offsets).
     ///
-    /// Fails with [`Error::Unsupported`] for anything but a version 2,
-    /// [`RCT_TYPE_BULLETPROOF_PLUS`] transaction, and with
-    /// [`Error::InvalidRing`] if the rings do not have the sizes the inputs
-    /// say.
+    /// Every kind of signature the chain has seen is checked: the
+    /// CryptoNote ring signatures of version 1 ([`check_ring_signature`];
+    /// the commitments of the ring members are not used), MLSAG for RingCT
+    /// types 1 to 4 ([`Mlsag::verify_full`], [`Mlsag::verify_simple`]) and
+    /// CLSAG for types 5 and 6 ([`Clsag::verify`]). For type 1, this also
+    /// shows that the amounts balance. Key images outside the prime-order
+    /// subgroup are refused, as consensus does.
+    ///
+    /// Fails with [`Error::Unsupported`] for a coinbase transaction,
+    /// [`Error::InvalidTransaction`] if the transaction does not have the
+    /// signatures its type calls for, and [`Error::InvalidRing`] if the
+    /// rings do not have the sizes the inputs say.
     pub fn verify_ring_signatures(&self, rings: &[Vec<RingMember>]) -> Result<bool, Error> {
-        self.check_current()?;
+        let rct_type = self.check_shape()?;
         if rings.len() != self.prefix.inputs.len() {
             return Err(Error::InvalidRing);
         }
-        let message = self.signature_hash();
-        let rct = &self.rct;
-        let inputs = self.prefix.inputs.iter().zip(rings);
-        let signatures = rct.clsags.iter().zip(&rct.pseudo_outs);
-        for ((input, ring), (clsag, pseudo_out)) in inputs.zip(signatures) {
+        let mut key_images = Vec::with_capacity(rings.len());
+        for (input, ring) in self.prefix.inputs.iter().zip(rings) {
             let Input::ToKey { key_image, .. } = input else {
-                return Err(Error::InvalidTransaction);
+                return Err(Error::Unsupported);
             };
             if ring.len() != input.ring_size() {
                 return Err(Error::InvalidRing);
             }
-            if !clsag.verify(&message, ring, key_image, pseudo_out) {
-                return Ok(false);
+            key_images.push(*key_image);
+        }
+        let rct = &self.rct;
+        let Some(rct_type) = rct_type else {
+            let message = self.prefix.hash();
+            let inputs = key_images.iter().zip(rings).zip(&self.signatures);
+            for ((key_image, ring), signatures) in inputs {
+                let keys: Vec<[u8; 32]> = ring.iter().map(|member| member.key).collect();
+                if key_image_point(key_image).is_none()
+                    || !check_ring_signature(&message, key_image, &keys, signatures)
+                {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        };
+        let message = self.signature_hash();
+        if rct_type == RCT_TYPE_FULL {
+            let signature = rct.mlsags.first().ok_or(Error::InvalidTransaction)?;
+            return Ok(signature.verify_full(&message, rings, &key_images, &rct.out_pk, rct.fee));
+        }
+        let inputs = key_images.iter().zip(rings).zip(&rct.pseudo_outs);
+        if has_clsags(rct_type) {
+            for (((key_image, ring), pseudo_out), clsag) in inputs.zip(&rct.clsags) {
+                if !clsag.verify(&message, ring, key_image, pseudo_out) {
+                    return Ok(false);
+                }
+            }
+        } else {
+            for (((key_image, ring), pseudo_out), mlsag) in inputs.zip(&rct.mlsags) {
+                if !mlsag.verify_simple(&message, ring, key_image, pseudo_out) {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
+    }
+
+    /// Whether the transaction's proofs hold, given the members of each
+    /// input's ring (as for
+    /// [`verify_ring_signatures`](Self::verify_ring_signatures)): the
+    /// amounts balance, every output amount is in range, and every input is
+    /// signed by the owner of one of its ring's outputs. Every format the
+    /// chain has seen is understood: version 1 and RingCT types 1 to 6.
+    ///
+    /// This is the cryptography of a transaction, not all of consensus: the
+    /// caller must still check that the ring members are the outputs the
+    /// inputs' offsets name and are spendable, that the key images have not
+    /// been seen before, and the rules of the block's era (ring sizes,
+    /// input and output ordering, allowed versions and types, the unlock
+    /// time, the minimum fee, sizes).
+    ///
+    /// The inexpensive checks come first. Fails with
+    /// [`Error::Unsupported`] for a coinbase transaction,
+    /// [`Error::InvalidTransaction`] for one whose parts do not fit
+    /// together, [`Error::InvalidRing`] if the rings do not have the sizes
+    /// the inputs say, and [`Error::CryptoNote`] for a commitment that is
+    /// not a curve point.
+    ///
+    /// ```
+    /// use outscript::monero::{RingMember, Transaction};
+    /// # fn fetch() -> (Vec<u8>, Vec<Vec<RingMember>>) { (Vec::new(), Vec::new()) }
+    /// // A transaction (`get_transactions`) and, for each input, the outputs
+    /// // its ring refers to (`get_outs`).
+    /// let (bytes, rings) = fetch();
+    /// # if false {
+    /// let tx = Transaction::parse(&bytes)?;
+    /// assert!(tx.verify(&rings)?);
+    /// # }
+    /// # Ok::<(), outscript::monero::Error>(())
+    /// ```
+    pub fn verify(&self, rings: &[Vec<RingMember>]) -> Result<bool, Error> {
+        let rct_type = self.check_shape()?;
+        if rings.len() != self.prefix.inputs.len()
+            || rings
+                .iter()
+                .zip(&self.prefix.inputs)
+                .any(|(ring, input)| ring.len() != input.ring_size())
+        {
+            return Err(Error::InvalidRing);
+        }
+        // RingCT type 1 has no pseudo-outputs: its signature covers the
+        // balance.
+        if rct_type != Some(RCT_TYPE_FULL) && !self.verify_balance()? {
+            return Ok(false);
+        }
+        if !self.verify_ring_signatures(rings)? {
+            return Ok(false);
+        }
+        Ok(rct_type.is_none() || self.verify_range_proof()?)
     }
 }
 

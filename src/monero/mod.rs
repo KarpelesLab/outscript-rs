@@ -121,12 +121,17 @@
 
 mod address;
 #[cfg(feature = "alloc")]
+mod bp_common;
+#[cfg(feature = "alloc")]
 mod build;
+#[cfg(feature = "alloc")]
+mod bulletproofs;
 #[cfg(feature = "alloc")]
 mod bulletproofs_plus;
 mod clsag;
 mod extra;
 mod keys;
+mod legacy_sig;
 mod mnemonic;
 mod mnemonic_words;
 mod ringct;
@@ -142,6 +147,8 @@ pub use address::{
 };
 #[cfg(feature = "alloc")]
 pub use build::{BuiltTransaction, TransactionBuilder, TransactionInput};
+#[cfg(feature = "alloc")]
+pub use bulletproofs::{BULLETPROOF_MAX_OUTPUTS, BulletproofGenerators};
 #[cfg(feature = "alloc")]
 pub use bulletproofs_plus::{
     BULLETPROOF_PLUS_MAX_OUTPUTS, BulletproofPlus, BulletproofPlusGenerators,
@@ -159,6 +166,7 @@ pub use extra::{
 #[cfg(feature = "alloc")]
 pub use extra::{push_additional_public_keys, push_nonce, push_payment_id, push_tx_public_key};
 pub use keys::{AccountKeys, SubaddressIndex, ViewKeys, subaddress_secret_key};
+pub use legacy_sig::{BORROMEAN_PROOF_LEN, borromean_verify, check_ring_signature};
 #[cfg(feature = "alloc")]
 pub use mnemonic::seed_to_mnemonic;
 pub use mnemonic::{MNEMONIC_WORDS, seed_from_mnemonic, seed_to_mnemonic_words};

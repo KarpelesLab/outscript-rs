@@ -189,3 +189,72 @@ fn ct_eq_u8(a: u8, b: u8) -> Choice {
     // x is in 0..=255: x - 1 borrows into the high bits only for x = 0.
     Choice::from(((x.wrapping_sub(1) >> 8) & 1) as u8)
 }
+
+/// The multi-scalar multiplication `sum(scalars[i] * points[i])` for public
+/// scalars, variable-time: Straus's method for a few points, the bucket
+/// method (Pippenger's) for many.
+#[cfg(feature = "alloc")]
+pub(crate) fn multiexp_vartime(scalars: &[Scalar], points: &[EdwardsPoint]) -> EdwardsPoint {
+    use crate::prelude::*;
+
+    let n = scalars.len().min(points.len());
+    if n < 96 {
+        let mut tables = vec![Table::new(); n.clamp(1, 32)];
+        return multiexp(scalars, points, &mut tables, false);
+    }
+    // The window: about log2(n) - 2 bits balances the n additions per
+    // window against the 2^c of the buckets.
+    let c: usize = match n {
+        0..256 => 5,
+        256..768 => 6,
+        768..2048 => 7,
+        2048..6144 => 8,
+        _ => 9,
+    };
+    let bytes: Vec<[u8; 32]> = scalars.iter().map(Scalar::to_bytes).collect();
+    // The c-bit digit of a scalar starting at bit `start`.
+    let digit = |scalar: &[u8; 32], start: usize| -> usize {
+        let mut value = 0usize;
+        for bit in 0..c {
+            let position = start + bit;
+            let byte = scalar.get(position / 8).copied().unwrap_or(0);
+            value |= usize::from((byte >> (position % 8)) & 1) << bit;
+        }
+        value
+    };
+    let windows = 253usize.div_ceil(c);
+    let mut buckets = vec![EdwardsPoint::identity(); (1 << c) - 1];
+    let mut used = vec![false; buckets.len()];
+    let mut total = EdwardsPoint::identity();
+    for window in (0..windows).rev() {
+        for _ in 0..c {
+            total = total.double();
+        }
+        used.fill(false);
+        for (scalar, point) in bytes.iter().zip(points) {
+            let d = digit(scalar, window * c);
+            if d == 0 {
+                continue;
+            }
+            if let (Some(bucket), Some(used)) = (buckets.get_mut(d - 1), used.get_mut(d - 1)) {
+                *bucket = if *used { bucket.add(point) } else { *point };
+                *used = true;
+            }
+        }
+        // sum(d * bucket[d]) as the sum of the running sums from the top.
+        let mut running: Option<EdwardsPoint> = None;
+        let mut sum: Option<EdwardsPoint> = None;
+        for (bucket, used) in buckets.iter().zip(&used).rev() {
+            if *used {
+                running = Some(running.map_or(*bucket, |r| r.add(bucket)));
+            }
+            if let Some(running) = &running {
+                sum = Some(sum.map_or(*running, |s| s.add(running)));
+            }
+        }
+        if let Some(sum) = sum {
+            total = total.add(&sum);
+        }
+    }
+    total
+}
