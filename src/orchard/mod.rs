@@ -10,7 +10,8 @@
 //! - **Keys** ([`keys`]): spending keys and their ZIP-32 derivation, full,
 //!   incoming and outgoing viewing keys, diversified [`Address`]es.
 //! - **Unified encodings** ([`unified`]): ZIP-316 unified addresses and
-//!   viewing keys.
+//!   viewing keys, of Revision 0 and of Revision 2 (with expiry and
+//!   birthday metadata).
 //! - **Notes** ([`note`], [`value`], [`tree`]): note commitments,
 //!   nullifiers, value commitments, the note commitment tree and
 //!   witnesses kept up to date as it grows.
@@ -144,6 +145,12 @@ pub enum Error {
     /// An item of a unified encoding has the wrong length for its typecode,
     /// or is not allowed in this kind of encoding.
     InvalidItem,
+    /// A unified encoding has a metadata item that must be understood to
+    /// use it (typecodes `0xE0` to `0xFC`) and is not: unknown, or in an
+    /// encoding of Revision 0, which cannot have any.
+    MustUnderstand,
+    /// A unified encoding has only metadata items (or none).
+    OnlyMetadata,
 }
 
 impl core::fmt::Display for Error {
@@ -176,6 +183,8 @@ impl core::fmt::Display for Error {
             Error::BothP2pkhAndP2sh => "both P2PKH and P2SH receivers",
             Error::OnlyTransparent => "no shielded item",
             Error::InvalidItem => "invalid unified item",
+            Error::MustUnderstand => "unified metadata that must be understood",
+            Error::OnlyMetadata => "no receiver or key",
         };
         f.write_str(msg)
     }

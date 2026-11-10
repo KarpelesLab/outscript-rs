@@ -21,9 +21,13 @@ fn f4jumble_vectors() {
         f4jumble_inv(&mut buf).unwrap();
         assert_eq!(buf, normal);
     }
-    assert_eq!(f4jumble(&mut [0u8; 47]), Err(Error::InvalidLength));
-    assert_eq!(f4jumble_inv(&mut [0u8; 47]), Err(Error::InvalidLength));
-    assert!(f4jumble(&mut [0u8; 48]).is_ok());
+    assert_eq!(f4jumble(&mut [0u8; 37]), Err(Error::InvalidLength));
+    assert_eq!(f4jumble_inv(&mut [0u8; 37]), Err(Error::InvalidLength));
+    assert!(f4jumble(&mut [0u8; 38]).is_ok());
+    let mut short: [u8; 38] = core::array::from_fn(|i| i as u8);
+    f4jumble(&mut short).unwrap();
+    f4jumble_inv(&mut short).unwrap();
+    assert!(short.iter().enumerate().all(|(i, b)| *b == i as u8));
 }
 
 /// The long vectors (3 MB and the 4 MB maximum) take a second or so
@@ -61,7 +65,7 @@ fn items<'a>(
     items
 }
 
-fn encode_items(hrp: &str, items: &[Item<'_>]) -> String {
+pub(super) fn encode_items(hrp: &str, items: &[Item<'_>]) -> String {
     let mut scratch = vec![0u8; raw_len(items)];
     let expected_len = encoded_len(hrp, scratch.len());
     let mut out = vec![0u8; expected_len];
@@ -390,7 +394,7 @@ fn unified_rules() {
         (vec![item(2, d43), item(2, d43)], Error::DuplicateTypecode),
         (vec![item(TYPECODE_MAX + 1, d43)], Error::InvalidTypecode),
         // too short for F4Jumble
-        (vec![item(3, &[1; 20])], Error::InvalidLength),
+        (vec![item(3, &[1; 19])], Error::InvalidLength),
     ] {
         assert_eq!(
             encode_to_slice("u", &list, &mut scratch, &mut out),
@@ -415,7 +419,7 @@ fn unified_rules() {
 
 /// Builds a unified string from a hand-made raw encoding, to check what
 /// the decoder rejects.
-fn jumble_and_encode(hrp: &str, raw: &[u8]) -> String {
+pub(super) fn jumble_and_encode(hrp: &str, raw: &[u8]) -> String {
     let mut raw = raw.to_vec();
     f4jumble(&mut raw).unwrap();
     let mut out = vec![0u8; encoded_len(hrp, raw.len())];
@@ -501,7 +505,7 @@ fn unified_decoder_rejects_malformed_encodings() {
         Err(Error::InvalidTypecode),
     );
     // too short for F4Jumble, bech32 (not bech32m), a small buffer
-    let short = [5u8; 40];
+    let short = [5u8; 37];
     let mut out = [0u8; 128];
     let n = crate::bech32::encode_to_slice("u", &short, crate::bech32::Variant::Bech32m, &mut out)
         .unwrap();

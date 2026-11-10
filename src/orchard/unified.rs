@@ -1,4 +1,6 @@
-//! ZIP-316 unified addresses and unified viewing keys (Revision 0).
+//! ZIP-316 unified addresses and unified viewing keys: Revision 0 here,
+//! and Revision 2 (metadata items: expiry, birthday; the `zu`, `tu`, `uvf`
+//! and `uvi` encodings) in [`revision2`].
 //!
 //! A unified encoding is a list of typed items (receivers of an address, or
 //! viewing keys of an account, one per pool), followed by 16 bytes of
@@ -14,7 +16,11 @@
 //!   [`UnifiedIncomingViewingKey`] hold the items this crate understands as
 //!   fixed-size arrays and enforce the rules of their kind (item lengths,
 //!   at least one shielded item, not both P2PKH and P2SH). Items of unknown
-//!   typecode are skipped when decoding, as ZIP-316 asks of consumers.
+//!   typecode are skipped when decoding, as ZIP-316 asks of consumers,
+//!   except the metadata that must be understood (typecodes `0xE0` to
+//!   `0xFC`), which an encoding of Revision 0 must not have.
+
+pub mod revision2;
 
 use purecrypto::hash::Blake2bMac;
 use purecrypto::zeroize::Zeroize;
@@ -27,8 +33,11 @@ use crate::bech32::{self, Variant};
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
 
-/// The shortest message F4Jumble takes.
-pub const F4JUMBLE_MIN_LEN: usize = 48;
+/// The shortest message F4Jumble takes: 38 bytes, a transparent receiver
+/// and the padding (which only an address of Revision 2 can consist of;
+/// Revision 0 of ZIP-316 said 48, a difference no valid encoding of
+/// Revision 0 shows).
+pub const F4JUMBLE_MIN_LEN: usize = 38;
 /// The longest message F4Jumble takes.
 pub const F4JUMBLE_MAX_LEN: usize = 4_194_368;
 
@@ -41,8 +50,30 @@ pub const TYPECODE_P2SH: u32 = 0x01;
 pub const TYPECODE_SAPLING: u32 = 0x02;
 /// The typecode of an Orchard item.
 pub const TYPECODE_ORCHARD: u32 = 0x03;
+/// The typecode of the birthday height of a viewing key (metadata,
+/// Revision 2).
+pub const TYPECODE_BIRTHDAY_HEIGHT: u32 = 0xc0;
+/// The typecode of the expiry height of an address (metadata that must be
+/// understood, Revision 2).
+pub const TYPECODE_EXPIRY_HEIGHT: u32 = 0xe0;
+/// The typecode of the expiry time of an address (metadata that must be
+/// understood, Revision 2).
+pub const TYPECODE_EXPIRY_TIME: u32 = 0xe1;
 /// The largest typecode.
 pub const TYPECODE_MAX: u32 = 0x0200_0000;
+
+/// Whether a typecode is that of a Metadata Item (`0xC0` to `0xFC`): an
+/// item that is neither a receiver nor a key.
+pub const fn is_metadata(typecode: u32) -> bool {
+    matches!(typecode, 0xc0..=0xfc)
+}
+
+/// Whether a typecode is that of a MUST-understand Metadata Item (`0xE0`
+/// to `0xFC`): a consumer that does not know the meaning of such an item
+/// must not use the encoding it is in.
+pub const fn is_must_understand(typecode: u32) -> bool {
+    matches!(typecode, 0xe0..=0xfc)
+}
 
 const PADDING_LEN: usize = 16;
 
@@ -87,7 +118,7 @@ fn f4jumble_split(msg: &mut [u8]) -> Result<(&mut [u8], &mut [u8]), Error> {
 /// Applies F4Jumble to `msg` in place: an unkeyed 4-round Feistel
 /// permutation that makes every bit of the output depend on every bit of
 /// the input, so that a truncated or partly matching address looks nothing
-/// like the original. The message must be 48 to 4194368 bytes long.
+/// like the original. The message must be 38 to 4194368 bytes long.
 pub fn f4jumble(msg: &mut [u8]) -> Result<(), Error> {
     let (a, b) = f4jumble_split(msg)?;
     xor_g(0, a, b);
@@ -473,7 +504,9 @@ impl UnifiedAddress {
     /// Decodes a unified address, returning its network too. Receivers of
     /// unknown typecode are skipped (they still make the address valid when
     /// its only known receivers are transparent, as nothing says they are
-    /// not shielded).
+    /// not shielded), and so is metadata, except the metadata that must be
+    /// understood, which Revision 0 does not allow
+    /// ([`Error::MustUnderstand`]).
     ///
     /// Without `alloc`, an encoding whose payload is longer than 512 bytes
     /// (a string of over 800 characters, which only unknown items can
@@ -488,6 +521,10 @@ impl UnifiedAddress {
                     TYPECODE_P2SH => ua.p2sh = fixed(item.data)?,
                     TYPECODE_SAPLING => ua.sapling = fixed(item.data)?,
                     TYPECODE_ORCHARD => ua.orchard = fixed(item.data)?,
+                    typecode if is_must_understand(typecode) => {
+                        return Err(Error::MustUnderstand);
+                    }
+                    typecode if is_metadata(typecode) => {}
                     _ => unknown = true,
                 }
             }
@@ -569,7 +606,8 @@ impl UnifiedFullViewingKey {
 
     /// Decodes a unified full viewing key, returning its network too. Items
     /// of unknown typecode (which includes `0x01`, meaningless in a viewing
-    /// key) are skipped.
+    /// key of Revision 0) are skipped, except the metadata that must be
+    /// understood ([`Error::MustUnderstand`]).
     ///
     /// Without `alloc`, an encoding whose payload is longer than 512 bytes
     /// (a string of over 800 characters, which only unknown items can
@@ -583,6 +621,10 @@ impl UnifiedFullViewingKey {
                     TYPECODE_P2PKH => key.transparent = fixed(item.data)?,
                     TYPECODE_SAPLING => key.sapling = fixed(item.data)?,
                     TYPECODE_ORCHARD => key.orchard = fixed(item.data)?,
+                    typecode if is_must_understand(typecode) => {
+                        return Err(Error::MustUnderstand);
+                    }
+                    typecode if is_metadata(typecode) => {}
                     _ => unknown = true,
                 }
             }
@@ -661,7 +703,8 @@ impl UnifiedIncomingViewingKey {
 
     /// Decodes a unified incoming viewing key, returning its network too.
     /// Items of unknown typecode (which includes `0x01`, meaningless in a
-    /// viewing key) are skipped.
+    /// viewing key of Revision 0) are skipped, except the metadata that
+    /// must be understood ([`Error::MustUnderstand`]).
     ///
     /// Without `alloc`, an encoding whose payload is longer than 512 bytes
     /// (a string of over 800 characters, which only unknown items can
@@ -675,6 +718,10 @@ impl UnifiedIncomingViewingKey {
                     TYPECODE_P2PKH => key.transparent = fixed(item.data)?,
                     TYPECODE_SAPLING => key.sapling = fixed(item.data)?,
                     TYPECODE_ORCHARD => key.orchard = fixed(item.data)?,
+                    typecode if is_must_understand(typecode) => {
+                        return Err(Error::MustUnderstand);
+                    }
+                    typecode if is_metadata(typecode) => {}
                     _ => unknown = true,
                 }
             }

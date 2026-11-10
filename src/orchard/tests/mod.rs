@@ -9,6 +9,7 @@ mod hashes;
 mod keys;
 mod notes;
 mod unified;
+mod unified_r2;
 
 /// The rows of a test vector file, without its two header rows.
 pub(crate) fn vectors(json: &str) -> Vec<Vec<Value>> {
