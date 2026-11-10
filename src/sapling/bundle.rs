@@ -29,8 +29,13 @@
 
 use super::Error;
 use super::jubjub::Point;
+use super::keys::{IncomingViewingKey, OutgoingViewingKey};
 use super::note::MAX_MONEY;
-use super::note_encryption::{ENC_CIPHERTEXT_SIZE, OUT_CIPHERTEXT_SIZE};
+use super::note::Note;
+use super::note_encryption::{
+    ENC_CIPHERTEXT_SIZE, MEMO_SIZE, OUT_CIPHERTEXT_SIZE, Zip212Enforcement, try_note_decryption,
+    try_output_recovery_with_ovk,
+};
 use super::redjubjub::{self, Signature};
 use crate::btcvarint::BtcVarInt;
 #[cfg(feature = "alloc")]
@@ -124,6 +129,40 @@ pub struct OutputRef<'a> {
 }
 
 impl OutputRef<'_> {
+    /// Trial-decrypts the output with an incoming viewing key: see
+    /// [`try_note_decryption`].
+    pub fn try_note_decryption(
+        &self,
+        ivk: &IncomingViewingKey,
+        zip212: Zip212Enforcement,
+    ) -> Option<(Note, [u8; MEMO_SIZE])> {
+        try_note_decryption(
+            ivk,
+            self.ephemeral_key,
+            self.cmu,
+            self.enc_ciphertext,
+            zip212,
+        )
+    }
+
+    /// Recovers the note of an output created with the outgoing viewing key
+    /// `ovk`: see [`try_output_recovery_with_ovk`].
+    pub fn try_output_recovery(
+        &self,
+        ovk: &OutgoingViewingKey,
+        zip212: Zip212Enforcement,
+    ) -> Option<(Note, [u8; MEMO_SIZE])> {
+        try_output_recovery_with_ovk(
+            ovk,
+            self.cv,
+            self.cmu,
+            self.ephemeral_key,
+            self.enc_ciphertext,
+            self.out_ciphertext,
+            zip212,
+        )
+    }
+
     /// An owned copy.
     pub fn to_owned(&self) -> OutputDescription {
         OutputDescription {
@@ -675,6 +714,62 @@ mod tests {
         let outputs = vec![output(600, &rcv[1], 1), output(300, &rcv[2], 2)];
         let bsk = binding_signing_key(&rcv[..1], &rcv[1..]);
         (spends, outputs, 100, sign_binding(&bsk, sighash, &[2; 80]))
+    }
+
+    /// An output built as a sender does is found by its recipient and
+    /// recovered by its sender, through the serialized bundle.
+    #[test]
+    fn scanning() {
+        use crate::sapling::keys::{ExpandedSpendingKey, default_diversifier};
+        use crate::sapling::note::Rseed;
+        use crate::sapling::note_encryption::{
+            EMPTY_MEMO, encrypt_note, encrypt_outgoing, outgoing_cipher_key,
+        };
+        let sk = [0x33u8; 32];
+        let fvk = ExpandedSpendingKey::from_spending_key(&sk)
+            .unwrap()
+            .full_viewing_key();
+        let address = fvk
+            .to_payment_address(default_diversifier(&sk).unwrap())
+            .unwrap();
+        let note = Note::new(address, 5_000, Rseed::AfterZip212([0x44; 32]));
+        let rcv = Fr::from_u64(31337);
+        let cv = value_commitment(note.value(), &rcv).to_bytes();
+        let cmu = note.cmu();
+        let (ephemeral_key, enc_ciphertext) = encrypt_note(&note, &EMPTY_MEMO).unwrap();
+        let ock = outgoing_cipher_key(fvk.ovk(), &cv, &cmu, &ephemeral_key);
+        let esk = note.rseed().esk().unwrap();
+        let output = OutputDescription {
+            cv,
+            cmu,
+            ephemeral_key,
+            enc_ciphertext,
+            out_ciphertext: encrypt_outgoing(&ock, address.pk_d(), &esk),
+            zkproof: [0; GROTH_PROOF_SIZE],
+        };
+        let sighash = [0x21; 32];
+        let binding_sig = sign_binding(&binding_signing_key([], [&rcv]), &sighash, &[3; 80]);
+        let mut bytes = vec![0u8; bundle_len(0, 1)];
+        write_bundle(&[], &[output], -5_000, &[0; 32], &binding_sig, &mut bytes).unwrap();
+
+        let bundle = BundleRef::parse(&bytes).unwrap();
+        assert_eq!(bundle.anchor(), None);
+        assert_eq!(bundle.verify(&sighash), Ok(()));
+        let found = bundle.output(0).unwrap();
+        let on = Zip212Enforcement::On;
+        assert_eq!(
+            found.try_note_decryption(&fvk.ivk(), on),
+            Some((note, EMPTY_MEMO))
+        );
+        assert_eq!(
+            found.try_output_recovery(fvk.ovk(), on),
+            Some((note, EMPTY_MEMO))
+        );
+        let other = ExpandedSpendingKey::from_spending_key(&[0x34; 32])
+            .unwrap()
+            .full_viewing_key();
+        assert_eq!(found.try_note_decryption(&other.ivk(), on), None);
+        assert_eq!(found.try_output_recovery(other.ovk(), on), None);
     }
 
     #[test]

@@ -10,6 +10,7 @@
 
 use super::field::{Fq, Fr};
 use purecrypto::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use purecrypto::zeroize::Zeroize;
 
 /// The curve parameter `d = -10240/10241`.
 pub const D: Fq = Fq::from_raw([
@@ -255,7 +256,7 @@ impl Point {
         for i in 1..16 {
             table[i] = table[i - 1].add(self);
         }
-        let bytes = scalar.to_bytes();
+        let mut bytes = scalar.to_bytes();
         let mut acc = Point::IDENTITY;
         for byte in bytes.iter().rev() {
             for nibble in [byte >> 4, byte & 15] {
@@ -267,6 +268,7 @@ impl Point {
                 acc = acc.add(&entry);
             }
         }
+        bytes.zeroize();
         acc
     }
 

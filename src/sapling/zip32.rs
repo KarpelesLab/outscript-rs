@@ -933,6 +933,52 @@ mod tests {
         );
     }
 
+    /// The encodings in librustzcash's `zcash_keys` tests.
+    #[test]
+    fn librustzcash_encodings() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/bech32_encodings.json")).unwrap();
+        let xsk = ExtendedSpendingKey::master(&[0; 32]).unwrap();
+        let xfvk = xsk.to_extended_full_viewing_key();
+        let mut buf = [0u8; EXTENDED_KEY_MAX_ENCODED_LEN];
+        let mut seen = 0;
+        for (name, network) in [
+            ("encoded_main", Network::Main),
+            ("encoded_test", Network::Test),
+            ("encoded_regtest", Network::Regtest),
+        ] {
+            if let Some(expect) = v["extended_spending_key"][name].as_str() {
+                seen += 1;
+                assert_eq!(xsk.encode(network, &mut buf).unwrap(), expect);
+                assert_eq!(
+                    ExtendedSpendingKey::decode(expect).unwrap(),
+                    (network, xsk.clone())
+                );
+            }
+            if let Some(expect) = v["extended_full_viewing_key"][name].as_str() {
+                seen += 1;
+                assert_eq!(xfvk.encode(network, &mut buf).unwrap(), expect);
+                assert_eq!(
+                    ExtendedFullViewingKey::decode(expect),
+                    Ok((network, xfvk.clone()))
+                );
+            }
+            let address: [u8; 43] = hex::decode(v["payment_address_bytes"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let address = PaymentAddress::from_bytes(&address).unwrap();
+            let expect = v["payment_address"][name].as_str().unwrap();
+            assert_eq!(address.encode(network, &mut buf).unwrap(), expect);
+            assert_eq!(PaymentAddress::decode(expect), Ok((network, address)));
+        }
+        assert_eq!(seen, 5);
+        assert_eq!(
+            PaymentAddress::decode(v["invalid_diversifier"].as_str().unwrap()),
+            Err(Error::InvalidDiversifier)
+        );
+    }
+
     #[test]
     fn bech32_encodings() {
         let account = ExtendedSpendingKey::from_seed_account(&seed(), COIN_TYPE_TEST, 7).unwrap();

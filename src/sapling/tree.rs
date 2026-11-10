@@ -256,6 +256,8 @@ impl<const D: usize> Frontier<D> {
 
     /// The frontier of the empty tree.
     pub const fn new() -> Self {
+        // rejects unsupported depths at compile time
+        let _ = Self::CAPACITY;
         Frontier {
             size: 0,
             leaf: UNCOMMITTED,
