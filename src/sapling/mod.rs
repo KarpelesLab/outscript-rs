@@ -29,7 +29,8 @@
 //! `const` constructors ([`field::Fq`], [`jubjub::AffinePoint`]), the
 //! generators and their window tables ([`generators`]), the Pedersen hash
 //! chunk encoding and segment generators ([`pedersen`]), and the bit
-//! decompositions the circuits consume ([`pedersen::Bits`], [`note`]).
+//! decompositions the circuits consume ([`pedersen::bits_le`],
+//! [`note::note_commitment_bits`]).
 
 pub mod bundle;
 pub mod field;

@@ -610,7 +610,7 @@ impl IncomingViewingKey {
     /// Decodes a Bech32 incoming viewing key of any network.
     pub fn decode(s: &str) -> Result<(Network, Self), Error> {
         let mut bytes = Zeroizing::new([0u8; 32]);
-        let network = bech32_decode(s, Network::hrp_incoming_viewing_key, &mut *bytes)?;
+        let network = bech32_decode(s, Network::hrp_incoming_viewing_key, &mut bytes)?;
         Ok((network, Self::from_bytes(&bytes)?))
     }
 }

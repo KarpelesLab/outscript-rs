@@ -3,7 +3,7 @@
 //! signatures.
 //!
 //! The serialized layout is the one
-//! [`ZcashTx::sapling`](crate::zcashtx::ZcashTx::sapling) carries and whose
+//! [`ZcashTx::sapling`](crate::zcashtx::ZcashTx#structfield.sapling) carries and whose
 //! ZIP-244 digest [`zcashtx`](crate::zcashtx) computes:
 //!
 //! ```text
@@ -22,7 +22,7 @@
 //!
 //! [`BundleRef`] is a zero-copy view of a serialized bundle and
 //! [`write_bundle`] serializes one from its parts, both without allocating;
-//! [`Bundle`] (with `alloc`) owns its descriptions.
+//! `Bundle` (with `alloc`) owns its descriptions.
 //!
 //! The Groth16 proofs are carried, not checked: [`BundleRef::verify`] checks
 //! everything else a validator does that does not need the chain state.
@@ -216,7 +216,7 @@ pub struct BundleRef<'a> {
 impl<'a> BundleRef<'a> {
     /// Parses a serialized bundle, which must fill `data` exactly. An empty
     /// slice is the empty bundle, as in
-    /// [`ZcashTx::sapling`](crate::zcashtx::ZcashTx::sapling).
+    /// [`ZcashTx::sapling`](crate::zcashtx::ZcashTx#structfield.sapling).
     ///
     /// Only the structure is checked, and that the value balance is within
     /// ±[`MAX_MONEY`]; see [`verify`](Self::verify) for the rest.
@@ -545,7 +545,7 @@ impl Bundle {
     }
 
     /// The serialized bundle, as
-    /// [`ZcashTx::sapling`](crate::zcashtx::ZcashTx::sapling) takes it.
+    /// [`ZcashTx::sapling`](crate::zcashtx::ZcashTx#structfield.sapling) takes it.
     pub fn serialize(&self) -> Result<Vec<u8>, Error> {
         let mut out = vec![0u8; self.serialized_len()];
         let n = self.write(&mut out)?;

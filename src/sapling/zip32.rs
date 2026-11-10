@@ -473,7 +473,7 @@ impl ExtendedSpendingKey {
     /// Decodes a Bech32 extended spending key of any network.
     pub fn decode(s: &str) -> Result<(Network, Self), Error> {
         let mut bytes = Zeroizing::new([0u8; EXTENDED_KEY_LEN]);
-        let network = bech32_decode(s, Network::hrp_extended_spending_key, &mut *bytes)?;
+        let network = bech32_decode(s, Network::hrp_extended_spending_key, &mut bytes)?;
         Ok((network, Self::from_bytes(&bytes)?))
     }
 
@@ -631,7 +631,7 @@ impl ExtendedFullViewingKey {
     /// Decodes a Bech32 extended full viewing key of any network.
     pub fn decode(s: &str) -> Result<(Network, Self), Error> {
         let mut bytes = Zeroizing::new([0u8; EXTENDED_KEY_LEN]);
-        let network = bech32_decode(s, Network::hrp_extended_full_viewing_key, &mut *bytes)?;
+        let network = bech32_decode(s, Network::hrp_extended_full_viewing_key, &mut bytes)?;
         Ok((network, Self::from_bytes(&bytes)?))
     }
 

@@ -724,8 +724,8 @@ mod tests {
         let left = merkle_crh(1, &h01, &h23);
         let right = merkle_crh(1, &h4, &EMPTY_ROOTS[1]);
         let mut root = merkle_crh(2, &left, &right);
-        for level in 3..DEPTH {
-            root = merkle_crh(level, &root, &EMPTY_ROOTS[level]);
+        for (level, empty) in EMPTY_ROOTS.iter().enumerate().take(DEPTH).skip(3) {
+            root = merkle_crh(level, &root, empty);
         }
         assert_eq!(tree.root(), root);
         for (i, w) in witnesses.iter().enumerate() {

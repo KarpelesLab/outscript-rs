@@ -5,7 +5,7 @@
 //! Chunk `j` of a segment encodes as `(1 - 2·s2)·(1 + s0 + 2·s1)·2^(4j)`,
 //! the encodings of a segment sum to a scalar, and each segment's scalar
 //! multiplies its own generator
-//! ([`pedersen_hash_generator`](super::generators::pedersen_hash_generator)).
+//! ([`pedersen_hash_generator`]).
 //!
 //! Inputs are bit sequences, given as iterators of `bool`: [`bits_le`] turns
 //! bytes into the little-endian bit order the specification uses
