@@ -18,7 +18,7 @@
 //! ```
 //!
 //! [`BundleRef`] is a validated, zero-copy view that needs no allocation;
-//! with `alloc`, [`Bundle`] is its owned counterpart, which a transaction
+//! with `alloc`, `Bundle` is its owned counterpart, which a transaction
 //! builder fills in and serializes.
 //!
 //! Signatures can be checked here; the zero-knowledge proof cannot, and a

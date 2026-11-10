@@ -130,3 +130,21 @@ fn pallas_map_to_curve_vectors() {
         assert_eq!(encoded, arr::<32>(&tv[1]));
     }
 }
+
+/// The Vesta vector of `pasta_curves` (`src/vesta.rs`, `test_hash_to_curve`),
+/// which gives the point in Jacobian coordinates.
+#[test]
+fn vesta_hash_to_curve_vector() {
+    let fq = |s: &str| {
+        let mut bytes: [u8; 32] = hex::decode(s).unwrap().try_into().unwrap();
+        bytes.reverse();
+        Fq::from_bytes(&bytes).unwrap()
+    };
+    let x = fq("12763505036e0e1a6684b7a7d8d5afb7378cc2b191a95e34f44824a06fcbd08e");
+    let y = fq("0256eafc0188b79bfa7c4b2b393893ddc298e90da500fa4a9aee17c2ea4240e6");
+    let z = fq("1b58d4aa4d68c3f4d9916b77c79ff9911597a27f2ee46244e98eb9615172d2ad");
+    let zinv = z.invert().unwrap();
+    let expected = vesta::Affine::from_xy(x * zinv.square(), y * zinv.square() * zinv).unwrap();
+    let p = vesta::Point::hash_to_curve(b"z.cash:test", b"hello");
+    assert_eq!(p.to_affine(), expected);
+}

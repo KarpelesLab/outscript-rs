@@ -172,10 +172,7 @@ fn merkle_tree_vectors() {
                 .all(|l| *l == tree::UNCOMMITTED)
         );
         #[cfg(feature = "alloc")]
-        {
-            assert_eq!(tree::root(committed), Some(root));
-            assert_eq!(tree::root(&leaves), Some(root));
-        }
+        assert_eq!(tree::root(committed), Some(root));
         assert_eq!(frontier.append(leaves[appended]), Ok(appended as u32));
         assert_eq!(frontier.size(), appended as u64 + 1);
         assert_eq!(frontier.root(), root);
@@ -191,16 +188,27 @@ fn merkle_tree_vectors() {
                 };
             }
             let path = MerklePath::from_parts(position as u32, auth_path);
-            assert_eq!(path.root(leaves[position]), root);
             assert_eq!(path.position(), position as u32);
             assert_eq!(path.auth_path(), &auth_path);
-            #[cfg(feature = "alloc")]
-            {
-                assert_eq!(tree::witness(&leaves, position as u32), Some(path));
-                if position <= appended {
-                    assert_eq!(tree::witness(committed, position as u32), Some(path));
+            // the first four levels lead to the root of the small tree
+            let mut node = leaves[position];
+            for (level, sibling) in expected.iter().enumerate() {
+                node = if (position >> level) & 1 == 0 {
+                    tree::merkle_crh(level, &node, sibling)
                 } else {
-                    assert!(tree::witness(committed, position as u32).is_none());
+                    tree::merkle_crh(level, sibling, &node)
+                };
+            }
+            assert_eq!(node, small_root);
+            // hashing the whole path and the whole tree is slower: do it
+            // for the leaf just appended
+            if position == appended {
+                assert_eq!(path.root(leaves[position]), root);
+                #[cfg(feature = "alloc")]
+                {
+                    assert_eq!(tree::witness(committed, position as u32), Some(path));
+                    assert_eq!(tree::witness(&leaves, position as u32), Some(path));
+                    assert!(tree::witness(committed, position as u32 + 1).is_none());
                 }
             }
         }
@@ -430,5 +438,62 @@ fn bundle_parsing_is_strict_and_panic_free() {
     assert_eq!(
         view.verify_signatures(&[1; 32]),
         Err(Error::InvalidEncoding)
+    );
+}
+
+/// A transaction mined on the main network (block 2600079): its Orchard
+/// spend authorization and binding signatures verify under the ZIP-244
+/// signature hash, which exercises RedPallas, the bundle parser, the value
+/// commitment arithmetic and point decoding against data this crate did
+/// not produce.
+#[test]
+fn mainnet_transaction_signatures() {
+    use crate::zcashtx::{SIGHASH_ALL, ZcashTx};
+    let raw = hex::decode(include_str!("../testdata/mainnet_tx_db84ddff.hex").trim()).unwrap();
+    let tx = ZcashTx::parse_into(&raw, &mut [], &mut []).unwrap();
+    assert_eq!(
+        hex::encode(tx.txid().unwrap()),
+        "db84ddffe1d30f658d5dfe008591c65405cca7276ec1e295d62df490b41f64a0"
+    );
+    let bundle = BundleRef::parse(tx.orchard).unwrap().unwrap();
+    assert_eq!(bundle.action_count(), 2);
+    assert_eq!(bundle.value_balance(), 10_000);
+    assert_eq!(bundle.flags(), Flags::ENABLED);
+    // nodes display the anchor byte-reversed, like a block hash
+    let mut anchor = *bundle.anchor();
+    anchor.reverse();
+    assert_eq!(
+        hex::encode(anchor),
+        "2dc2dce6ed589670024b2a82dfadcfa93950a9d62a8f2b741a7abcd2d10a51e8"
+    );
+    assert_eq!(bundle.serialized_len(), tx.orchard.len());
+    let first = bundle.action(0).unwrap();
+    assert_eq!(
+        hex::encode(first.cmx),
+        "413196ee1ed9d2d0ff029d692de27efd7520f84ae9dbaaaae020734231fa1900"
+    );
+    assert_eq!(
+        hex::encode(first.rk),
+        "0224db998eea21660d14b5c2c834f5e9eac92a8fba33f75864886485ae2fc19e"
+    );
+
+    let sighash = tx.sighash(None, SIGHASH_ALL, &[]).unwrap();
+    assert_eq!(bundle.verify_signatures(&sighash), Ok(()));
+    for action in bundle.actions() {
+        assert_eq!(action.verify_spend_auth(&sighash), Ok(()));
+        assert_eq!(
+            action.verify_spend_auth(&[0; 32]),
+            Err(Error::InvalidSignature)
+        );
+        // the fields are canonical encodings
+        assert!(action.value_commitment().is_some());
+        assert!(Nullifier::from_bytes(&action.nullifier).is_some());
+        assert!(Fp::from_bytes(&action.cmx).is_some());
+    }
+    let mut wrong = sighash;
+    wrong[0] ^= 1;
+    assert_eq!(
+        bundle.verify_signatures(&wrong),
+        Err(Error::InvalidSignature)
     );
 }

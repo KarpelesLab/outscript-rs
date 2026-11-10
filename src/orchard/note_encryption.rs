@@ -47,8 +47,9 @@ pub struct ActionOutput<'a> {
 }
 
 /// `KDF^Orchard`: the symmetric key for a shared secret.
-fn kdf(shared_secret: &Point, ephemeral_key: &[u8; 32]) -> [u8; 32] {
+fn kdf(mut shared_secret: Point, ephemeral_key: &[u8; 32]) -> [u8; 32] {
     let mut secret = shared_secret.to_bytes();
+    shared_secret.zeroize();
     let mut key = [0u8; 32];
     blake2b(b"Zcash_OrchardKDF", &[&secret, ephemeral_key], &mut key);
     secret.zeroize();
@@ -94,7 +95,7 @@ pub fn encrypt_note(note: &Note, memo: &[u8; MEMO_SIZE]) -> EncryptedNote {
     let ephemeral_key = recipient.g_d().mul(&esk).to_bytes();
     let shared = recipient.pk_d().to_point().mul(&esk);
     esk.zeroize();
-    let mut key = kdf(&shared, &ephemeral_key);
+    let mut key = kdf(shared, &ephemeral_key);
 
     let mut enc_ciphertext = [0u8; ENC_CIPHERTEXT_SIZE];
     let (plaintext, tag) = enc_ciphertext.split_at_mut(NOTE_PLAINTEXT_SIZE);
@@ -191,7 +192,7 @@ fn recipient_key(ivk: &IncomingViewingKey, ephemeral_key: &[u8; 32]) -> Option<[
         return None;
     }
     let shared = epk.to_point().mul(&ivk.ivk_scalar());
-    Some(kdf(&shared, ephemeral_key))
+    Some(kdf(shared, ephemeral_key))
 }
 
 /// Tries to decrypt the note of an action with an incoming viewing key,
@@ -281,7 +282,7 @@ pub fn try_output_recovery_with_ovk(
         return None;
     }
     let shared = pk_d.to_point().mul(&esk);
-    let mut key = kdf(&shared, output.ephemeral_key);
+    let mut key = kdf(shared, output.ephemeral_key);
     let result = decrypt_and_check(&key, output, enc_ciphertext, Some(&esk), |_| pk_d);
     key.zeroize();
     esk.zeroize();

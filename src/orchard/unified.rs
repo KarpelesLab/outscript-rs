@@ -475,8 +475,9 @@ impl UnifiedAddress {
     /// its only known receivers are transparent, as nothing says they are
     /// not shielded).
     ///
-    /// Without `alloc`, strings longer than 512 characters are rejected
-    /// with [`Error::TooLarge`].
+    /// Without `alloc`, an encoding whose payload is longer than 512 bytes
+    /// (a string of over 800 characters, which only unknown items can
+    /// cause) is rejected with [`Error::TooLarge`].
     pub fn decode(s: &str) -> Result<(Network, Self), Error> {
         decode_with(s, &ADDRESS_HRPS, |network, items| {
             let mut ua = UnifiedAddress::default();
@@ -570,8 +571,9 @@ impl UnifiedFullViewingKey {
     /// of unknown typecode (which includes `0x01`, meaningless in a viewing
     /// key) are skipped.
     ///
-    /// Without `alloc`, strings longer than 512 characters are rejected
-    /// with [`Error::TooLarge`].
+    /// Without `alloc`, an encoding whose payload is longer than 512 bytes
+    /// (a string of over 800 characters, which only unknown items can
+    /// cause) is rejected with [`Error::TooLarge`].
     pub fn decode(s: &str) -> Result<(Network, Self), Error> {
         decode_with(s, &UFVK_HRPS, |network, items| {
             let mut key = UnifiedFullViewingKey::default();
@@ -661,8 +663,9 @@ impl UnifiedIncomingViewingKey {
     /// Items of unknown typecode (which includes `0x01`, meaningless in a
     /// viewing key) are skipped.
     ///
-    /// Without `alloc`, strings longer than 512 characters are rejected
-    /// with [`Error::TooLarge`].
+    /// Without `alloc`, an encoding whose payload is longer than 512 bytes
+    /// (a string of over 800 characters, which only unknown items can
+    /// cause) is rejected with [`Error::TooLarge`].
     pub fn decode(s: &str) -> Result<(Network, Self), Error> {
         decode_with(s, &UIVK_HRPS, |network, items| {
             let mut key = UnifiedIncomingViewingKey::default();
