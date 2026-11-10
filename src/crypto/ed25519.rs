@@ -19,6 +19,16 @@ pub fn sign(seed: &[u8; 32], message: &[u8]) -> [u8; 64] {
 
 /// Verifies a 64-byte Ed25519 signature over `message` for the given 32-byte
 /// public key.
+///
+/// # Not consensus-equivalent to Solana
+///
+/// This is `purecrypto`'s *cofactored* verification, which is more permissive
+/// than the *strict* (cofactorless) verification Solana validators apply. On
+/// edge-case inputs — a public key or signature `R` with a torsion (mixed-order)
+/// component — this function can return `true` for a signature a validator
+/// rejects. Honestly
+/// generated signatures verify identically under both, but do not use this
+/// result to predict whether a crafted signature will be accepted on chain.
 pub fn verify(public: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
     let pk = Ed25519PublicKey::from_bytes(*public);
     let sig = Ed25519Signature::from_bytes(*signature);

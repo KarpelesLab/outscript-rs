@@ -106,7 +106,20 @@ pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
 ///
 /// Keccak-256 over the public key bytes with the leading byte (the SEC1 `0x04`
 /// uncompressed prefix) stripped, returning the last 20 bytes of the digest.
+///
+/// # Warning
+///
+/// The input must be a 65-byte uncompressed SEC1 public key starting with
+/// `0x04` (e.g. `SecpPublicKey::serialize_uncompressed`). The input is **not**
+/// validated: the first byte of anything else is dropped just the same, so a
+/// 33-byte compressed key or a bare 64-byte `x || y` yields 20 bytes that are
+/// not the key's address — and funds sent there are lost. Debug builds assert
+/// the expected shape.
 pub fn ether_hash(uncompressed_pubkey: &[u8]) -> [u8; 20] {
+    debug_assert!(
+        uncompressed_pubkey.len() == 65 && uncompressed_pubkey[0] == 0x04,
+        "ether_hash expects a 65-byte 0x04-prefixed uncompressed public key"
+    );
     let body = if uncompressed_pubkey.is_empty() {
         uncompressed_pubkey
     } else {
