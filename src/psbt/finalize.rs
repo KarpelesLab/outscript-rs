@@ -1,9 +1,11 @@
 //! The PSBT finalizer role.
 
-use super::sign::{Kind, for_each_push, resolve};
+use super::sign::{Kind, Resolved, SignCtx, for_each_push, resolve};
 use super::{
     Error, MapEdit, MapLoc, NewRecord, Psbt, PsbtInput, WriteValue, input, put_varint, write_map,
 };
+use crate::btcraw::{self, SIGHASH_UNIFIED, TapScriptPath};
+use crate::crypto::secp256k1::{SecpPublicKey, bip340_verify, parse_der_signature};
 use crate::hash::hash160;
 use crate::pushbytes::push_bytes_len;
 use crate::sink::{Counter, Sink, SliceSink};
@@ -123,23 +125,98 @@ fn template(script: &[u8]) -> Option<Template<'_>> {
     None
 }
 
-/// The signature stack satisfying `template`, if enough signatures exist.
-fn satisfy<'a>(inp: &PsbtInput<'a>, t: &Template<'a>) -> Option<Stack<'a>> {
+/// Checks the signatures of one input before the finalizer uses them: a
+/// signature whose sighash type disagrees with the input's declared
+/// `PSBT_IN_SIGHASH_TYPE`, or that does not verify, is treated as absent.
+struct Checker<'c, 'p, 'a> {
+    ctx: &'c mut SignCtx<'p, 'a>,
+    index: usize,
+    res: Resolved<'a>,
+    /// The input's `PSBT_IN_SIGHASH_TYPE`, if declared.
+    declared: Option<u32>,
+}
+
+impl Checker<'_, '_, '_> {
+    fn type_ok(&self, hash_type: u8) -> bool {
+        self.declared.is_none_or(|d| d == u32::from(hash_type))
+    }
+
+    /// Reports whether `sig` (DER, then the sighash byte) is a usable ECDSA
+    /// signature of `pubkey` over this input with `script_code`. A hash type
+    /// this crate computes no digest for (anything but `SIGHASH_ALL` and the
+    /// unified types) cannot be verified and is accepted as is.
+    fn ecdsa(&mut self, script_code: &[u8], segwit: bool, pubkey: &[u8], sig: &[u8]) -> bool {
+        let Some((&hash_type, der)) = sig.split_last() else {
+            return false;
+        };
+        if !self.type_ok(hash_type) {
+            return false;
+        }
+        if hash_type != 1 && hash_type & SIGHASH_UNIFIED == 0 {
+            return true;
+        }
+        let Ok(digest) =
+            self.ctx
+                .ecdsa_digest(self.index, &self.res, script_code, segwit, hash_type)
+        else {
+            return false;
+        };
+        let (Ok(pk), Ok((r, s))) = (SecpPublicKey::from_sec1(pubkey), parse_der_signature(der))
+        else {
+            return false;
+        };
+        pk.verify(&digest, &r, &s)
+    }
+
+    /// Reports whether `sig` (64 bytes, or 65 with a non-default sighash
+    /// byte) is a valid BIP-340 signature of the x-only `key` over this input,
+    /// on the key path or for the leaf `path`.
+    fn schnorr(&mut self, key: &[u8], sig: &[u8], path: Option<TapScriptPath>) -> bool {
+        let (sig, hash_type) = match sig {
+            [sig @ .., hash_type] if sig.len() == 64 && *hash_type != 0 => (sig, *hash_type),
+            sig if sig.len() == 64 => (sig, 0),
+            _ => return false,
+        };
+        if !self.type_ok(hash_type) {
+            return false;
+        }
+        let (Ok(key), Ok(sig)) = (<&[u8; 32]>::try_from(key), <&[u8; 64]>::try_from(sig)) else {
+            return false;
+        };
+        match self
+            .ctx
+            .taproot_digest(self.index, &self.res, hash_type, path)
+        {
+            Ok(digest) => bip340_verify(key, &digest, sig),
+            Err(_) => false,
+        }
+    }
+}
+
+/// The signature stack satisfying `template`, if enough signatures pass `ok`
+/// (called with a public key and its signature).
+fn satisfy<'a>(
+    inp: &PsbtInput<'a>,
+    t: &Template<'a>,
+    ok: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+) -> Option<Stack<'a>> {
     let mut st = Stack::EMPTY;
     match t {
         Template::Pkh(hash) => {
-            let (pk, sig) = inp.partial_sigs().find(|(pk, _)| hash160(pk) == *hash)?;
+            let (pk, sig) = inp
+                .partial_sigs()
+                .find(|(pk, sig)| hash160(pk) == *hash && ok(pk, sig))?;
             st.push(sig);
             st.push(pk);
         }
-        Template::Pk(key) => st.push(inp.partial_sig(key)?),
+        Template::Pk(key) => st.push(inp.partial_sig(key).filter(|sig| ok(key, sig))?),
         Template::Multi { m, keys } => {
             st.push(&[]); // CHECKMULTISIG dummy
             for key in keys.items() {
                 if st.len - 1 == *m {
                     break;
                 }
-                if let Some(sig) = inp.partial_sig(key) {
+                if let Some(sig) = inp.partial_sig(key).filter(|sig| ok(key, sig)) {
                     st.push(sig);
                 }
             }
@@ -185,8 +262,12 @@ fn tap_template(script: &[u8]) -> Option<(usize, Stack<'_>)> {
 
 /// The witness spending a taproot input through the script path: the first
 /// provable tapscript leaf (preferring the shortest control block) whose
-/// template has enough signatures.
-fn tap_script_witness<'a>(inp: &PsbtInput<'a>, output_key: &[u8; 32]) -> Option<Stack<'a>> {
+/// template has enough valid signatures.
+fn tap_script_witness<'a>(
+    inp: &PsbtInput<'a>,
+    output_key: &[u8; 32],
+    chk: &mut Checker<'_, '_, '_>,
+) -> Option<Stack<'a>> {
     let mut best: Option<(usize, Stack<'a>)> = None;
     for leaf in inp.tap_leaf_scripts() {
         if leaf.leaf_version != TAPSCRIPT_LEAF_VERSION
@@ -206,18 +287,21 @@ fn tap_script_witness<'a>(inp: &PsbtInput<'a>, output_key: &[u8; 32]) -> Option<
             continue;
         }
         let leaf_hash = cb.leaf_hash(leaf.script);
-        let sig_of = |key: &[u8]| {
-            inp.tap_script_sigs()
-                .find(|(k, l, _)| *k == key && *l == leaf_hash)
-                .map(|(_, _, sig)| sig)
-        };
-        // exactly `m` signatures, from the first keys that have one; the
-        // other keys get an empty vector
-        let mut used = [false; 18];
+        let path = TapScriptPath::new(leaf_hash);
+        // exactly `m` signatures, from the first keys that have a valid one;
+        // the other keys get an empty vector
+        let mut sigs: [&'a [u8]; 18] = [&[]; 18];
         let mut count = 0;
         for (i, key) in keys.items().iter().enumerate() {
-            if count < m && sig_of(key).is_some() {
-                used[i] = true;
+            if count == m {
+                break;
+            }
+            let sig = inp
+                .tap_script_sigs()
+                .find(|(k, l, _)| k == key && *l == leaf_hash)
+                .map(|(_, _, sig)| sig);
+            if let Some(sig) = sig.filter(|sig| chk.schnorr(key, sig, Some(path))) {
+                sigs[i] = sig;
                 count += 1;
             }
         }
@@ -226,8 +310,8 @@ fn tap_script_witness<'a>(inp: &PsbtInput<'a>, output_key: &[u8; 32]) -> Option<
         }
         // the first key's signature is consumed first, so it sits on top
         let mut st = Stack::EMPTY;
-        for (i, key) in keys.items().iter().enumerate().rev() {
-            st.push(if used[i] { sig_of(key)? } else { &[] });
+        for sig in sigs[..keys.len].iter().rev() {
+            st.push(sig);
         }
         st.push(leaf.script);
         st.push(leaf.control_block);
@@ -241,9 +325,19 @@ struct Final<'a> {
     witness: Stack<'a>,
 }
 
-fn build_final<'a>(psbt: &Psbt<'a>, index: usize) -> Result<Option<Final<'a>>, Error> {
-    let inp = psbt.input(index).ok_or(Error::InputIndex)?;
-    let res = resolve(psbt, index)?;
+fn build_final<'a>(
+    ctx: &mut SignCtx<'_, 'a>,
+    psbt: &Psbt<'a>,
+    index: usize,
+    inp: PsbtInput<'a>,
+) -> Result<Option<Final<'a>>, Error> {
+    let res = resolve(psbt, index, &inp)?;
+    let mut chk = Checker {
+        ctx,
+        index,
+        res,
+        declared: inp.sighash_type(),
+    };
     let mut script_sig = ScriptSigValue {
         items: Stack::EMPTY,
         redeem: res.redeem,
@@ -251,32 +345,41 @@ fn build_final<'a>(psbt: &Psbt<'a>, index: usize) -> Result<Option<Final<'a>>, E
     let mut witness = Stack::EMPTY;
     match res.kind {
         Kind::Legacy(script) => {
-            let Some(st) = template(script).and_then(|t| satisfy(&inp, &t)) else {
+            let mut ok = |pk: &[u8], sig: &[u8]| chk.ecdsa(script, false, pk, sig);
+            let Some(st) = template(script).and_then(|t| satisfy(&inp, &t, &mut ok)) else {
                 return Ok(None);
             };
             script_sig.items = st;
         }
         Kind::P2wpkh(hash) => {
-            let Some(st) = satisfy(&inp, &Template::Pkh(hash)) else {
+            let code = btcraw::p2pkh_script_code(&hash);
+            let mut ok = |pk: &[u8], sig: &[u8]| chk.ecdsa(&code, true, pk, sig);
+            let Some(st) = satisfy(&inp, &Template::Pkh(hash), &mut ok) else {
                 return Ok(None);
             };
             witness = st;
         }
         Kind::P2wsh(ws) => {
-            let Some(mut st) = template(ws).and_then(|t| satisfy(&inp, &t)) else {
+            let mut ok = |pk: &[u8], sig: &[u8]| chk.ecdsa(ws, true, pk, sig);
+            let Some(mut st) = template(ws).and_then(|t| satisfy(&inp, &t, &mut ok)) else {
                 return Ok(None);
             };
             st.push(ws);
             witness = st;
         }
         // the key path is the cheapest spend; otherwise a signed leaf
-        Kind::P2tr(output_key) => match inp.tap_key_sig() {
-            Some(sig) => witness.push(sig),
-            None => match tap_script_witness(&inp, &output_key) {
-                Some(st) => witness = st,
-                None => return Ok(None),
-            },
-        },
+        Kind::P2tr(output_key) => {
+            let key_sig = inp
+                .tap_key_sig()
+                .filter(|sig| chk.schnorr(&output_key, sig, None));
+            match key_sig {
+                Some(sig) => witness.push(sig),
+                None => match tap_script_witness(&inp, &output_key, &mut chk) {
+                    Some(st) => witness = st,
+                    None => return Ok(None),
+                },
+            }
+        }
     }
     Ok(Some(Final {
         script_sig,
@@ -286,11 +389,12 @@ fn build_final<'a>(psbt: &Psbt<'a>, index: usize) -> Result<Option<Final<'a>>, E
 
 impl<'a> Psbt<'a> {
     fn write_finalized(&self, s: &mut dyn Sink, finalized: &mut usize) -> Result<(), Error> {
+        let mut ctx = SignCtx::new(self, &[]);
         self.write(s, &mut |loc, map, s| {
             if let MapLoc::Input(i) = loc
                 && !PsbtInput(map).is_finalized()
             {
-                match build_final(self, i) {
+                match build_final(&mut ctx, self, i, PsbtInput(map)) {
                     Ok(Some(fin)) => {
                         *finalized += 1;
                         let witness = WitnessValue(fin.witness);
@@ -346,6 +450,16 @@ impl<'a> Psbt<'a> {
     /// through a `<key> OP_CHECKSIG` or `multi_a` leaf (up to 18 keys) with
     /// enough signatures. Finalized inputs keep only their UTXO and unknown
     /// fields.
+    ///
+    /// Signatures are not taken on trust: one whose sighash type differs from
+    /// the input's `PSBT_IN_SIGHASH_TYPE` (when declared), or that does not
+    /// verify against its key and the transaction, is ignored, so an input
+    /// left without enough valid signatures stays unfinalized instead of
+    /// yielding an invalid transaction. Verifying a taproot or unified-sighash
+    /// signature needs the UTXO of every input. The one exception is an ECDSA
+    /// signature with a non-unified hash type other than `SIGHASH_ALL`
+    /// (`NONE`, `SINGLE`, `ANYONECANPAY`), which this crate computes no digest
+    /// for: it is used unverified.
     pub fn finalize_to_slice(&self, out: &mut [u8]) -> Result<(usize, usize), Error> {
         let mut sink = SliceSink::new(out);
         let mut count = 0;

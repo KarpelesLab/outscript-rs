@@ -537,6 +537,179 @@ fn rejection_reasons() {
     }
 }
 
+/// A map may hold at most `MAX_MAP_RECORDS` records, which bounds the
+/// quadratic duplicate check on hostile input.
+#[test]
+fn map_record_count_is_capped() {
+    let mut creator = [0u8; 512];
+    let n = unhex(CREATOR, &mut creator);
+    // the PSBT ends with the terminators of its two input and two output maps
+    let head = n - 4;
+    assert_eq!(creator[head - 1..n], [0u8; 5]);
+    let build = |records: usize, at_global: bool, buf: &mut [u8]| {
+        let split = if at_global { head - 1 } else { head };
+        buf[..split].copy_from_slice(&creator[..split]);
+        let mut pos = split;
+        for i in 0..records {
+            // an unknown record: key type 0xf0 with two bytes of key data
+            let rec = [0x03, 0xf0, (i >> 8) as u8, i as u8, 0x00];
+            buf[pos..pos + 5].copy_from_slice(&rec);
+            pos += 5;
+        }
+        buf[pos..pos + n - split].copy_from_slice(&creator[split..n]);
+        pos + n - split
+    };
+    let mut buf = [0u8; 512 + 5 * (MAX_MAP_RECORDS + 1)];
+    let len = build(MAX_MAP_RECORDS, false, &mut buf);
+    let psbt = Psbt::parse(&buf[..len]).unwrap();
+    assert_eq!(
+        psbt.input(0).unwrap().map().records().count(),
+        MAX_MAP_RECORDS
+    );
+    // one more, in an input map or in the global map
+    let len = build(MAX_MAP_RECORDS + 1, false, &mut buf);
+    assert_eq!(Psbt::parse(&buf[..len]).err(), Some(Error::TooLarge));
+    let len = build(MAX_MAP_RECORDS, true, &mut buf);
+    assert_eq!(Psbt::parse(&buf[..len]).err(), Some(Error::TooLarge));
+    // adding a record to a full map is refused the same way
+    let len = build(MAX_MAP_RECORDS, false, &mut buf);
+    let psbt = Psbt::parse(&buf[..len]).unwrap();
+    let mut out = [0u8; 600 + 5 * (MAX_MAP_RECORDS + 1)];
+    assert_eq!(
+        psbt.set_input_record(0, &[0xf1], &[], &mut out),
+        Err(Error::TooLarge)
+    );
+    assert!(psbt.set_input_record(1, &[0xf1], &[], &mut out).is_ok());
+}
+
+/// ECDSA inputs: only SIGHASH_ALL and unified ALL are signed by default; the
+/// other unified types need the opt-in, and bytes whose low five bits are not
+/// ALL, NONE or SINGLE are refused regardless.
+#[test]
+fn ecdsa_sighash_type_needs_opt_in() {
+    let key = wif(WIF_0);
+    let mut out = [0u8; 4096];
+    let with_type = |t: u32| {
+        let mut b = Buf::hex(UPDATER);
+        b.apply(|p, o| p.set_sighash_type(0, t, o));
+        b
+    };
+    // legacy NONE, SINGLE and ANYONECANPAY are not implemented at all
+    for t in [0x00u32, 0x02, 0x03, 0x81, 0x82, 0x83, 0x100, 0x0101] {
+        let b = with_type(t);
+        for allowed in [DEFAULT_SIGHASH_TYPES, &[t as u8][..]] {
+            assert_eq!(
+                b.psbt()
+                    .sign_to_slice_with_sighash_types(&key, allowed, &mut out),
+                Err(Error::UnsupportedSighash),
+                "{t:#x}"
+            );
+        }
+    }
+    // unified NONE, SINGLE and ANYONECANPAY: only when allowed
+    for t in [0x22u32, 0x23, 0xa1, 0xa2, 0xa3] {
+        let b = with_type(t);
+        assert_eq!(
+            b.psbt().sign_to_slice(&key, &mut out),
+            Err(Error::UnsupportedSighash),
+            "{t:#x}"
+        );
+        let (n, count) = b
+            .psbt()
+            .sign_to_slice_with_sighash_types(&key, &[t as u8], &mut out)
+            .unwrap();
+        assert_eq!(count, 1, "{t:#x}");
+        let signed = Psbt::parse(&out[..n]).unwrap();
+        let (_, sig) = signed.input(0).unwrap().partial_sigs().next().unwrap();
+        assert_eq!(sig.last(), Some(&(t as u8)));
+        // with the second key's signature, the finalizer verifies both
+        let mut both = [0u8; 4096];
+        let (n, count) = signed
+            .sign_to_slice_with_sighash_types(&wif(WIF_1), &[t as u8], &mut both)
+            .unwrap();
+        assert_eq!(count, 1, "{t:#x}");
+        let (_, count) = Psbt::parse(&both[..n])
+            .unwrap()
+            .finalize_to_slice(&mut out)
+            .unwrap();
+        assert_eq!(count, 1, "{t:#x}");
+    }
+    // unified bytes with undefined low bits: never
+    for t in [0x20u32, 0x24, 0x3f, 0xa0, 0xa4, 0x60] {
+        let b = with_type(t);
+        assert_eq!(
+            b.psbt()
+                .sign_to_slice_with_sighash_types(&key, &[t as u8], &mut out),
+            Err(Error::UnsupportedSighash),
+            "{t:#x}"
+        );
+    }
+    // ALL and unified ALL by default; a key that is not involved is skipped
+    // whatever the type
+    for t in [0x01u32, 0x21] {
+        let b = with_type(t);
+        assert_eq!(b.psbt().sign_to_slice(&key, &mut out).map(|r| r.1), Ok(1));
+    }
+    let b = with_type(0x83);
+    assert_eq!(
+        b.psbt().sign_to_slice(&wif(WIF_2), &mut out).map(|r| r.1),
+        Ok(1) // its key is in input 1 only
+    );
+}
+
+/// The finalizer ignores partial signatures that do not verify or whose
+/// sighash byte is not the declared `PSBT_IN_SIGHASH_TYPE`.
+#[test]
+fn finalizer_checks_partial_signatures() {
+    let finalize = |b: &Buf| {
+        let mut out = [0u8; 4096];
+        let (n, count) = b.psbt().finalize_to_slice(&mut out).unwrap();
+        assert_eq!(b.psbt().finalized_len(), Ok(n));
+        let done = Psbt::parse(&out[..n]).unwrap();
+        (
+            count,
+            done.input(0).unwrap().is_finalized(),
+            done.input(1).unwrap().is_finalized(),
+        )
+    };
+    assert_eq!(finalize(&Buf::hex(COMBINED)), (2, true, true));
+
+    // input 0 (P2SH 2-of-2): one key's signature replaced by the other's
+    let mut b = Buf::hex(COMBINED);
+    let mut rec_key = [0u8; 34];
+    rec_key[0] = 0x02;
+    let mut wrong = [0u8; 73];
+    let wrong = {
+        let mut sigs = b.psbt().input(0).unwrap().partial_sigs();
+        let ((pk0, _), (_, sig1)) = (sigs.next().unwrap(), sigs.next().unwrap());
+        rec_key[1..].copy_from_slice(pk0);
+        wrong[..sig1.len()].copy_from_slice(sig1);
+        &wrong[..sig1.len()]
+    };
+    b.apply(|p, o| p.set_input_record(0, &rec_key, wrong, o));
+    assert_eq!(finalize(&b), (1, false, true));
+
+    // input 1 (P2SH-P2WSH 2-of-2): a signature with a flipped bit
+    let mut b = Buf::hex(COMBINED);
+    let (pk, sig) = b.psbt().input(1).unwrap().partial_sigs().next().unwrap();
+    rec_key[1..].copy_from_slice(pk);
+    let mut bad = [0u8; 73];
+    let bad = {
+        bad[..sig.len()].copy_from_slice(sig);
+        bad[10] ^= 1;
+        &bad[..sig.len()]
+    };
+    b.apply(|p, o| p.set_input_record(1, &rec_key, bad, o));
+    assert_eq!(finalize(&b), (1, true, false));
+
+    // valid SIGHASH_ALL signatures under a different declared type
+    let mut b = Buf::hex(COMBINED);
+    b.apply(|p, o| p.set_sighash_type(1, 0x03, o));
+    assert_eq!(finalize(&b), (1, true, false));
+    b.apply(|p, o| p.set_sighash_type(0, 0x81, o));
+    assert_eq!(finalize(&b), (0, false, false));
+}
+
 // --- taproot script trees (BIP-341/342/371) ---
 
 mod taproot_tree {
@@ -624,11 +797,23 @@ mod taproot_tree {
     /// A PSBT spending a taproot output with internal key `key(1)` and the
     /// tree `[single(key 2), multi_a 2-of-3 (keys 3, 4, 5)]`, fully updated.
     fn fixture(sighash_type: Option<u32>) -> Fixture {
+        fixture_with(sighash_type, false)
+    }
+
+    /// The same, or with `repeat_single` the tree
+    /// `[single, [multi_a, single]]`: one script under two control blocks.
+    fn fixture_with(sighash_type: Option<u32>, repeat_single: bool) -> Fixture {
         let single = single_leaf(&key(2));
         let multi = multi_a_leaf([&key(3), &key(4), &key(5)]);
-        let leaves = [TapLeaf::new(1, &single), TapLeaf::new(1, &multi)];
+        let two = [TapLeaf::new(1, &single), TapLeaf::new(1, &multi)];
+        let three = [
+            TapLeaf::new(1, &single),
+            TapLeaf::new(2, &multi),
+            TapLeaf::new(2, &single),
+        ];
+        let leaves: &[TapLeaf<'_>] = if repeat_single { &three } else { &two };
         let internal = key(1).xonly_public_key();
-        let root = tap_tree_root(&leaves).unwrap();
+        let root = tap_tree_root(leaves).unwrap();
         let spk = p2tr_script_pubkey(&internal, Some(&root)).unwrap();
         let (output_key, _) = taproot_tweak_with_root(&internal, Some(&root)).unwrap();
 
@@ -650,9 +835,9 @@ mod taproot_tree {
         step!(|p: &Psbt<'_>, o: &mut [u8]| p.set_witness_utxo(0, AMOUNT, &spk, o));
         step!(|p: &Psbt<'_>, o: &mut [u8]| p.set_tap_internal_key(0, &internal, o));
         step!(|p: &Psbt<'_>, o: &mut [u8]| p.set_tap_merkle_root(0, &root, o));
-        for i in 0..2 {
+        for i in 0..leaves.len() {
             let mut cb = [0u8; MAX_CONTROL_BLOCK_LEN];
-            let cn = control_block_to_slice(&internal, &leaves, i, &mut cb).unwrap();
+            let cn = control_block_to_slice(&internal, leaves, i, &mut cb).unwrap();
             step!(|p: &Psbt<'_>, o: &mut [u8]| p.add_tap_leaf_script(
                 0,
                 &cb[..cn],
@@ -679,14 +864,29 @@ mod taproot_tree {
             Psbt::parse(&self.buf[..self.len]).unwrap()
         }
         fn sign(&mut self, k: &SecpPrivateKey) -> usize {
+            self.sign_allowing(k, DEFAULT_SIGHASH_TYPES)
+        }
+        fn sign_allowing(&mut self, k: &SecpPrivateKey, allowed: &[u8]) -> usize {
             let mut out = [0u8; 2048];
             let p = self.psbt();
             assert!(p.sign_len_bound() <= out.len());
-            let (n, count) = p.sign_to_slice(k, &mut out).unwrap();
+            let (n, count) = p
+                .sign_to_slice_with_sighash_types(k, allowed, &mut out)
+                .unwrap();
             assert!(n <= p.sign_len_bound());
             self.buf[..n].copy_from_slice(&out[..n]);
             self.len = n;
             count
+        }
+        /// Replaces input 0's record `key` with `value`.
+        fn set(&mut self, key: &[u8], value: &[u8]) {
+            let mut out = [0u8; 2048];
+            let n = self
+                .psbt()
+                .set_input_record(0, key, value, &mut out)
+                .unwrap();
+            self.buf[..n].copy_from_slice(&out[..n]);
+            self.len = n;
         }
         fn finalize(&mut self) -> usize {
             let mut out = [0u8; 2048];
@@ -849,10 +1049,11 @@ mod taproot_tree {
 
     #[test]
     fn sighash_types_and_key_in_both_paths() {
-        // SINGLE|ANYONECANPAY: the type is committed to and appended
+        // SINGLE|ANYONECANPAY: the type is committed to and appended, once
+        // the caller allows it
         let mut f = fixture(Some(0x83));
-        assert_eq!(f.sign(&key(1)), 1);
-        assert_eq!(f.sign(&key(2)), 1);
+        assert_eq!(f.sign_allowing(&key(1), &[0x83]), 1);
+        assert_eq!(f.sign_allowing(&key(2), &[0x83]), 1);
         let inp = f.psbt().input(0).unwrap();
         let mut key_sig = [0u8; 65];
         key_sig.copy_from_slice(inp.tap_key_sig().unwrap());
@@ -879,12 +1080,176 @@ mod taproot_tree {
         let (items, count) = witness_items(inp.final_script_witness().unwrap());
         assert_eq!((count, items[0]), (1, &key_sig[..]));
 
+        // an undefined type is refused even when listed
         let bad = fixture(Some(0x04));
         let mut out = [0u8; 2048];
         assert_eq!(
             bad.psbt().sign_to_slice(&key(1), &mut out),
             Err(Error::UnsupportedSighash)
         );
+        assert_eq!(
+            bad.psbt()
+                .sign_to_slice_with_sighash_types(&key(1), &[0x04], &mut out),
+            Err(Error::UnsupportedSighash)
+        );
+    }
+
+    /// The PSBT's sighash type is untrusted: types that do not commit to the
+    /// whole transaction are signed only when the caller allows them.
+    #[test]
+    fn sighash_type_needs_opt_in() {
+        let mut out = [0u8; 2048];
+        // NONE|ANYONECANPAY, SINGLE, NONE and their unified forms, on the key
+        // path (key 1) and the script path (key 2)
+        for t in [0x82u32, 0x03, 0x02, 0x81, 0x22, 0xa3] {
+            let f = fixture(Some(t));
+            for k in [key(1), key(2)] {
+                assert_eq!(
+                    f.psbt().sign_to_slice(&k, &mut out),
+                    Err(Error::UnsupportedSighash),
+                    "{t:#x}"
+                );
+                assert_eq!(
+                    f.psbt().sign_input_to_slice(0, &k, &mut out),
+                    Err(Error::UnsupportedSighash),
+                    "{t:#x}"
+                );
+                // allowing another type does not help
+                assert_eq!(
+                    f.psbt()
+                        .sign_to_slice_with_sighash_types(&k, &[0x00, 0x01, 0x83], &mut out),
+                    Err(Error::UnsupportedSighash),
+                    "{t:#x}"
+                );
+            }
+            // a key that is not involved just signs nothing
+            assert_eq!(
+                f.psbt().sign_to_slice(&key(9), &mut out).map(|r| r.1),
+                Ok(0)
+            );
+            // the explicit opt-in signs, with the declared type
+            let mut f = f;
+            assert_eq!(f.sign_allowing(&key(1), &[t as u8]), 1, "{t:#x}");
+            let sig = f.psbt().input(0).unwrap().tap_key_sig().unwrap();
+            assert_eq!((sig.len(), sig[64]), (65, t as u8));
+            let n = f
+                .psbt()
+                .sign_input_to_slice_with_sighash_types(0, &key(2), &[t as u8], &mut out)
+                .unwrap();
+            let signed = Psbt::parse(&out[..n]).unwrap();
+            assert_eq!(signed.input(0).unwrap().tap_script_sigs().count(), 1);
+            assert_eq!(f.finalize(), 1, "{t:#x}");
+        }
+        // DEFAULT, ALL and unified ALL are signed without asking
+        for t in [None, Some(0x00), Some(0x01), Some(0x21)] {
+            let mut f = fixture(t);
+            assert_eq!(f.sign(&key(1)), 1, "{t:?}");
+            assert_eq!(f.sign(&key(2)), 1, "{t:?}");
+            assert_eq!(f.finalize(), 1, "{t:?}");
+        }
+        // an empty allow-list signs nothing
+        let f = fixture(None);
+        assert_eq!(
+            f.psbt()
+                .sign_to_slice_with_sighash_types(&key(1), &[], &mut out),
+            Err(Error::UnsupportedSighash)
+        );
+    }
+
+    /// A script listed under two control blocks is one leaf: it is signed
+    /// once, and the result stays a valid PSBT.
+    #[test]
+    fn script_under_two_control_blocks() {
+        let mut f = fixture_with(None, true);
+        let inp = f.psbt().input(0).unwrap();
+        assert_eq!(inp.tap_leaf_scripts().count(), 3);
+        let single = f.single;
+        let mut blocks = inp
+            .tap_leaf_scripts()
+            .filter(|l| l.script == single)
+            .map(|l| l.control_block);
+        let (a, b) = (blocks.next().unwrap(), blocks.next().unwrap());
+        assert_eq!(blocks.next(), None);
+        drop(blocks);
+        assert_ne!(a, b);
+        for cb in [a, b] {
+            let cb = crate::taproot::ControlBlock::parse(cb).unwrap();
+            assert!(cb.verify(&f.single, &f.output_key));
+        }
+
+        assert_eq!(f.sign(&key(2)), 1);
+        let inp = f.psbt().input(0).unwrap();
+        assert_eq!(inp.tap_script_sigs().count(), 1);
+        let leaf_hash = tapleaf_hash(0xc0, &f.single);
+        assert!(
+            inp.tap_script_sig(&key(2).xonly_public_key(), &leaf_hash)
+                .is_some()
+        );
+        assert_eq!(f.sign(&key(2)), 0);
+        // the shorter control block is used
+        assert_eq!(f.finalize(), 1);
+        let inp = f.psbt().input(0).unwrap();
+        let (items, count) = witness_items(inp.final_script_witness().unwrap());
+        assert_eq!((count, items[2].len()), (3, 65));
+    }
+
+    /// The finalizer ignores taproot signatures that do not verify or whose
+    /// sighash type is not the declared one.
+    #[test]
+    fn finalizer_checks_taproot_signatures() {
+        let mut f = fixture(None);
+        assert_eq!(f.sign(&key(1)), 1);
+        assert_eq!(f.sign(&key(2)), 1);
+        let inp = f.psbt().input(0).unwrap();
+        let key_sig: [u8; 64] = inp.tap_key_sig().unwrap().try_into().unwrap();
+        let leaf_hash = tapleaf_hash(0xc0, &f.single);
+        let script_sig: [u8; 64] = inp
+            .tap_script_sig(&key(2).xonly_public_key(), &leaf_hash)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let signed = (f.buf, f.len);
+
+        // a garbage key-path signature: the script path is used instead
+        let mut bad = key_sig;
+        bad[40] ^= 1;
+        f.set(&[0x13], &bad);
+        assert_eq!(f.finalize(), 1);
+        let inp = f.psbt().input(0).unwrap();
+        let (items, count) = witness_items(inp.final_script_witness().unwrap());
+        assert_eq!((count, items[0]), (3, &script_sig[..]));
+
+        // both garbage: the input stays unfinalized
+        (f.buf, f.len) = signed;
+        f.set(&[0x13], &bad);
+        let mut sig_key = [0u8; 65];
+        sig_key[0] = 0x14;
+        sig_key[1..33].copy_from_slice(&key(2).xonly_public_key());
+        sig_key[33..].copy_from_slice(&leaf_hash);
+        let mut bad_script = script_sig;
+        bad_script[3] ^= 0x80;
+        f.set(&sig_key, &bad_script);
+        let before = f.len;
+        assert_eq!(f.finalize(), 0);
+        assert_eq!(f.len, before);
+        assert!(!f.psbt().is_finalized());
+
+        // SIGHASH_DEFAULT signatures relabelled as SIGHASH_ALL
+        (f.buf, f.len) = signed;
+        let mut with_type = [0u8; 65];
+        with_type[..64].copy_from_slice(&key_sig);
+        with_type[64] = 0x01;
+        f.set(&[0x13], &with_type);
+        with_type[..64].copy_from_slice(&script_sig);
+        f.set(&sig_key, &with_type);
+        assert_eq!(f.finalize(), 0);
+
+        // valid signatures, but not of the declared sighash type
+        (f.buf, f.len) = signed;
+        f.set(&[0x03], &1u32.to_le_bytes());
+        assert_eq!(f.finalize(), 0);
+        f.set(&[0x03], &0u32.to_le_bytes());
+        assert_eq!(f.finalize(), 1);
     }
 
     /// An external signer that only knows BIP-86 key-path signing still

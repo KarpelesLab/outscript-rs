@@ -9,10 +9,13 @@
 //!   [`Psbt::set_witness_utxo`] or [`Psbt::add_input_bip32_derivation`].
 //! - **Signer**: [`Psbt::sign_to_slice`] / [`Psbt::sign_input_to_slice`] with
 //!   any [`PsbtSigner`] (P2PKH, P2PK, bare and P2SH multisig, P2WPKH, P2WSH,
-//!   their P2SH-nested forms, and P2TR key path). An input whose
-//!   `PSBT_IN_SIGHASH_TYPE` sets
+//!   their P2SH-nested forms, and P2TR key and script paths). An input
+//!   whose `PSBT_IN_SIGHASH_TYPE` sets
 //!   [`SIGHASH_UNIFIED`](crate::btcraw::SIGHASH_UNIFIED) is signed under the
-//!   unified opt-in signature hash.
+//!   unified opt-in signature hash. Only the sighash types in
+//!   [`DEFAULT_SIGHASH_TYPES`] (which commit to the whole transaction) are
+//!   signed unless the caller allows others through
+//!   [`Psbt::sign_to_slice_with_sighash_types`].
 //! - **Combiner**: [`Psbt::combine_to_slice`].
 //! - **Finalizer**: [`Psbt::finalize_to_slice`].
 //! - **Extractor**: [`Psbt::extract_tx_to_slice`].
@@ -30,7 +33,7 @@ pub use crate::Error;
 mod finalize;
 mod sign;
 
-pub use sign::{PsbtSigner, SignerError};
+pub use sign::{DEFAULT_SIGHASH_TYPES, PsbtSigner, SignerError};
 
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
@@ -398,10 +401,18 @@ pub struct Map<'a> {
     bytes: &'a [u8],
 }
 
+/// The most records one PSBT map may hold. Parsing fails with
+/// [`Error::TooLarge`] beyond it, which bounds the (quadratic, allocation-free)
+/// duplicate-key check and map rewriting on untrusted input. Real maps hold a
+/// few dozen records at most.
+pub const MAX_MAP_RECORDS: usize = 2048;
+
 impl<'a> Map<'a> {
-    /// Reads one map (including its terminator), checking only the framing.
+    /// Reads one map (including its terminator), checking only the framing
+    /// and that it holds at most [`MAX_MAP_RECORDS`] records.
     fn read(r: &mut Reader<'a>) -> Result<Map<'a>, Error> {
         let start = r.pos;
+        let mut count = 0usize;
         loop {
             let at = r.pos;
             let key = r.var_bytes()?;
@@ -409,6 +420,10 @@ impl<'a> Map<'a> {
                 return Ok(Map {
                     bytes: &r.buf[start..at],
                 });
+            }
+            count += 1;
+            if count > MAX_MAP_RECORDS {
+                return Err(Error::TooLarge);
             }
             Reader::new(key).varint()?;
             r.var_bytes()?;
@@ -634,7 +649,8 @@ pub(crate) enum MapLoc {
 }
 
 impl<'a> Psbt<'a> {
-    /// Parses and fully validates a binary PSBT.
+    /// Parses and fully validates a binary PSBT. A map with more than
+    /// [`MAX_MAP_RECORDS`] records is refused with [`Error::TooLarge`].
     pub fn parse(bytes: &'a [u8]) -> Result<Psbt<'a>, Error> {
         if bytes.get(..5) != Some(&MAGIC[..]) {
             return Err(Error::InvalidMagic);
@@ -741,9 +757,31 @@ impl<'a> Psbt<'a> {
 
     /// The output spent by input `index`, from its non-witness UTXO (checked
     /// against the outpoint's txid) or witness UTXO.
+    ///
+    /// # Security
+    ///
+    /// Only a non-witness UTXO is authenticated (its hash is the outpoint's
+    /// txid). A witness UTXO is taken on trust: nothing in the PSBT proves
+    /// its amount or script. A segwit v0 signature (BIP-143) commits only to
+    /// the amount of the input it signs, so whoever built the PSBT can
+    /// understate the amounts of inputs and have a signer unknowingly pay the
+    /// difference as fee, including by presenting the same inputs in two
+    /// PSBTs with different claimed amounts. Before signing segwit v0 inputs
+    /// described only by a witness UTXO, check the amounts against a trusted
+    /// source (your own wallet or node) or require the non-witness UTXO.
+    /// Taproot signatures commit to the amount and script of every input, so
+    /// a wrong witness UTXO there gives an invalid signature instead.
     pub fn utxo(&self, index: usize) -> Result<RawTxOut<'a>, Error> {
         let inp = self.input(index).ok_or(Error::InputIndex)?;
         let outpoint = self.tx.inputs().nth(index).ok_or(Error::InputIndex)?;
+        Self::utxo_of(&inp, &outpoint)
+    }
+
+    /// [`Psbt::utxo`] for an input map and its outpoint already at hand.
+    pub(crate) fn utxo_of(
+        inp: &PsbtInput<'a>,
+        outpoint: &RawTxIn<'a>,
+    ) -> Result<RawTxOut<'a>, Error> {
         if let Some(prev) = inp.map().get_type(input::NON_WITNESS_UTXO) {
             let layout = TxLayout::parse(prev, true)?;
             if tx_txid(prev, &layout) != outpoint.txid {

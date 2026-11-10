@@ -1,7 +1,7 @@
 //! The PSBT signer role, and the input-script resolution shared with the
 //! finalizer.
 
-use super::{Error, MapEdit, MapLoc, NewRecord, Psbt, input, write_map};
+use super::{Error, MapEdit, MapLoc, NewRecord, Psbt, PsbtInput, input, write_map};
 use crate::btcraw::{
     self, RawTxIn, RawTxOut, SIGHASH_UNIFIED, SegwitV0Midstate, TapScriptPath, TapSighash,
     TaprootMidstate, UnifiedSpend, legacy_sighash_of, segwit_v0_midstate_of, taproot_midstate_of,
@@ -78,6 +78,45 @@ impl PsbtSigner for SecpPrivateKey {
     }
 }
 
+/// The sighash types the signer accepts unless told otherwise:
+/// `SIGHASH_DEFAULT` (0x00, taproot only), `SIGHASH_ALL` (0x01) and
+/// `SIGHASH_ALL` under the unified sighash (0x21,
+/// [`SIGHASH_UNIFIED`]` | SIGHASH_ALL`). All three commit to every input and
+/// every output of the transaction.
+pub const DEFAULT_SIGHASH_TYPES: &[u8] = &[0x00, 0x01, SIGHASH_UNIFIED | 0x01];
+
+/// The hash type to sign a taproot input with, given its declared
+/// `PSBT_IN_SIGHASH_TYPE`, if BIP-341 or the unified sighash defines it and
+/// `allowed` lists it.
+fn taproot_hash_type(declared: Option<u32>, allowed: &[u8]) -> Result<u8, Error> {
+    let t = match declared {
+        None => 0,
+        Some(t @ (0x00..=0x03 | 0x81..=0x83 | 0x21..=0x23 | 0xa1..=0xa3)) => t as u8,
+        Some(_) => return Err(Error::UnsupportedSighash),
+    };
+    if allowed.contains(&t) {
+        Ok(t)
+    } else {
+        Err(Error::UnsupportedSighash)
+    }
+}
+
+/// The hash type to sign an ECDSA input with: `SIGHASH_ALL`, or a unified
+/// type whose low five bits are `ALL`, `NONE` or `SINGLE`, if `allowed`
+/// lists it.
+fn ecdsa_hash_type(declared: Option<u32>, allowed: &[u8]) -> Result<u8, Error> {
+    let t = match declared.unwrap_or(1) {
+        1 => 1,
+        t @ 0..=0xff if t & u32::from(SIGHASH_UNIFIED) != 0 && matches!(t & 0x1f, 1..=3) => t as u8,
+        _ => return Err(Error::UnsupportedSighash),
+    };
+    if allowed.contains(&t) {
+        Ok(t)
+    } else {
+        Err(Error::UnsupportedSighash)
+    }
+}
+
 // --- script resolution ---
 
 /// What an input spends, once P2SH and P2WSH wrappers are opened.
@@ -119,14 +158,17 @@ fn is_witness_program(script: &[u8]) -> bool {
 }
 
 /// Resolves what input `index` spends, applying the BIP-174 signer checks.
-pub(crate) fn resolve<'a>(psbt: &Psbt<'a>, index: usize) -> Result<Resolved<'a>, Error> {
-    let inp = psbt.input(index).ok_or(Error::InputIndex)?;
+pub(crate) fn resolve<'a>(
+    psbt: &Psbt<'a>,
+    index: usize,
+    inp: &PsbtInput<'a>,
+) -> Result<Resolved<'a>, Error> {
     let outpoint = psbt
         .unsigned_tx()
         .inputs()
         .nth(index)
         .ok_or(Error::InputIndex)?;
-    let utxo = psbt.utxo(index)?;
+    let utxo = Psbt::utxo_of(inp, &outpoint)?;
     let (script, redeem) = match utxo.script {
         [0xa9, 0x14, hash @ .., 0x87] if hash.len() == 20 => {
             let rs = inp.redeem_script().ok_or(Error::MissingRedeemScript)?;
@@ -253,23 +295,38 @@ impl SignedSet {
     }
 }
 
-struct SignCtx<'p, 'a> {
+/// Computes the digests signatures on a PSBT's inputs commit to, caching the
+/// per-transaction midstates. Shared by the signer and the finalizer.
+pub(crate) struct SignCtx<'p, 'a> {
     psbt: &'p Psbt<'a>,
+    /// The sighash types the signer may sign with.
+    allowed: &'p [u8],
     segwit: Option<SegwitV0Midstate>,
     taproot: Option<Result<TaprootMidstate, Error>>,
 }
 
-impl<'a> SignCtx<'_, 'a> {
+impl<'p, 'a> SignCtx<'p, 'a> {
+    pub(crate) fn new(psbt: &'p Psbt<'a>, allowed: &'p [u8]) -> Self {
+        SignCtx {
+            psbt,
+            allowed,
+            segwit: None,
+            taproot: None,
+        }
+    }
+
     fn taproot(&mut self) -> Result<TaprootMidstate, Error> {
         let psbt = self.psbt;
         *self.taproot.get_or_insert_with(|| {
             let tx = psbt.unsigned_tx();
             let mut missing = false;
-            let prevouts = (0..tx.input_count()).map_while(|i| match psbt.utxo(i) {
-                Ok(u) => Some(u),
-                Err(_) => {
-                    missing = true;
-                    None
+            let prevouts = psbt.inputs().zip(tx.inputs()).map_while(|(inp, outpoint)| {
+                match Psbt::utxo_of(&inp, &outpoint) {
+                    Ok(u) => Some(u),
+                    Err(_) => {
+                        missing = true;
+                        None
+                    }
                 }
             });
             let mid = taproot_midstate_of(&tx, prevouts);
@@ -283,7 +340,7 @@ impl<'a> SignCtx<'_, 'a> {
 
     /// The digest a taproot signature on input `index` commits to: the unified
     /// sighash if `hash_type` opts in, BIP-341 otherwise.
-    fn taproot_digest(
+    pub(crate) fn taproot_digest(
         &mut self,
         index: usize,
         res: &Resolved<'_>,
@@ -306,11 +363,57 @@ impl<'a> SignCtx<'_, 'a> {
         taproot_sighash_of(&tx, &mid, index, res.utxo, &opts)
     }
 
-    /// Signs input `index` wherever the signer's key is involved (an empty
-    /// set if it is not).
-    fn sign_input(&mut self, index: usize, signer: &dyn PsbtSigner) -> Result<SignedSet, Error> {
+    /// The digest an ECDSA signature with `hash_type` on input `index`
+    /// commits to: the unified sighash if the type opts in, else the BIP-143
+    /// (`segwit`) or legacy `SIGHASH_ALL` digest of `script_code`.
+    pub(crate) fn ecdsa_digest(
+        &mut self,
+        index: usize,
+        res: &Resolved<'_>,
+        script_code: &[u8],
+        segwit: bool,
+        hash_type: u8,
+    ) -> Result<[u8; 32], Error> {
+        let psbt = self.psbt;
+        if hash_type & SIGHASH_UNIFIED != 0 {
+            let spend = if segwit {
+                UnifiedSpend::SegwitV0(script_code)
+            } else {
+                UnifiedSpend::Legacy(script_code)
+            };
+            let mid = self.taproot()?;
+            unified_sighash_of(
+                &psbt.unsigned_tx(),
+                &mid,
+                index,
+                res.utxo,
+                hash_type,
+                &spend,
+            )
+        } else if hash_type != 1 {
+            Err(Error::UnsupportedSighash)
+        } else if segwit {
+            let tx = psbt.unsigned_tx();
+            Ok(self
+                .segwit
+                .get_or_insert_with(|| segwit_v0_midstate_of(&tx))
+                .sighash(&res.outpoint, script_code, res.utxo.amount, 1))
+        } else {
+            legacy_sighash_of(&psbt.unsigned_tx(), index, script_code, 1)
+                .map_err(|_: btcraw::Error| Error::InputIndex)
+        }
+    }
+
+    /// Signs input `index` (whose map is `inp`) wherever the signer's key is
+    /// involved (an empty set if it is not).
+    fn sign_input(
+        &mut self,
+        index: usize,
+        inp: &PsbtInput<'a>,
+        signer: &dyn PsbtSigner,
+    ) -> Result<SignedSet, Error> {
         let mut set = SignedSet::default();
-        if let Some(signed) = self.sign_input_ecdsa_or_taproot(index, signer, &mut set)? {
+        if let Some(signed) = self.sign_input_ecdsa_or_taproot(index, inp, signer, &mut set)? {
             set.push(signed);
         }
         Ok(set)
@@ -320,26 +423,24 @@ impl<'a> SignCtx<'_, 'a> {
     fn sign_input_ecdsa_or_taproot(
         &mut self,
         index: usize,
+        inp: &PsbtInput<'a>,
         signer: &dyn PsbtSigner,
         set: &mut SignedSet,
     ) -> Result<Option<Signed>, Error> {
         let psbt = self.psbt;
-        let inp = psbt.input(index).ok_or(Error::InputIndex)?;
         if inp.is_finalized() {
             return Ok(None);
         }
-        let res = resolve(psbt, index)?;
+        let res = resolve(psbt, index, inp)?;
         let pubkey = signer.public_key();
         let comp = pubkey.serialize_compressed();
         let uncomp = pubkey.serialize_uncompressed();
 
         if let Kind::P2tr(output_key) = res.kind {
             let x_only: [u8; 32] = comp[1..].try_into().unwrap();
-            let hash_type = match inp.sighash_type() {
-                None => 0,
-                Some(t @ (0x00..=0x03 | 0x81..=0x83 | 0x21..=0x23 | 0xa1..=0xa3)) => t as u8,
-                Some(_) => return Err(Error::UnsupportedSighash),
-            };
+            // checked only once the key turns out to be involved, so that
+            // another party's input with an unusual type is simply skipped
+            let hash_type = taproot_hash_type(inp.sighash_type(), self.allowed);
             let mut signer_failed = false;
 
             // key path: the signer holds the internal key, and tweaking it with
@@ -351,6 +452,7 @@ impl<'a> SignCtx<'_, 'a> {
                     .ok()
                     == Some(output_key)
             {
+                let hash_type = hash_type?;
                 let sighash = self.taproot_digest(index, &res, hash_type, None)?;
                 match signer.sign_taproot_with_root(&sighash, root.as_ref()) {
                     Ok(sig) => set.push_schnorr(&[&[input::TAP_KEY_SIG as u8]], &sig, hash_type),
@@ -359,7 +461,10 @@ impl<'a> SignCtx<'_, 'a> {
             }
 
             // script path: every proven tapscript leaf that pushes the key and
-            // is not signed by it yet
+            // is not signed by it yet. A script listed under several control
+            // blocks is one leaf (one leaf hash), signed once.
+            let mut signed_leaves = [[0u8; 32]; MAX_LEAF_SIGS];
+            let mut signed_leaf_count = 0;
             for leaf in inp.tap_leaf_scripts() {
                 if set.is_full() {
                     break;
@@ -379,17 +484,24 @@ impl<'a> SignCtx<'_, 'a> {
                     continue;
                 }
                 let leaf_hash = cb.leaf_hash(leaf.script);
-                if inp.tap_script_sig(&x_only, &leaf_hash).is_some() {
+                if inp.tap_script_sig(&x_only, &leaf_hash).is_some()
+                    || signed_leaves[..signed_leaf_count].contains(&leaf_hash)
+                {
                     continue;
                 }
+                let hash_type = hash_type?;
                 let path = TapScriptPath::new(leaf_hash);
                 let sighash = self.taproot_digest(index, &res, hash_type, Some(path))?;
                 match signer.sign_schnorr(&sighash) {
-                    Ok(sig) => set.push_schnorr(
-                        &[&[input::TAP_SCRIPT_SIG as u8], &x_only, &leaf_hash],
-                        &sig,
-                        hash_type,
-                    ),
+                    Ok(sig) => {
+                        set.push_schnorr(
+                            &[&[input::TAP_SCRIPT_SIG as u8], &x_only, &leaf_hash],
+                            &sig,
+                            hash_type,
+                        );
+                        signed_leaves[signed_leaf_count] = leaf_hash;
+                        signed_leaf_count += 1;
+                    }
                     Err(_) => signer_failed = true,
                 }
             }
@@ -419,35 +531,8 @@ impl<'a> SignCtx<'_, 'a> {
             },
             Kind::P2tr(_) => unreachable!("handled above"),
         };
-        let hash_type = match inp.sighash_type().unwrap_or(1) {
-            1 => 1,
-            t @ 0..=0xff if t & u32::from(SIGHASH_UNIFIED) != 0 => t as u8,
-            _ => return Err(Error::UnsupportedSighash),
-        };
-        let digest = if hash_type & SIGHASH_UNIFIED != 0 {
-            let spend = if segwit {
-                UnifiedSpend::SegwitV0(script_code)
-            } else {
-                UnifiedSpend::Legacy(script_code)
-            };
-            let mid = self.taproot()?;
-            unified_sighash_of(
-                &psbt.unsigned_tx(),
-                &mid,
-                index,
-                res.utxo,
-                hash_type,
-                &spend,
-            )?
-        } else if segwit {
-            let tx = psbt.unsigned_tx();
-            self.segwit
-                .get_or_insert_with(|| segwit_v0_midstate_of(&tx))
-                .sighash(&res.outpoint, script_code, res.utxo.amount, 1)
-        } else {
-            legacy_sighash_of(&psbt.unsigned_tx(), index, script_code, 1)
-                .map_err(|_: btcraw::Error| Error::InputIndex)?
-        };
+        let hash_type = ecdsa_hash_type(inp.sighash_type(), self.allowed)?;
+        let digest = self.ecdsa_digest(index, &res, script_code, segwit, hash_type)?;
         let der = signer.sign_ecdsa(&digest).map_err(|_| Error::Signer)?;
         let mut value = InlineBytes::from_slice(&der).ok_or(Error::Signer)?;
         value.push(hash_type).unwrap();
@@ -488,29 +573,68 @@ impl<'a> Psbt<'a> {
     /// internal key (tweaked with the input's merkle root, if any), and on the
     /// script path for each tapscript leaf that pushes its x-only key and has a
     /// valid control block, up to 8 leaves per input and call; leaves the key
-    /// already signed are skipped. The input's sighash type is honoured (any
-    /// BIP-341 type for taproot, `SIGHASH_ALL` otherwise), and a type setting
-    /// [`SIGHASH_UNIFIED`] signs under the unified opt-in sighash, which needs
-    /// the UTXO of every input.
+    /// already signed are skipped.
     ///
     /// Inputs that are already finalized, lack the UTXO/script data to sign,
     /// or do not involve the key are left unchanged. An input whose data fails
     /// the BIP-174 signer checks (mismatched txid, redeem or witness script, a
     /// witness UTXO for a non-witness spend) makes the whole operation fail.
+    ///
+    /// # Sighash types
+    ///
+    /// The PSBT is untrusted input, and so is each input's
+    /// `PSBT_IN_SIGHASH_TYPE`. Only the types in [`DEFAULT_SIGHASH_TYPES`]
+    /// are signed: `SIGHASH_DEFAULT` (taproot inputs without a declared type),
+    /// `SIGHASH_ALL` (other inputs without one, or declared) and `SIGHASH_ALL`
+    /// under the unified sighash (0x21, see [`SIGHASH_UNIFIED`], which needs
+    /// the UTXO of every input). An input the key is involved in that declares
+    /// any other type fails the whole operation with
+    /// [`Error::UnsupportedSighash`]: `NONE`, `SINGLE` and `ANYONECANPAY`
+    /// signatures do not commit to the whole transaction, and whoever holds
+    /// one can redirect the funds. Earlier versions signed every type BIP-341
+    /// or the unified sighash defines. To sign other types on purpose, use
+    /// [`Psbt::sign_to_slice_with_sighash_types`].
+    ///
+    /// # Amounts
+    ///
+    /// The signer does not know what the transaction pays. Review its outputs
+    /// and input amounts before signing, and see [`Psbt::utxo`]: a segwit v0
+    /// input described only by a witness UTXO has an unauthenticated amount,
+    /// which lets the PSBT's creator hide an excessive fee.
     pub fn sign_to_slice(
         &self,
         signer: &dyn PsbtSigner,
         out: &mut [u8],
     ) -> Result<(usize, usize), Error> {
-        let mut ctx = SignCtx {
-            psbt: self,
-            segwit: None,
-            taproot: None,
-        };
+        self.sign_to_slice_with_sighash_types(signer, DEFAULT_SIGHASH_TYPES, out)
+    }
+
+    /// [`Psbt::sign_to_slice`], signing with the sighash types listed in
+    /// `allowed` instead of [`DEFAULT_SIGHASH_TYPES`].
+    ///
+    /// Each byte of `allowed` is a hash type the caller accepts, compared
+    /// with the input's `PSBT_IN_SIGHASH_TYPE` (0x00 for a taproot input
+    /// without one, 0x01 for any other). Listing a type does not make it
+    /// signable where the signer does not implement it: taproot inputs take
+    /// the BIP-341 types (0x00 to 0x03, 0x81 to 0x83) and their unified forms
+    /// (0x21 to 0x23, 0xa1 to 0xa3); other inputs take `SIGHASH_ALL` (0x01)
+    /// and unified types whose low five bits are `ALL`, `NONE` or `SINGLE`.
+    /// Anything else fails with [`Error::UnsupportedSighash`].
+    ///
+    /// Only allow `NONE`, `SINGLE` or `ANYONECANPAY` types for a protocol that
+    /// needs them: such a signature lets its holder change the outputs, or
+    /// the other inputs, of the transaction.
+    pub fn sign_to_slice_with_sighash_types(
+        &self,
+        signer: &dyn PsbtSigner,
+        allowed: &[u8],
+        out: &mut [u8],
+    ) -> Result<(usize, usize), Error> {
+        let mut ctx = SignCtx::new(self, allowed);
         let mut signed_count = 0;
         let n = self.emit(out, &mut |loc, map, s| {
             if let MapLoc::Input(i) = loc {
-                match ctx.sign_input(i, signer) {
+                match ctx.sign_input(i, &PsbtInput(map), signer) {
                     Ok(set) if set.len > 0 => {
                         signed_count += 1;
                         let add = set.records();
@@ -531,18 +655,33 @@ impl<'a> Psbt<'a> {
     /// Signs input `index` with `signer`, writing the updated PSBT into `out`.
     /// Fails with [`Error::KeyNotInvolved`] if the key does not appear in the
     /// input, or with the reason the input cannot be signed.
+    ///
+    /// Like [`Psbt::sign_to_slice`], this signs only the sighash types in
+    /// [`DEFAULT_SIGHASH_TYPES`] and fails with [`Error::UnsupportedSighash`]
+    /// for an input declaring another one (see
+    /// [`Psbt::sign_input_to_slice_with_sighash_types`]), and it trusts the
+    /// amount of a witness UTXO (see [`Psbt::utxo`]).
     pub fn sign_input_to_slice(
         &self,
         index: usize,
         signer: &dyn PsbtSigner,
         out: &mut [u8],
     ) -> Result<usize, Error> {
-        let mut ctx = SignCtx {
-            psbt: self,
-            segwit: None,
-            taproot: None,
-        };
-        let set = ctx.sign_input(index, signer)?;
+        self.sign_input_to_slice_with_sighash_types(index, signer, DEFAULT_SIGHASH_TYPES, out)
+    }
+
+    /// [`Psbt::sign_input_to_slice`], signing with the sighash types listed in
+    /// `allowed` (see [`Psbt::sign_to_slice_with_sighash_types`]).
+    pub fn sign_input_to_slice_with_sighash_types(
+        &self,
+        index: usize,
+        signer: &dyn PsbtSigner,
+        allowed: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
+        let mut ctx = SignCtx::new(self, allowed);
+        let inp = self.input(index).ok_or(Error::InputIndex)?;
+        let set = ctx.sign_input(index, &inp, signer)?;
         if set.len == 0 {
             return Err(Error::KeyNotInvolved);
         }
@@ -553,8 +692,18 @@ impl<'a> Psbt<'a> {
     /// [`Psbt::sign_to_slice`] into a new vector.
     #[cfg(feature = "alloc")]
     pub fn sign_to_vec(&self, signer: &dyn PsbtSigner) -> Result<(Vec<u8>, usize), Error> {
+        self.sign_to_vec_with_sighash_types(signer, DEFAULT_SIGHASH_TYPES)
+    }
+
+    /// [`Psbt::sign_to_slice_with_sighash_types`] into a new vector.
+    #[cfg(feature = "alloc")]
+    pub fn sign_to_vec_with_sighash_types(
+        &self,
+        signer: &dyn PsbtSigner,
+        allowed: &[u8],
+    ) -> Result<(Vec<u8>, usize), Error> {
         let mut buf = vec![0u8; self.sign_len_bound()];
-        let (n, count) = self.sign_to_slice(signer, &mut buf)?;
+        let (n, count) = self.sign_to_slice_with_sighash_types(signer, allowed, &mut buf)?;
         buf.truncate(n);
         Ok((buf, count))
     }
@@ -566,8 +715,19 @@ impl<'a> Psbt<'a> {
         index: usize,
         signer: &dyn PsbtSigner,
     ) -> Result<Vec<u8>, Error> {
+        self.sign_input_to_vec_with_sighash_types(index, signer, DEFAULT_SIGHASH_TYPES)
+    }
+
+    /// [`Psbt::sign_input_to_slice_with_sighash_types`] into a new vector.
+    #[cfg(feature = "alloc")]
+    pub fn sign_input_to_vec_with_sighash_types(
+        &self,
+        index: usize,
+        signer: &dyn PsbtSigner,
+        allowed: &[u8],
+    ) -> Result<Vec<u8>, Error> {
         let mut buf = vec![0u8; self.sign_len_bound()];
-        let n = self.sign_input_to_slice(index, signer, &mut buf)?;
+        let n = self.sign_input_to_slice_with_sighash_types(index, signer, allowed, &mut buf)?;
         buf.truncate(n);
         Ok(buf)
     }
