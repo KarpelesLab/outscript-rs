@@ -67,7 +67,8 @@ pub fn encode_segment(bits: &mut impl Iterator<Item = bool>) -> Option<Fr> {
 }
 
 /// `PedersenHashToPoint("Zcash_PH", M)`: the sum over the segments of `M` of
-/// `[⟨M_i⟩] I_i`. The hash of the empty sequence is the identity.
+/// `[⟨M_i⟩] I_i`, in constant time for a given input length. The hash of
+/// the empty sequence is the identity.
 pub fn pedersen_hash_to_point(bits: impl IntoIterator<Item = bool>) -> Point {
     let mut bits = bits.into_iter();
     let mut result = Point::IDENTITY;
@@ -79,10 +80,30 @@ pub fn pedersen_hash_to_point(bits: impl IntoIterator<Item = bool>) -> Point {
     result
 }
 
+/// [`pedersen_hash_to_point`] for public inputs (such as the nodes of the
+/// note commitment tree): faster, but the running time depends on the
+/// input.
+pub fn pedersen_hash_to_point_vartime(bits: impl IntoIterator<Item = bool>) -> Point {
+    let mut bits = bits.into_iter();
+    let mut result = Point::IDENTITY;
+    let mut segment = 0u32;
+    while let Some(scalar) = encode_segment(&mut bits) {
+        result += pedersen_hash_generator(segment).mul_vartime(&scalar);
+        segment += 1;
+    }
+    result
+}
+
 /// `PedersenHash("Zcash_PH", M)`: the `u` coordinate of
 /// [`pedersen_hash_to_point`].
 pub fn pedersen_hash(bits: impl IntoIterator<Item = bool>) -> Fq {
     pedersen_hash_to_point(bits).to_affine().u()
+}
+
+/// [`pedersen_hash`] for public inputs: see
+/// [`pedersen_hash_to_point_vartime`].
+pub fn pedersen_hash_vartime(bits: impl IntoIterator<Item = bool>) -> Fq {
+    pedersen_hash_to_point_vartime(bits).to_affine().u()
 }
 
 /// `MixingPedersenHash(P, x) = P + [x] J`, which binds a note commitment to
@@ -148,7 +169,8 @@ mod tests {
         assert!(vectors.len() > 20);
         for v in &vectors {
             let bits = v[1].as_str().unwrap().bytes().map(|b| b == b'1');
-            let p = pedersen_hash_to_point(bits).to_affine();
+            let p = pedersen_hash_to_point(bits.clone()).to_affine();
+            assert_eq!(pedersen_hash_to_point_vartime(bits).to_affine(), p);
             let be = |f: Fq| {
                 let mut bytes = f.to_bytes();
                 bytes.reverse();

@@ -42,7 +42,7 @@ pub mod jubjub;
 pub mod pedersen;
 pub mod prf;
 // TMP pub mod redjubjub;
-// TMP pub mod tree;
+pub mod tree;
 // TMP pub mod zip32;
 
 #[cfg(test)]

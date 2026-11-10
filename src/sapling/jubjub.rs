@@ -259,10 +259,27 @@ impl Point {
         acc
     }
 
-    /// `[scalar]·self` by double-and-add: the running time reveals the
-    /// scalar, so this is for public scalars only.
+    /// `[scalar]·self` with a 4-bit window that skips zero digits: the
+    /// running time reveals the scalar, so this is for public scalars only.
     pub fn mul_vartime(&self, scalar: &Fr) -> Point {
-        Self::mul_limbs_vartime(self, &scalar.to_raw())
+        let limbs = scalar.to_raw();
+        let mut table = [*self; 15];
+        for i in 1..15 {
+            table[i] = table[i - 1].add(self);
+        }
+        let mut acc = Point::IDENTITY;
+        let mut started = false;
+        for i in (0..64).rev() {
+            if started {
+                acc = acc.double().double().double().double();
+            }
+            let nibble = ((limbs[i / 16] >> (4 * (i % 16))) & 15) as usize;
+            if nibble != 0 {
+                acc = acc.add(&table[nibble - 1]);
+                started = true;
+            }
+        }
+        acc
     }
 
     fn mul_limbs_vartime(&self, limbs: &[u64; 4]) -> Point {
