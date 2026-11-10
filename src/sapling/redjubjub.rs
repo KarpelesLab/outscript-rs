@@ -12,6 +12,12 @@
 //! number generator of its own. The nonce is derived from them and from the
 //! message, so a repeated random string does not reveal the key as long as
 //! the message differs.
+//!
+//! Many signatures are verified faster together, with a [`BatchVerifier`]:
+//! it accepts a batch exactly when [`verify`] accepts each of its
+//! signatures (but for a probability of 2⁻¹²⁸ over the verifier's random
+//! bytes), which is what the consensus rules since Canopy were designed
+//! for.
 
 use super::Error;
 use super::field::Fr;
@@ -191,6 +197,182 @@ pub fn verify_binding(bvk: &Point, sighash: &[u8; 32], signature: &Signature) ->
     verify(SigType::Binding, &bvk.to_bytes(), sighash, signature)
 }
 
+/// The number of random bytes a [`BatchVerifier`] takes per signature.
+pub const BATCH_RANDOM_SIZE: usize = 16;
+
+/// The number of points a [`BatchVerifier`] multiplies together: two per
+/// signature.
+const BATCH_POINTS: usize = 16;
+
+/// `Σ scalarᵢ·pointᵢ`, with the doublings shared between the terms. Not
+/// constant time: for public values.
+fn multiscalar_mul_vartime(terms: &[(Point, Fr)]) -> Point {
+    let mut limbs = [[0u64; 4]; BATCH_POINTS];
+    for (limbs, (_, scalar)) in limbs.iter_mut().zip(terms) {
+        *limbs = scalar.to_raw();
+    }
+    let limbs = &limbs[..terms.len().min(BATCH_POINTS)];
+    let top = limbs
+        .iter()
+        .flat_map(|l| l.iter().enumerate())
+        .filter(|(_, limb)| **limb != 0)
+        .map(|(i, limb)| 64 * i + 64 - limb.leading_zeros() as usize)
+        .max()
+        .unwrap_or(0);
+    let mut acc = Point::IDENTITY;
+    for bit in (0..top).rev() {
+        acc = acc.double();
+        for (limbs, (point, _)) in limbs.iter().zip(terms) {
+            if (limbs[bit / 64] >> (bit % 64)) & 1 == 1 {
+                acc = acc.add(point);
+            }
+        }
+    }
+    acc
+}
+
+/// Verifies many RedJubjub signatures together, of either scheme, with a
+/// random linear combination of their verification equations:
+///
+/// ```text
+/// [8]( [Σ zᵢ·Sᵢ] P_G − Σ [zᵢ] Rᵢ − Σ [zᵢ·cᵢ] vkᵢ ) = O
+/// ```
+///
+/// which holds for every choice of the `zᵢ` exactly when each signature
+/// satisfies the equation of [`verify`]. The `zᵢ` come from the caller's
+/// random bytes, [`BATCH_RANDOM_SIZE`] per signature: they must be
+/// unpredictable to whoever made the signatures, so fresh output of a
+/// cryptographically secure generator, drawn after the signatures are
+/// known. A batch with an invalid signature is then accepted with
+/// probability 2⁻¹²⁸.
+///
+/// A failed batch does not say which signature is invalid: verify them one
+/// by one to find out. Nothing is allocated, whatever the size of the
+/// batch.
+///
+/// ```
+/// use outscript::sapling::Fr;
+/// use outscript::sapling::redjubjub::{BatchVerifier, SigType, sign, verification_key};
+/// # let (random_a, random_b) = ([1u8; 80], [2u8; 80]);
+/// # let (z_a, z_b) = ([3u8; 16], [4u8; 16]);
+/// let sk = Fr::from_u64(1234);
+/// let vk = verification_key(SigType::SpendAuth, &sk).to_bytes();
+/// let a = sign(SigType::SpendAuth, &sk, b"first", &random_a);
+/// let b = sign(SigType::SpendAuth, &sk, b"second", &random_b);
+///
+/// let mut batch = BatchVerifier::new();
+/// batch.queue(SigType::SpendAuth, &vk, b"first", &a, &z_a)?;
+/// batch.queue(SigType::SpendAuth, &vk, b"second", &b, &z_b)?;
+/// batch.verify()?;
+/// # Ok::<(), outscript::sapling::Error>(())
+/// ```
+#[derive(Clone, Debug)]
+pub struct BatchVerifier {
+    /// `Σ [zᵢ] Rᵢ + Σ [zᵢ·cᵢ] vkᵢ` over the signatures already combined.
+    sum: Point,
+    /// `Σ zᵢ·Sᵢ` for each scheme: spend authorization, then binding.
+    s: [Fr; 2],
+    /// The terms not yet in `sum`.
+    pending: [(Point, Fr); BATCH_POINTS],
+    n_pending: usize,
+    len: usize,
+}
+
+impl Default for BatchVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BatchVerifier {
+    /// An empty batch.
+    pub const fn new() -> Self {
+        BatchVerifier {
+            sum: Point::IDENTITY,
+            s: [Fr::ZERO; 2],
+            pending: [(Point::IDENTITY, Fr::ZERO); BATCH_POINTS],
+            n_pending: 0,
+            len: 0,
+        }
+    }
+
+    /// The number of signatures queued.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no signature has been queued.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn flush(&mut self) {
+        let terms = &self.pending[..self.n_pending];
+        self.sum = self.sum.add(&multiscalar_mul_vartime(terms));
+        self.n_pending = 0;
+    }
+
+    /// Adds a signature of `message` under the verification key `vk` to the
+    /// batch, with [`BATCH_RANDOM_SIZE`] fresh random bytes.
+    ///
+    /// Fails right away, leaving the batch as it was, if the signature
+    /// could not be valid: `vk` or `R` is not the canonical encoding of a
+    /// point, or `S` is not reduced. Whether the signature verifies is
+    /// only known from [`verify`](Self::verify).
+    pub fn queue(
+        &mut self,
+        sig_type: SigType,
+        vk: &[u8; 32],
+        message: &[u8],
+        signature: &Signature,
+        random: &[u8; BATCH_RANDOM_SIZE],
+    ) -> Result<(), Error> {
+        let (r_bytes, s_bytes) = signature.0.split_at(32);
+        let r_bytes: &[u8; 32] = r_bytes.try_into().map_err(|_| Error::InvalidSignature)?;
+        let s_bytes: &[u8; 32] = s_bytes.try_into().map_err(|_| Error::InvalidSignature)?;
+        let vk_point = Point::from_bytes(vk).ok_or(Error::InvalidSignature)?;
+        let r = Point::from_bytes(r_bytes).ok_or(Error::InvalidSignature)?;
+        let s = Fr::from_bytes(s_bytes).ok_or(Error::InvalidSignature)?;
+        let c = h_star(&[r_bytes, vk, message]);
+        // z = 2¹²⁸ + random: 128 bits of randomness, and never zero
+        let mut z = [0u8; 32];
+        z[..BATCH_RANDOM_SIZE].copy_from_slice(random);
+        z[BATCH_RANDOM_SIZE] = 1;
+        let z = Fr::from_bytes_reduced(&z);
+
+        if self.n_pending + 2 > BATCH_POINTS {
+            self.flush();
+        }
+        self.pending[self.n_pending] = (r, z);
+        self.pending[self.n_pending + 1] = (vk_point, z * c);
+        self.n_pending += 2;
+        let scheme = match sig_type {
+            SigType::SpendAuth => 0,
+            SigType::Binding => 1,
+        };
+        self.s[scheme] += z * s;
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Checks the batch: `Ok` when every queued signature is valid (an
+    /// empty batch is), [`Error::InvalidSignature`] when at least one is
+    /// not.
+    pub fn verify(mut self) -> Result<(), Error> {
+        self.flush();
+        let lhs = SigType::SpendAuth
+            .base()
+            .to_point()
+            .mul_vartime(&self.s[0])
+            .add(&SigType::Binding.base().to_point().mul_vartime(&self.s[1]));
+        if lhs.add(&self.sum.negate()).is_small_order() {
+            Ok(())
+        } else {
+            Err(Error::InvalidSignature)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +491,141 @@ mod tests {
         let outputs = [value_commitment(150, &rcv[2])];
         let bvk = binding_validating_key(&spends, &outputs, -30);
         assert_eq!(verification_key(SigType::Binding, &bsk), bvk);
+    }
+
+    /// Batches agree with single verification: every signature of
+    /// `sapling_signatures.json` (more than one group of points), then the
+    /// same with each kind of bad signature in turn.
+    #[test]
+    fn batch_matches_single() {
+        let z = |i: usize| -> [u8; BATCH_RANDOM_SIZE] {
+            blake2b(b"outscript_test__", &[&(i as u64).to_le_bytes()])
+        };
+        // (scheme, key, message, signature)
+        type Entry = (SigType, [u8; 32], Vec<u8>, Signature);
+        let mut sigs: Vec<Entry> = Vec::new();
+        for_each_row(
+            include_str!("testdata/sapling_signatures.json"),
+            |_, row| {
+                let m = row.bytes("m");
+                let spend = SigType::SpendAuth;
+                sigs.push((
+                    spend,
+                    row.array("vk"),
+                    m.clone(),
+                    Signature(row.array("sig")),
+                ));
+                sigs.push((spend, row.array("rvk"), m, Signature(row.array("rsig"))));
+            },
+        );
+        for i in 0..3u64 {
+            let sk = Fr::from_u64(1000 + i);
+            let vk = verification_key(SigType::Binding, &sk).to_bytes();
+            let sig = sign(SigType::Binding, &sk, &[i as u8; 32], &[i as u8; 80]);
+            sigs.insert(
+                5 * i as usize,
+                (SigType::Binding, vk, vec![i as u8; 32], sig),
+            );
+        }
+        assert!(2 * sigs.len() > 2 * BATCH_POINTS);
+
+        let run = |sigs: &[Entry]| -> Result<(), Error> {
+            let mut batch = BatchVerifier::new();
+            assert!(batch.is_empty());
+            for (i, (sig_type, vk, m, sig)) in sigs.iter().enumerate() {
+                batch.queue(*sig_type, vk, m, sig, &z(i))?;
+                assert_eq!(batch.len(), i + 1);
+            }
+            batch.verify()
+        };
+        let single = |sigs: &[Entry]| -> Result<(), Error> {
+            sigs.iter()
+                .try_for_each(|(sig_type, vk, m, sig)| verify(*sig_type, vk, m, sig))
+        };
+        assert_eq!(BatchVerifier::default().verify(), Ok(()));
+        assert_eq!(run(&sigs), Ok(()));
+        assert_eq!(single(&sigs), Ok(()));
+        for n in [1, 2, 8, 9] {
+            assert_eq!(run(&sigs[..n]), Ok(()));
+        }
+
+        let bad = Err(Error::InvalidSignature);
+        for target in [0, 3, 7, 16, sigs.len() - 1] {
+            // a flipped bit of R (when still a point), of S, of the key,
+            // of the message; the other scheme; the signature of another
+            let mutations: [&dyn Fn(&mut Entry); 6] = [
+                &|e| e.3.0[1] ^= 4,
+                &|e| e.3.0[33] ^= 1,
+                &|e| e.1[2] ^= 8,
+                &|e| e.2[0] ^= 1,
+                &|e| {
+                    e.0 = match e.0 {
+                        SigType::SpendAuth => SigType::Binding,
+                        SigType::Binding => SigType::SpendAuth,
+                    }
+                },
+                &|e| e.3 = Signature([0; 64]),
+            ];
+            for mutate in mutations {
+                let mut tampered = sigs.clone();
+                mutate(&mut tampered[target]);
+                assert_eq!(run(&tampered), bad);
+                assert_eq!(single(&tampered), bad);
+            }
+        }
+        // two valid signatures, each under the other's key
+        let mut swapped = sigs.clone();
+        let (a, b) = (swapped[1].3, swapped[2].3);
+        swapped[1].3 = b;
+        swapped[2].3 = a;
+        assert_eq!(run(&swapped), bad);
+    }
+
+    /// The batch equation has the cofactor of the single one: a signature
+    /// whose `R` carries a small-order component is valid either way.
+    #[test]
+    fn batch_accepts_small_order_components() {
+        let sk = Fr::from_u64(77);
+        let vk = verification_key(SigType::SpendAuth, &sk).to_bytes();
+        let sig = sign(SigType::SpendAuth, &sk, b"m", &[3; 80]);
+        // the point of order two, (0, -1)
+        let mut order_two = (-crate::sapling::Fq::ONE).to_bytes();
+        order_two[31] &= 0x7f;
+        let torsion = Point::from_bytes(&order_two).unwrap();
+        assert!(torsion.is_small_order() && !torsion.is_identity());
+        // R' = R + T changes the challenge, so re-sign by hand around it
+        let r = Fr::from_u64(5);
+        let r_point = SigType::SpendAuth.base().to_point().mul(&r).add(&torsion);
+        let r_bytes = r_point.to_bytes();
+        let c = h_star(&[&r_bytes, &vk, b"m"]);
+        let mut odd = [0u8; 64];
+        odd[..32].copy_from_slice(&r_bytes);
+        odd[32..].copy_from_slice(&(r + c * sk).to_bytes());
+        let odd = Signature(odd);
+        assert_eq!(verify(SigType::SpendAuth, &vk, b"m", &odd), Ok(()));
+        for z in [[0u8; 16], [1; 16], [0xff; 16]] {
+            let mut batch = BatchVerifier::new();
+            batch
+                .queue(SigType::SpendAuth, &vk, b"m", &sig, &z)
+                .unwrap();
+            batch
+                .queue(SigType::SpendAuth, &vk, b"m", &odd, &z)
+                .unwrap();
+            assert_eq!(batch.verify(), Ok(()));
+        }
+        // malformed encodings fail when queued and leave the batch usable
+        let mut batch = BatchVerifier::new();
+        let mut bad_r = sig;
+        bad_r.0[..32].fill(0xff);
+        let mut bad_s = sig;
+        bad_s.0[32..].fill(0xff);
+        let spend = SigType::SpendAuth;
+        let err = Err(Error::InvalidSignature);
+        assert_eq!(batch.queue(spend, &vk, b"m", &bad_r, &[0; 16]), err);
+        assert_eq!(batch.queue(spend, &vk, b"m", &bad_s, &[0; 16]), err);
+        assert_eq!(batch.queue(spend, &[0xff; 32], b"m", &sig, &[0; 16]), err);
+        assert!(batch.is_empty());
+        batch.queue(spend, &vk, b"m", &sig, &[0; 16]).unwrap();
+        assert_eq!(batch.verify(), Ok(()));
     }
 }

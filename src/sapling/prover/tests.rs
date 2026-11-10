@@ -213,6 +213,192 @@ fn reference_proofs_verify() {
         .unwrap();
 }
 
+/// Deterministic stand-in for the verifier's random generator.
+fn batch_random(tag: u8, len: usize) -> Vec<u8> {
+    (0..len)
+        .flat_map(|i| {
+            crate::sapling::prf::blake2b::<64>(b"outscript_test__", &[&[tag], &i.to_le_bytes()])
+        })
+        .take(len)
+        .collect()
+}
+
+/// Every real proof at hand (mainnet v4 and v5, `sapling-crypto`'s) in one
+/// batch for the two keys; a batch with one of them altered fails.
+#[test]
+fn batch_of_real_proofs() {
+    type SpendArgs = ([u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 192]);
+    type OutputArgs = ([u8; 32], [u8; 32], [u8; 32], [u8; 192]);
+    let mut spends: Vec<SpendArgs> = Vec::new();
+    let mut outputs: Vec<OutputArgs> = Vec::new();
+
+    let raw = hex::decode(include_str!("../testdata/mainnet_v5_sapling_tx.hex").trim()).unwrap();
+    let tx = ZcashTx::parse_into(&raw, &mut [], &mut []).unwrap();
+    let bundle = BundleRef::parse(tx.sapling).unwrap();
+    let anchor = bundle.anchor().unwrap();
+    for s in bundle.spends() {
+        spends.push((*s.cv, *anchor, *s.nullifier, *s.rk, *s.zkproof));
+    }
+    for o in bundle.outputs() {
+        outputs.push((*o.cv, *o.cmu, *o.ephemeral_key, *o.zkproof));
+    }
+    let json: Value =
+        serde_json::from_str(include_str!("../testdata/mainnet_v4_sapling_proofs.json")).unwrap();
+    for s in json["spends"].as_array().unwrap() {
+        spends.push((
+            array(s, "cv"),
+            array(s, "anchor"),
+            array(s, "nullifier"),
+            array(s, "rk"),
+            array(s, "zkproof"),
+        ));
+    }
+    for o in json["outputs"].as_array().unwrap() {
+        outputs.push((
+            array(o, "cv"),
+            array(o, "cmu"),
+            array(o, "ephemeral_key"),
+            array(o, "zkproof"),
+        ));
+    }
+    let f = fixture();
+    spends.push((f.spend_cv, f.anchor, f.nullifier, f.rk, f.spend_proof));
+    outputs.push((f.output_cv, f.cmu, f.epk, f.output_proof));
+    assert_eq!((spends.len(), outputs.len()), (3, 5));
+
+    let spend_vk = SpendVerifyingKey::mainnet();
+    let output_vk = OutputVerifyingKey::mainnet();
+    let run = |spends: &[SpendArgs], outputs: &[OutputArgs]| -> Result<(), Error> {
+        let random = batch_random(1, 16 * (spends.len() + outputs.len()));
+        let mut random = random.as_chunks::<16>().0.iter();
+        let mut batch = BatchVerifier::new();
+        // interleaved: the order does not matter
+        let mut outputs = outputs.iter();
+        for (cv, anchor, nf, rk, proof) in spends {
+            spend_vk.queue(
+                &mut batch,
+                cv,
+                anchor,
+                nf,
+                rk,
+                proof,
+                random.next().unwrap(),
+            )?;
+            if let Some((cv, cmu, epk, proof)) = outputs.next() {
+                output_vk.queue(&mut batch, cv, cmu, epk, proof, random.next().unwrap())?;
+            }
+        }
+        for (cv, cmu, epk, proof) in outputs {
+            output_vk.queue(&mut batch, cv, cmu, epk, proof, random.next().unwrap())?;
+        }
+        assert!(format!("{batch:?}").contains("keys: 2"));
+        batch.verify()
+    };
+    assert_eq!(run(&spends, &outputs), Ok(()));
+
+    // one altered public input or proof, in either kind
+    let mut bad = spends.clone();
+    bad[1].2[0] ^= 1;
+    assert_eq!(run(&bad, &outputs), Err(Error::InvalidProof));
+    let (cv, anchor, nf, rk, proof) = &bad[1];
+    assert_eq!(
+        spend_vk.verify(cv, anchor, nf, rk, proof),
+        Err(Error::InvalidProof)
+    );
+    let mut bad = outputs.clone();
+    bad[4].3 = outputs[3].3;
+    assert_eq!(run(&spends, &bad), Err(Error::InvalidProof));
+    let (cv, cmu, epk, proof) = &bad[4];
+    assert_eq!(
+        output_vk.verify(cv, cmu, epk, proof),
+        Err(Error::InvalidProof)
+    );
+    // what cannot be valid is refused when queued
+    let mut bad = spends.clone();
+    bad[0].1 = [0xff; 32];
+    assert_eq!(run(&bad, &outputs), Err(Error::InvalidPublicInput));
+    let mut bad = outputs.clone();
+    bad[0].3 = [0; 192];
+    assert!(run(&spends, &bad).is_err());
+}
+
+/// `verify_bundle` on a mainnet transaction, and on altered copies of it.
+#[test]
+fn verify_mainnet_bundle() {
+    let raw = hex::decode(include_str!("../testdata/mainnet_v5_sapling_tx.hex").trim()).unwrap();
+    let tx = ZcashTx::parse_into(&raw, &mut [], &mut []).unwrap();
+    let sighash = tx.sighash(None, SIGHASH_ALL, &[]).unwrap();
+    let bundle = BundleRef::parse(tx.sapling).unwrap();
+    let spend_vk = SpendVerifyingKey::mainnet();
+    let output_vk = OutputVerifyingKey::mainnet();
+    assert_eq!(bundle.n_signatures(), 2);
+    let len = verify_bundle_random_len(&bundle);
+    assert_eq!(len, 16 * (2 + 1 + 2));
+    let random = batch_random(2, len);
+    let check = |bundle: &BundleRef<'_>, sighash: &[u8; 32], random: &[u8]| {
+        verify_bundle(bundle, sighash, &spend_vk, &output_vk, random)
+    };
+    assert_eq!(check(&bundle, &sighash, &random), Ok(()));
+    assert_eq!(check(&bundle, &sighash, &vec![0; len]), Ok(()));
+    assert_eq!(bundle.verify_batched(&sighash, &random[..32]), Ok(()));
+    assert_eq!(
+        verify_bundle_proofs_batch(&bundle, &spend_vk, &output_vk, &random[32..]),
+        Ok(())
+    );
+
+    for bad in [&random[..len - 1], &[][..], &vec![0; len + 16][..]] {
+        assert_eq!(
+            check(&bundle, &sighash, bad),
+            Err(BundleError::RandomLength)
+        );
+    }
+    assert_eq!(
+        bundle.verify_batched(&sighash, &random[..31]),
+        Err(SaplingError::RandomLength)
+    );
+    assert_eq!(
+        verify_bundle_proofs_batch(&bundle, &spend_vk, &output_vk, &random[..32]),
+        Err(Error::RandomLength)
+    );
+    // another transaction's signature hash
+    let signature = Err(BundleError::Sapling(SaplingError::InvalidSignature));
+    assert_eq!(check(&bundle, &[7; 32], &random), signature);
+    assert_eq!(bundle.verify(&[7; 32]), Err(SaplingError::InvalidSignature));
+
+    // a bit flipped in each part of the serialized bundle
+    let sapling = tx.sapling;
+    let n = sapling.len();
+    let offsets = [
+        (1 + 32, "nullifier"),
+        (1 + 96 + 1 + 100, "enc_ciphertext"),
+        (1 + 96 + 1 + 2 * 756 + 3, "value balance"),
+        (1 + 96 + 1 + 2 * 756 + 8 + 1, "anchor"),
+        (n - 64 - 2 * 192 - 64 + 5, "spend auth signature"),
+        (n - 64 + 40, "binding signature"),
+    ];
+    for (offset, what) in offsets {
+        let mut bytes = sapling.to_vec();
+        bytes[offset] ^= 1;
+        let altered = BundleRef::parse(&bytes).unwrap();
+        // the signature hash covers all but the signatures: keep it, so
+        // that only the proofs and the binding signature can object
+        let batched = check(&altered, &sighash, &random);
+        let single = altered
+            .verify(&sighash)
+            .map_err(BundleError::Sapling)
+            .and_then(|()| {
+                verify_bundle_proofs(&altered, &spend_vk, &output_vk).map_err(BundleError::Proof)
+            });
+        assert_eq!(batched, single, "{what}");
+        // the note ciphertext is only bound by the signature hash
+        assert_eq!(batched.is_ok(), what == "enc_ciphertext", "{what}");
+    }
+    // an empty bundle has nothing to verify
+    let empty = BundleRef::parse(&[]).unwrap();
+    assert_eq!(verify_bundle_random_len(&empty), 0);
+    assert_eq!(check(&empty, &sighash, &[]), Ok(()));
+}
+
 /// The parameter files contain the embedded keys, and nothing but the
 /// exact files is accepted.
 #[cfg(feature = "std")]

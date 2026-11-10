@@ -18,19 +18,28 @@
 //! ([`SpendVerifyingKey::mainnet`], [`OutputVerifyingKey::mainnet`]). They
 //! are the same on every Zcash network.
 //!
+//! [`verify_bundle`] checks a whole bundle: encodings, signatures and
+//! proofs, the last two in batches. [`SpendVerifyingKey::queue`],
+//! [`OutputVerifyingKey::queue`] and [`queue_bundle_proofs`] put proofs of
+//! any number of transactions in one [`BatchVerifier`].
+//!
 //! # Randomness
 //!
 //! A proof takes 128 bytes of randomness from the caller, which blind it:
 //! they must come from a cryptographically secure generator and never be
-//! reused for another proof.
+//! reused for another proof. Batched verification takes 16 random bytes
+//! per proof or signature, which must be unpredictable to whoever made
+//! them.
 
 #[cfg(feature = "std")]
 use crate::prelude::*;
+use crate::sapling::Error as SaplingError;
+use crate::sapling::bundle::BundleRef;
 use crate::sapling::circuit::{Output, Spend, multipack};
 use crate::sapling::field::Fq;
 use crate::sapling::groth16::{
-    self, Error, PROOF_SIZE, Parameters, PreparedVerifyingKey, Proof, SynthesisError, VerifyingKey,
-    create_proof, verify_proof,
+    BATCH_RANDOM_SIZE, BatchVerifier, Error, PROOF_SIZE, Parameters, PreparedVerifyingKey, Proof,
+    SynthesisError, VerifyingKey, create_proof, verify_proof,
 };
 use crate::sapling::jubjub::AffinePoint;
 use purecrypto::hash::Blake2bMac;
@@ -355,6 +364,46 @@ impl OutputVerifyingKey {
     }
 }
 
+impl SpendVerifyingKey {
+    /// Adds the proof of a Spend description to a batch instead of
+    /// verifying it: see [`BatchVerifier`]. Fails right away, as
+    /// [`verify`](Self::verify) does, on public inputs consensus forbids
+    /// and on a proof that does not decode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn queue<'a>(
+        &'a self,
+        batch: &mut BatchVerifier<'a>,
+        cv: &[u8; 32],
+        anchor: &[u8; 32],
+        nullifier: &[u8; 32],
+        rk: &[u8; 32],
+        zkproof: &[u8; PROOF_SIZE],
+        random: &[u8; BATCH_RANDOM_SIZE],
+    ) -> Result<(), Error> {
+        let inputs = spend_public_inputs(cv, anchor, nullifier, rk)?;
+        batch.queue(&self.0, &Proof::from_bytes(zkproof)?, &inputs, random)
+    }
+}
+
+impl OutputVerifyingKey {
+    /// Adds the proof of an Output description to a batch instead of
+    /// verifying it: see [`BatchVerifier`]. Fails right away, as
+    /// [`verify`](Self::verify) does, on public inputs consensus forbids
+    /// and on a proof that does not decode.
+    pub fn queue<'a>(
+        &'a self,
+        batch: &mut BatchVerifier<'a>,
+        cv: &[u8; 32],
+        cmu: &[u8; 32],
+        ephemeral_key: &[u8; 32],
+        zkproof: &[u8; PROOF_SIZE],
+        random: &[u8; BATCH_RANDOM_SIZE],
+    ) -> Result<(), Error> {
+        let inputs = output_public_inputs(cv, cmu, ephemeral_key)?;
+        batch.queue(&self.0, &Proof::from_bytes(zkproof)?, &inputs, random)
+    }
+}
+
 /// Decodes an embedded verifying key, which is known to be valid.
 fn embedded(bytes: &[u8]) -> VerifyingKey {
     match VerifyingKey::read(bytes) {
@@ -368,10 +417,10 @@ fn embedded(bytes: &[u8]) -> VerifyingKey {
 /// signatures are checked by
 /// [`BundleRef::verify`](crate::sapling::bundle::BundleRef::verify).
 pub fn verify_bundle_proofs(
-    bundle: &crate::sapling::bundle::BundleRef<'_>,
+    bundle: &BundleRef<'_>,
     spend_vk: &SpendVerifyingKey,
     output_vk: &OutputVerifyingKey,
-) -> Result<(), groth16::Error> {
+) -> Result<(), Error> {
     if let Some(anchor) = bundle.anchor() {
         for spend in bundle.spends() {
             spend_vk.verify(spend.cv, anchor, spend.nullifier, spend.rk, spend.zkproof)?;
@@ -381,6 +430,133 @@ pub fn verify_bundle_proofs(
         output_vk.verify(output.cv, output.cmu, output.ephemeral_key, output.zkproof)?;
     }
     Ok(())
+}
+
+/// Adds every Spend and Output proof of a Sapling bundle to a batch, to
+/// verify the proofs of many bundles together. `random` must hold
+/// [`BATCH_RANDOM_SIZE`] fresh random bytes per proof
+/// ([`Error::RandomLength`] otherwise): see [`BatchVerifier`]. On error the
+/// batch may hold part of the bundle's proofs and must be discarded.
+pub fn queue_bundle_proofs<'a>(
+    bundle: &BundleRef<'_>,
+    spend_vk: &'a SpendVerifyingKey,
+    output_vk: &'a OutputVerifyingKey,
+    batch: &mut BatchVerifier<'a>,
+    random: &[u8],
+) -> Result<(), Error> {
+    let (random, rest) = random.as_chunks::<BATCH_RANDOM_SIZE>();
+    if !rest.is_empty() || random.len() != bundle.n_spends() + bundle.n_outputs() {
+        return Err(Error::RandomLength);
+    }
+    let mut random = random.iter();
+    if let Some(anchor) = bundle.anchor() {
+        for (spend, r) in bundle.spends().zip(&mut random) {
+            let (cv, nf, rk) = (spend.cv, spend.nullifier, spend.rk);
+            spend_vk.queue(batch, cv, anchor, nf, rk, spend.zkproof, r)?;
+        }
+    }
+    for (output, r) in bundle.outputs().zip(&mut random) {
+        let (cv, cmu, epk) = (output.cv, output.cmu, output.ephemeral_key);
+        output_vk.queue(batch, cv, cmu, epk, output.zkproof, r)?;
+    }
+    Ok(())
+}
+
+/// [`verify_bundle_proofs`] with the proofs verified as one batch, which is
+/// faster as soon as there are two. `random` is as for
+/// [`queue_bundle_proofs`].
+pub fn verify_bundle_proofs_batch(
+    bundle: &BundleRef<'_>,
+    spend_vk: &SpendVerifyingKey,
+    output_vk: &OutputVerifyingKey,
+    random: &[u8],
+) -> Result<(), Error> {
+    let mut batch = BatchVerifier::new();
+    queue_bundle_proofs(bundle, spend_vk, output_vk, &mut batch, random)?;
+    batch.verify()
+}
+
+/// Why a bundle is not valid: see [`verify_bundle`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BundleError {
+    /// An encoding or a signature is invalid: see the inner error.
+    Sapling(SaplingError),
+    /// A proof is invalid: see the inner error.
+    Proof(Error),
+    /// The random bytes supplied have the wrong length.
+    RandomLength,
+}
+
+impl core::fmt::Display for BundleError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            BundleError::Sapling(e) => write!(f, "{e}"),
+            BundleError::Proof(e) => write!(f, "{e}"),
+            BundleError::RandomLength => f.write_str("wrong amount of randomness"),
+        }
+    }
+}
+
+impl core::error::Error for BundleError {}
+
+/// The number of random bytes [`verify_bundle`] needs for a bundle:
+/// [`BATCH_RANDOM_SIZE`] for each signature and each proof.
+pub fn verify_bundle_random_len(bundle: &BundleRef<'_>) -> usize {
+    BATCH_RANDOM_SIZE * (bundle.n_signatures() + bundle.n_spends() + bundle.n_outputs())
+}
+
+/// Checks everything a validator checks of a parsed Sapling bundle without
+/// the chain state, given the transaction's signature hash (see
+/// [`ZcashTx::sighash`](crate::zcashtx::ZcashTx::sighash) with no input
+/// index): the encodings, the spend authorization signatures, the binding
+/// signature (so the values balance), and the Spend and Output proofs.
+/// What is left to the caller is the chain: the anchor must be a root of
+/// the note commitment tree, and the nullifiers unspent.
+///
+/// The signatures are verified as one batch and the proofs as another,
+/// with [`verify_bundle_random_len`] random bytes from the caller, which
+/// must be fresh output of a cryptographically secure generator: see
+/// [`BatchVerifier`]. An invalid bundle is accepted with probability 2⁻¹²⁸
+/// at most; an error does not say which signature or proof is at fault
+/// ([`BundleRef::verify`] and [`verify_bundle_proofs`] do).
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use outscript::sapling::bundle::BundleRef;
+/// use outscript::sapling::prover::{
+///     OutputVerifyingKey, SpendVerifyingKey, verify_bundle, verify_bundle_random_len,
+/// };
+/// use outscript::zcashtx::{SIGHASH_ALL, ZcashTx};
+/// # let raw: Vec<u8> = todo!();
+/// # let random: Vec<u8> = todo!();
+///
+/// let tx = ZcashTx::parse_into(&raw, &mut [], &mut [])?;
+/// let sighash = tx.sighash(None, SIGHASH_ALL, &[])?;
+/// let bundle = BundleRef::parse(tx.sapling)?;
+/// // random: verify_bundle_random_len(&bundle) fresh random bytes
+/// assert_eq!(random.len(), verify_bundle_random_len(&bundle));
+/// let (spend_vk, output_vk) = (SpendVerifyingKey::mainnet(), OutputVerifyingKey::mainnet());
+/// verify_bundle(&bundle, &sighash, &spend_vk, &output_vk, &random)?;
+/// # Ok(()) }
+/// ```
+pub fn verify_bundle(
+    bundle: &BundleRef<'_>,
+    sighash: &[u8; 32],
+    spend_vk: &SpendVerifyingKey,
+    output_vk: &OutputVerifyingKey,
+    random: &[u8],
+) -> Result<(), BundleError> {
+    let (for_signatures, for_proofs) = random
+        .split_at_checked(BATCH_RANDOM_SIZE * bundle.n_signatures())
+        .ok_or(BundleError::RandomLength)?;
+    if for_proofs.len() != BATCH_RANDOM_SIZE * (bundle.n_spends() + bundle.n_outputs()) {
+        return Err(BundleError::RandomLength);
+    }
+    bundle
+        .verify_batched(sighash, for_signatures)
+        .map_err(BundleError::Sapling)?;
+    verify_bundle_proofs_batch(bundle, spend_vk, output_vk, for_proofs).map_err(BundleError::Proof)
 }
 
 #[cfg(test)]

@@ -123,6 +123,8 @@ pub enum Error {
     TreeFull,
     /// The authentication path does not belong to this tree or leaf.
     InvalidPath,
+    /// The random bytes supplied have the wrong length.
+    RandomLength,
 }
 
 impl core::fmt::Display for Error {
@@ -146,6 +148,7 @@ impl core::fmt::Display for Error {
             Error::InvalidLength => f.write_str("invalid length prefix"),
             Error::TreeFull => f.write_str("note commitment tree is full"),
             Error::InvalidPath => f.write_str("invalid authentication path"),
+            Error::RandomLength => f.write_str("wrong amount of randomness"),
         }
     }
 }

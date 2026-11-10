@@ -36,7 +36,7 @@ use super::note_encryption::{
     ENC_CIPHERTEXT_SIZE, MEMO_SIZE, OUT_CIPHERTEXT_SIZE, Zip212Enforcement, try_note_decryption,
     try_output_recovery_with_ovk,
 };
-use super::redjubjub::{self, Signature};
+use super::redjubjub::{self, BatchVerifier, SigType, Signature};
 use crate::btcvarint::BtcVarInt;
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
@@ -383,20 +383,10 @@ impl<'a> BundleRef<'a> {
         ))
     }
 
-    /// Checks what a validator checks of a bundle without the chain state
-    /// and without verifying proofs, given the transaction's signature hash
-    /// (see [`ZcashTx::sighash`](crate::zcashtx::ZcashTx::sighash) with no
-    /// input index):
-    ///
-    /// - every `cv`, `rk` and ephemeral key is a canonical point and not of
-    ///   small order, and every `cmu` and the anchor are canonical field
-    ///   elements;
-    /// - every spend authorization signature verifies under its `rk`;
-    /// - the binding signature verifies, so the values balance.
-    ///
-    /// **The Spend and Output proofs are not verified**, and neither are the
-    /// anchor or the nullifiers against the chain.
-    pub fn verify(&self, sighash: &[u8; 32]) -> Result<(), Error> {
+    /// The encoding rules of the consensus: every `cv`, `rk` and ephemeral
+    /// key is a canonical point and not of small order, and every `cmu` and
+    /// the anchor are canonical field elements.
+    fn check_encodings(&self) -> Result<(), Error> {
         let not_small_order = |bytes: &[u8; 32]| -> Result<(), Error> {
             let p = Point::from_bytes(bytes).ok_or(Error::InvalidPoint)?;
             if p.is_small_order() {
@@ -415,18 +405,111 @@ impl<'a> BundleRef<'a> {
         for spend in self.spends() {
             not_small_order(spend.cv)?;
             not_small_order(spend.rk)?;
-            redjubjub::verify_spend(spend.rk, sighash, &Signature(*spend.spend_auth_sig))?;
         }
         for output in self.outputs() {
             not_small_order(output.cv)?;
             not_small_order(output.ephemeral_key)?;
             field_element(output.cmu)?;
         }
+        Ok(())
+    }
+
+    /// Checks what a validator checks of a bundle without the chain state
+    /// and without verifying proofs, given the transaction's signature hash
+    /// (see [`ZcashTx::sighash`](crate::zcashtx::ZcashTx::sighash) with no
+    /// input index):
+    ///
+    /// - every `cv`, `rk` and ephemeral key is a canonical point and not of
+    ///   small order, and every `cmu` and the anchor are canonical field
+    ///   elements;
+    /// - every spend authorization signature verifies under its `rk`;
+    /// - the binding signature verifies, so the values balance.
+    ///
+    /// **The Spend and Output proofs are not verified**, and neither are the
+    /// anchor or the nullifiers against the chain. With the feature
+    /// `zcash-sapling-prover`, `prover::verify_bundle` checks the proofs as
+    /// well.
+    pub fn verify(&self, sighash: &[u8; 32]) -> Result<(), Error> {
+        self.check_encodings()?;
+        for spend in self.spends() {
+            redjubjub::verify_spend(spend.rk, sighash, &Signature(*spend.spend_auth_sig))?;
+        }
         if let Some(sig) = self.binding_sig {
             let bvk = self.binding_validating_key()?;
             redjubjub::verify_binding(&bvk, sighash, &Signature(*sig))?;
         }
         Ok(())
+    }
+
+    /// The number of signatures of the bundle: one per spend and the
+    /// binding signature, none for an empty bundle.
+    pub const fn n_signatures(&self) -> usize {
+        if self.is_empty() {
+            0
+        } else {
+            self.spends.len() + 1
+        }
+    }
+
+    /// Checks the encodings as [`verify`](Self::verify) does, and adds the
+    /// signatures of the bundle to a batch instead of verifying them: for
+    /// verifying the signatures of many bundles (each with its own
+    /// signature hash) together.
+    ///
+    /// `random` must hold [`BATCH_RANDOM_SIZE`](redjubjub::BATCH_RANDOM_SIZE)
+    /// fresh random bytes per signature ([`n_signatures`](Self::n_signatures)
+    /// of them): see [`BatchVerifier`]. On error the batch may hold part of
+    /// the bundle's signatures and must be discarded.
+    pub fn queue_signatures(
+        &self,
+        sighash: &[u8; 32],
+        batch: &mut BatchVerifier,
+        random: &[u8],
+    ) -> Result<(), Error> {
+        let (random, rest) = random.as_chunks::<{ redjubjub::BATCH_RANDOM_SIZE }>();
+        if !rest.is_empty() || random.len() != self.n_signatures() {
+            return Err(Error::RandomLength);
+        }
+        self.check_encodings()?;
+        let mut random = random.iter();
+        for (spend, z) in self.spends().zip(&mut random) {
+            let signature = Signature(*spend.spend_auth_sig);
+            batch.queue(SigType::SpendAuth, spend.rk, sighash, &signature, z)?;
+        }
+        if let (Some(sig), Some(z)) = (self.binding_sig, random.next()) {
+            let bvk = self.binding_validating_key()?.to_bytes();
+            batch.queue(SigType::Binding, &bvk, sighash, &Signature(*sig), z)?;
+        }
+        Ok(())
+    }
+
+    /// [`verify`](Self::verify) with the signatures verified as a batch,
+    /// which is faster as soon as there is a spend. `random` is as for
+    /// [`queue_signatures`](Self::queue_signatures).
+    pub fn verify_batched(&self, sighash: &[u8; 32], random: &[u8]) -> Result<(), Error> {
+        let mut batch = BatchVerifier::new();
+        self.queue_signatures(sighash, &mut batch, random)?;
+        batch.verify()
+    }
+
+    /// Trial-decrypts every output with every incoming viewing key, in
+    /// one batch: see
+    /// [`try_note_decryption_batch`](super::note_encryption::try_note_decryption_batch).
+    /// `found` gets the index of the output, the index of the key, the
+    /// note and its memo.
+    pub fn try_note_decryption_batch(
+        &self,
+        ivks: &[IncomingViewingKey],
+        zip212: Zip212Enforcement,
+        found: impl FnMut(usize, usize, Note, &[u8; MEMO_SIZE]),
+    ) {
+        super::note_encryption::try_note_decryption_batch(
+            ivks,
+            self.outputs()
+                .map(|o| (o.ephemeral_key, o.cmu, o.enc_ciphertext)),
+            zip212,
+            found,
+        );
     }
 
     /// An owned copy of the bundle.

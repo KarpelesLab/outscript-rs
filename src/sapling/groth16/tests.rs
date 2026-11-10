@@ -242,3 +242,98 @@ fn malformed_parameters_are_rejected() {
     assert!(Proof::from_bytes(&[0xff; PROOF_SIZE]).is_err());
     assert!(Proof::from_bytes(&[0; PROOF_SIZE]).is_err());
 }
+
+/// A batch is accepted exactly when each of its proofs is.
+#[test]
+fn batch_matches_single() {
+    let f = fixture();
+    let params = Parameters::read(PARAMS, false).unwrap();
+    let pvk = params.vk.prepare();
+    let mut proofs = vec![(Proof::from_bytes(&f.proof).unwrap(), f.y)];
+    for seed in 1..3u64 {
+        let circuit = Chain {
+            x: Fq::from_u64(77 * seed),
+            n: 20,
+        };
+        let r = Fq::from_bytes_wide(&[seed as u8; 64]);
+        let s = Fq::from_bytes_wide(&[0x40 | seed as u8; 64]);
+        let proof = create_proof(&circuit, &params, &r, &s).unwrap();
+        proofs.push((proof, circuit.output()));
+    }
+    let run = |proofs: &[(Proof, Fq)], tag: u8| {
+        let mut batch = BatchVerifier::new();
+        assert!(batch.is_empty());
+        for (i, (proof, y)) in proofs.iter().enumerate() {
+            let mut random = [tag; BATCH_RANDOM_SIZE];
+            random[0] = i as u8;
+            batch.queue(&pvk, proof, &[*y], &random).unwrap();
+        }
+        assert_eq!(batch.len(), proofs.len());
+        assert!(format!("{batch:?}").contains("keys: 1"));
+        batch.verify()
+    };
+    assert_eq!(BatchVerifier::default().verify(), Ok(()));
+    // whatever the random bytes, all zeros and all ones included
+    for tag in [0, 0x5a, 0xff] {
+        assert_eq!(run(&proofs, tag), Ok(()));
+    }
+    assert_eq!(run(&proofs[..1], 1), Ok(()));
+
+    // one bad proof or input anywhere fails the batch, as it fails alone
+    for target in 0..proofs.len() {
+        let (proof, y) = proofs[target];
+        for bad in [
+            (
+                Proof {
+                    a: proof.a.double(),
+                    ..proof
+                },
+                y,
+            ),
+            (
+                Proof {
+                    b: proof.b.double(),
+                    ..proof
+                },
+                y,
+            ),
+            (
+                Proof {
+                    c: proof.c.neg(),
+                    ..proof
+                },
+                y,
+            ),
+            (proof, y + Fq::ONE),
+        ] {
+            let mut tampered = proofs.clone();
+            tampered[target] = bad;
+            assert_eq!(run(&tampered, 9), Err(Error::InvalidProof));
+            assert_eq!(
+                verify_proof(&pvk, &bad.0, &[bad.1]),
+                Err(Error::InvalidProof)
+            );
+        }
+    }
+    // two valid proofs with their inputs exchanged
+    let mut swapped = proofs.clone();
+    swapped[0].1 = proofs[1].1;
+    swapped[1].1 = proofs[0].1;
+    assert_eq!(run(&swapped, 3), Err(Error::InvalidProof));
+
+    // the wrong number of inputs leaves the batch as it was
+    let mut batch = BatchVerifier::new();
+    let (proof, y) = proofs[0];
+    let err = Err(Error::InvalidVerifyingKey);
+    assert_eq!(batch.queue(&pvk, &proof, &[], &[1; 16]), err);
+    assert_eq!(batch.queue(&pvk, &proof, &[y, y], &[1; 16]), err);
+    assert!(batch.is_empty());
+    // a copy of the key is another key to the batch, with the same result
+    let copy = pvk.clone();
+    batch.queue(&pvk, &proof, &[y], &[1; 16]).unwrap();
+    batch
+        .queue(&copy, &proofs[1].0, &[proofs[1].1], &[2; 16])
+        .unwrap();
+    assert!(format!("{batch:?}").contains("keys: 2"));
+    assert_eq!(batch.verify(), Ok(()));
+}

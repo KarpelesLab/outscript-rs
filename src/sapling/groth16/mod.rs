@@ -10,6 +10,9 @@
 //!   scalars, the same [`Proof`] as `bellman::groth16::create_proof`;
 //! - [`verify_proof`] accepts exactly the proofs `bellman` accepts.
 //!
+//! Many proofs, for one or several verifying keys, are verified faster
+//! together with a [`BatchVerifier`].
+//!
 //! Circuits are written against the [`ConstraintSystem`] trait and
 //! implement [`Circuit`]. The Sapling circuits are in
 //! [`circuit`](super::circuit); most users want the typed wrappers in
@@ -77,6 +80,8 @@ pub enum Error {
     HashMismatch,
     /// Reading the parameters failed.
     Io,
+    /// The random bytes supplied for a batch have the wrong length.
+    RandomLength,
 }
 
 impl core::fmt::Display for Error {
@@ -91,6 +96,7 @@ impl core::fmt::Display for Error {
             Error::InvalidPublicInput => "invalid public input",
             Error::HashMismatch => "parameter hash mismatch",
             Error::Io => "could not read the parameters",
+            Error::RandomLength => "wrong amount of randomness",
         })
     }
 }
@@ -307,6 +313,157 @@ pub fn verify_proof(
         Ok(())
     } else {
         Err(Error::InvalidProof)
+    }
+}
+
+/// The number of random bytes a [`BatchVerifier`] takes per proof.
+pub const BATCH_RANDOM_SIZE: usize = 16;
+
+/// What a batch accumulates for one verifying key.
+struct BatchKey<'a> {
+    pvk: &'a PreparedVerifyingKey,
+    /// `Σ rᵢ` then `Σ rᵢ·inputᵢⱼ` for each public input `j`: the scalars of
+    /// the input commitment bases.
+    scalars: Vec<Fq>,
+    /// `Σ rᵢ·Cᵢ`.
+    c: G1,
+}
+
+/// Verifies many Groth16 proofs together, for any number of verifying
+/// keys, with a random linear combination of their verification equations:
+///
+/// ```text
+/// Π e(rᵢ·Aᵢ, Bᵢ) · e(Σ rᵢ·accᵢ, -γ) · e(Σ rᵢ·Cᵢ, -δ) = e(α, β)^(Σ rᵢ)
+/// ```
+///
+/// (the last three factors once per verifying key), where `accᵢ` is the
+/// combination of the input bases with the public inputs of proof `i`.
+/// A batch of `n` proofs costs `n` plus two pairings per key and a single
+/// final exponentiation, where separate verifications cost `3·n` pairings
+/// and `n` final exponentiations.
+///
+/// The `rᵢ` come from the caller's random bytes, [`BATCH_RANDOM_SIZE`] per
+/// proof: they must be unpredictable to whoever made the proofs, so fresh
+/// output of a cryptographically secure generator, drawn after the proofs
+/// are known. The batch is then accepted exactly when
+/// [`verify_proof`] accepts each proof, but for a probability of 2⁻¹²⁸.
+///
+/// A failed batch does not say which proof is invalid: verify them one by
+/// one to find out.
+pub struct BatchVerifier<'a> {
+    keys: Vec<BatchKey<'a>>,
+    /// `(rᵢ·Aᵢ, Bᵢ)` for each proof.
+    pairs: Vec<(G1, G2)>,
+}
+
+impl core::fmt::Debug for BatchVerifier<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BatchVerifier")
+            .field("proofs", &self.pairs.len())
+            .field("keys", &self.keys.len())
+            .finish()
+    }
+}
+
+impl Default for BatchVerifier<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> BatchVerifier<'a> {
+    /// An empty batch.
+    pub const fn new() -> Self {
+        BatchVerifier {
+            keys: Vec::new(),
+            pairs: Vec::new(),
+        }
+    }
+
+    /// The number of proofs queued.
+    pub fn len(&self) -> usize {
+        self.pairs.len()
+    }
+
+    /// Whether no proof has been queued.
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// Adds a proof for the verifying key `pvk` and the given public
+    /// inputs to the batch, with [`BATCH_RANDOM_SIZE`] fresh random bytes.
+    ///
+    /// Proofs for the same key share its part of the work when they are
+    /// queued with the same `pvk` value (the same reference, not a copy).
+    /// Fails with [`Error::InvalidVerifyingKey`], leaving the batch as it
+    /// was, if the number of inputs does not fit the key.
+    pub fn queue(
+        &mut self,
+        pvk: &'a PreparedVerifyingKey,
+        proof: &Proof,
+        public_inputs: &[Fq],
+        random: &[u8; BATCH_RANDOM_SIZE],
+    ) -> Result<(), Error> {
+        if public_inputs.len() + 1 != pvk.ic.len() {
+            return Err(Error::InvalidVerifyingKey);
+        }
+        // r = 2¹²⁸ + random: 128 bits of randomness, and never zero
+        let mut bytes = [0u8; 32];
+        bytes[..BATCH_RANDOM_SIZE].copy_from_slice(random);
+        bytes[BATCH_RANDOM_SIZE] = 1;
+        let r = Fq::from_bytes_reduced(&bytes);
+        let r_bls = to_bls_scalar(&r);
+
+        let index = match self.keys.iter().position(|k| core::ptr::eq(k.pvk, pvk)) {
+            Some(index) => index,
+            None => {
+                self.keys.push(BatchKey {
+                    pvk,
+                    scalars: vec![Fq::ZERO; pvk.ic.len()],
+                    c: G1::IDENTITY,
+                });
+                self.keys.len() - 1
+            }
+        };
+        let key = &mut self.keys[index];
+        let (constant, inputs) = key
+            .scalars
+            .split_first_mut()
+            .ok_or(Error::InvalidVerifyingKey)?;
+        *constant += r;
+        for (scalar, input) in inputs.iter_mut().zip(public_inputs) {
+            *scalar += r * *input;
+        }
+        key.c = key.c.add(&proof.c.mul(&r_bls));
+        self.pairs.push((proof.a.mul(&r_bls), proof.b));
+        Ok(())
+    }
+
+    /// Checks the batch: `Ok` when every queued proof is valid (an empty
+    /// batch is), [`Error::InvalidProof`] when at least one is not.
+    pub fn verify(self) -> Result<(), Error> {
+        let mut expected = Gt::IDENTITY;
+        let mut key_points = Vec::with_capacity(self.keys.len());
+        for key in &self.keys {
+            let mut acc = G1::IDENTITY;
+            for (scalar, base) in key.scalars.iter().zip(&key.pvk.ic) {
+                acc = acc.add(&base.mul(&to_bls_scalar(scalar)));
+            }
+            key_points.push(acc);
+            if let Some(sum) = key.scalars.first() {
+                expected = expected.mul(&key.pvk.alpha_g1_beta_g2.pow(&to_bls_scalar(sum)));
+            }
+        }
+        let mut pairs: Vec<(&G1, &G2)> = self.pairs.iter().map(|(a, b)| (a, b)).collect();
+        for (key, acc) in self.keys.iter().zip(&key_points) {
+            pairs.push((acc, &key.pvk.neg_gamma_g2));
+            pairs.push((&key.c, &key.pvk.neg_delta_g2));
+        }
+        if multi_pairing(&pairs) == expected {
+            Ok(())
+        } else {
+            Err(Error::InvalidProof)
+        }
     }
 }
 
