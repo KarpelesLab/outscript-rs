@@ -19,18 +19,16 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct BtcAmount(pub u64);
 
-/// Parses decimal digits (with an optional leading `+`, like `u64::from_str`),
-/// skipping the byte at `skip`.
+/// Parses decimal digits, skipping the byte at `skip` (the decimal point).
+/// Like `u64::from_str`, a `+` is accepted only as the very first byte of `s`.
 fn parse_digits(s: &[u8], skip: Option<usize>) -> Result<u64, Error> {
-    let mut digits = s
+    let start = usize::from(s.first() == Some(&b'+'));
+    let digits = s
         .iter()
         .enumerate()
+        .skip(start)
         .filter(|&(i, _)| Some(i) != skip)
-        .map(|(_, &c)| c)
-        .peekable();
-    if digits.peek() == Some(&b'+') {
-        digits.next();
-    }
+        .map(|(_, &c)| c);
     let mut v: u64 = 0;
     let mut any = false;
     for c in digits {
@@ -64,6 +62,10 @@ impl BtcAmount {
     /// satoshis).
     pub fn from_text(s: &str) -> Result<BtcAmount, Error> {
         if let Some(hex_part) = s.strip_prefix("0x") {
+            // `from_str_radix` would accept a sign here
+            if !hex_part.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return Err(Error::InvalidAmount);
+            }
             return u64::from_str_radix(hex_part, 16)
                 .map(BtcAmount)
                 .map_err(|e| match e.kind() {
@@ -181,6 +183,29 @@ mod tests {
         }
         assert_eq!(
             BtcAmount::from_text("18446744073709551616"),
+            Err(Error::Overflow)
+        );
+    }
+
+    /// A sign is only valid as the very first byte: not after the decimal
+    /// point, and not after the `0x` prefix.
+    #[test]
+    fn sign_only_leads() {
+        for bad in [
+            ".+5", "1.+5", "+.+5", "1+", "0x+10", "0x-10", "+0x10", "0x+", "+", "+.", "-.5",
+        ] {
+            assert_eq!(
+                BtcAmount::from_text(bad),
+                Err(Error::InvalidAmount),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(BtcAmount::from_text("+5"), Ok(BtcAmount(500_000_000)));
+        assert_eq!(BtcAmount::from_text("+.5"), Ok(BtcAmount(50_000_000)));
+        assert_eq!(BtcAmount::from_text("0x10"), Ok(BtcAmount(16)));
+        assert_eq!(BtcAmount::from_text("0xfF"), Ok(BtcAmount(255)));
+        assert_eq!(
+            BtcAmount::from_text("0x10000000000000000"),
             Err(Error::Overflow)
         );
     }
