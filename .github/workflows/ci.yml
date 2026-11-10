@@ -108,6 +108,41 @@ jobs:
           RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
         run: cargo doc --no-deps ${{ matrix.features.flags }}
 
+  slow:
+    name: Slow tests (provers, release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: slow
+
+      # The Sapling proving parameters (about 50 MB). The tests check their
+      # BLAKE2b-512 hashes before using them.
+      - name: Cache Sapling parameters
+        id: params
+        uses: actions/cache@v4
+        with:
+          path: ~/.zcash-params
+          key: sapling-params-v1
+
+      - name: Download Sapling parameters
+        if: steps.params.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.zcash-params
+          curl -fsSL --retry 3 -o ~/.zcash-params/sapling-spend.params https://download.z.cash/downloads/sapling-spend.params
+          curl -fsSL --retry 3 -o ~/.zcash-params/sapling-output.params https://download.z.cash/downloads/sapling-output.params
+
+      # Everything, including the tests ignored by default for their run time
+      # or their need for the parameters.
+      - name: Test (release, with ignored tests)
+        run: cargo test --release --features zcash-sapling-prover,zcash-orchard-prover -- --include-ignored
+
   msrv:
     name: MSRV (1.95)
     runs-on: ubuntu-latest
