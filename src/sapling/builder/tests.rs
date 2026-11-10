@@ -2,11 +2,6 @@
 //! files, see `prover/tests.rs`) a complete shielded transaction.
 
 use super::*;
-use crate::sapling::bundle::BundleRef;
-use crate::sapling::keys::Diversifier;
-use crate::sapling::note_encryption::{
-    Zip212Enforcement, try_note_decryption, try_output_recovery_with_ovk,
-};
 use crate::sapling::tree::Frontier;
 use crate::sapling::zip32::ExtendedSpendingKey;
 
@@ -148,6 +143,11 @@ fn output_checks_and_empty_bundle() {
 #[test]
 #[ignore = "needs the Sapling parameters"]
 fn shielded_transaction() {
+    use crate::sapling::bundle::BundleRef;
+    use crate::sapling::keys::Diversifier;
+    use crate::sapling::note_encryption::{
+        Zip212Enforcement, try_note_decryption, try_output_recovery_with_ovk,
+    };
     use crate::sapling::prover::{
         OutputVerifyingKey, SpendVerifyingKey, tests::load_params, verify_bundle_proofs,
     };

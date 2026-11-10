@@ -1,7 +1,7 @@
 //! Zcash Sapling shielded pool (feature `zcash-sapling`).
 //!
-//! Everything a wallet needs short of creating proofs, following the Zcash
-//! protocol specification (NU5/NU6) and ZIPs 32, 212, 216 and 225:
+//! Everything a wallet needs, following the Zcash protocol specification
+//! (NU5/NU6) and ZIPs 32, 212, 216 and 225:
 //!
 //! - [`field`] and [`jubjub`]: the Jubjub curve and its two fields;
 //! - [`group_hash`], [`generators`] and [`pedersen`]: `GroupHash`, the fixed
@@ -22,15 +22,34 @@
 //! All secret-dependent curve arithmetic is constant time, and types holding
 //! secret keys wipe themselves when dropped.
 //!
+//! # Proofs and shielded transactions
+//!
+//! The feature `zcash-sapling-prover` (not in the default set; it needs an
+//! allocator and enables `purecrypto`'s BLS12-381) adds the proof system:
+//!
+//! - `groth16`: Groth16 over BLS12-381, compatible with `bellman` (the
+//!   parameter file format, proof creation and verification);
+//! - `circuit`: the Spend and Output circuits;
+//! - `prover`: the Sapling proving parameters (supplied by the caller and
+//!   checked by hash), the embedded verifying keys, and typed proving and
+//!   verification of Spend and Output descriptions;
+//! - `builder`: a builder that turns notes to spend and outputs to create
+//!   into a complete, proven and signed Sapling bundle for
+//!   [`zcashtx`](crate::zcashtx).
+//!
+//! Verifying proofs needs no external file; creating them needs
+//! `sapling-spend.params` and `sapling-output.params`. The prover's
+//! multi-scalar multiplications run in variable time, as in every Groth16
+//! prover.
+//!
 //! # Building blocks for a prover
 //!
-//! Spend and Output proofs are not created here, but the pieces a Groth16
-//! circuit synthesis needs are public: field and curve arithmetic with
-//! `const` constructors ([`field::Fq`], [`jubjub::AffinePoint`]), the
-//! generators and their window tables ([`generators`]), the Pedersen hash
-//! chunk encoding and segment generators ([`pedersen`]), and the bit
-//! decompositions the circuits consume ([`pedersen::bits_le`],
-//! [`note::note_commitment_bits`]).
+//! The pieces the circuits are synthesized from are public: field and curve
+//! arithmetic with `const` constructors ([`field::Fq`],
+//! [`jubjub::AffinePoint`]), the generators and their window tables
+//! ([`generators`]), the Pedersen hash chunk encoding and segment generators
+//! ([`pedersen`]), and the bit decompositions the circuits consume
+//! ([`pedersen::bits_le`], [`note::note_commitment_bits`]).
 
 #[cfg(feature = "zcash-sapling-prover")]
 pub mod builder;
