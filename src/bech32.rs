@@ -218,9 +218,7 @@ fn bech32_encode_raw(
 /// part (as written), the data characters without the checksum, and the
 /// checksum variant.
 fn bech32_parse(s: &str) -> Result<(&str, &[u8], Variant), Error> {
-    let has_lower = s.bytes().any(|b| b.is_ascii_lowercase());
-    let has_upper = s.bytes().any(|b| b.is_ascii_uppercase());
-    if has_lower && has_upper {
+    if is_mixed_case(s) {
         return Err(Error::MixedCase);
     }
     let pos = s.rfind('1').ok_or(Error::InvalidSeparator)?;
@@ -247,14 +245,16 @@ fn values(chars: &[u8]) -> impl Iterator<Item = u8> + '_ {
     chars.iter().map(|&c| charset_rev(c).unwrap_or(0))
 }
 
-/// Case-insensitively compares a parsed prefix with the expected (lower-case)
-/// one.
+/// Whether `s` mixes upper- and lower-case ASCII letters.
+fn is_mixed_case(s: &str) -> bool {
+    s.bytes().any(|b| b.is_ascii_lowercase()) && s.bytes().any(|b| b.is_ascii_uppercase())
+}
+
+/// Compares a parsed prefix with the expected one, ignoring ASCII case on
+/// both sides: an all-upper-case string is valid, and callers may pass the
+/// prefix as it was written. Mixed case is rejected separately.
 fn prefix_matches(got: &str, want: &str) -> bool {
-    got.len() == want.len()
-        && got
-            .bytes()
-            .zip(want.bytes())
-            .all(|(a, b)| a.to_ascii_lowercase() == b)
+    got.eq_ignore_ascii_case(want)
 }
 
 /// Encodes 8-bit `data` as a bech32 string of the given variant into `out`,
@@ -311,6 +311,10 @@ pub fn segwit_addr_encode_to_slice(
 /// Decodes a segwit address, verifying it uses the expected human-readable
 /// part, and writes the witness program into `out` (40 bytes always suffice).
 /// Returns the witness version and program length.
+///
+/// `hrp` is compared without regard to ASCII case, so an all-upper-case
+/// address (valid per BIP-173, and common in QR codes) is accepted; a
+/// mixed-case one is rejected with [`Error::MixedCase`].
 pub fn segwit_addr_decode_to_slice(
     hrp: &str,
     addr: &str,
@@ -433,6 +437,10 @@ fn size_from_bits(bits: u8) -> usize {
 /// Encodes a Bitcoin Cash CashAddr into `out`, returning the number of (ASCII)
 /// bytes written. `prefix` may include a trailing colon (e.g.
 /// "bitcoincash:"); the output is `prefix:payload`.
+///
+/// `version_type` is the 4-bit address type (0 is P2PKH, 1 is P2SH); a value
+/// above 15 does not fit the version byte and fails with
+/// [`Error::InvalidVersionByte`].
 pub fn cashaddr_encode_to_slice(
     prefix: &str,
     version_type: u8,
@@ -441,6 +449,10 @@ pub fn cashaddr_encode_to_slice(
 ) -> Result<usize, Error> {
     let p = cashaddr_prefix(prefix);
     let size = size_bits(hash.len()).ok_or(Error::InvalidHashLength)?;
+    // The version byte is a reserved zero bit, 4 type bits and 3 size bits.
+    if version_type > 0x0f {
+        return Err(Error::InvalidVersionByte);
+    }
     let version_byte = (version_type << 3) | size;
 
     let mut w = SliceWriter { out, pos: 0 };
@@ -470,11 +482,17 @@ pub fn cashaddr_encode_to_slice(
 /// Decodes a Bitcoin Cash CashAddr, verifying the expected prefix, and writes
 /// the hash into `out` (64 bytes always suffice). Returns the type (0 is P2PKH,
 /// 1 is P2SH) and the hash length.
+///
+/// The address may be all lower-case or all upper-case; a mixed-case one is
+/// rejected with [`Error::MixedCase`].
 pub fn cashaddr_decode_to_slice(
     prefix: &str,
     addr: &str,
     out: &mut [u8],
 ) -> Result<(u8, usize), Error> {
+    if is_mixed_case(addr) {
+        return Err(Error::MixedCase);
+    }
     let p = cashaddr_prefix(prefix);
     let body = match addr.split_once(':') {
         Some((pre, rest)) => {
@@ -589,6 +607,89 @@ mod tests {
         assert_eq!(
             cashaddr_decode_to_slice("bitcoincash:", bare, &mut hash),
             Ok((0, 20))
+        );
+    }
+
+    #[test]
+    fn segwit_hrp_case() {
+        const UPPER: &str = "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4";
+        let mut p = [0u8; 40];
+        // the expected part may be given in either case
+        for hrp in ["bc", "BC"] {
+            for addr in [BIP173_ADDR, UPPER] {
+                assert_eq!(
+                    segwit_addr_decode_to_slice(hrp, addr, &mut p),
+                    Ok((0, 20)),
+                    "{hrp} {addr}"
+                );
+            }
+        }
+        assert_eq!(
+            segwit_addr_decode_to_slice("tb", UPPER, &mut p),
+            Err(Error::PrefixMismatch)
+        );
+        for mixed in [
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3T4",
+            "Bc1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
+        ] {
+            assert_eq!(
+                segwit_addr_decode_to_slice("bc", mixed, &mut p),
+                Err(Error::MixedCase),
+                "{mixed}"
+            );
+        }
+    }
+
+    #[test]
+    fn cashaddr_case() {
+        const UPPER: &str = "BITCOINCASH:QPUSJXTJRPKYF843MMFZK78YP5QFHHCQ3YV38MA5LM";
+        let mut want = [0u8; 64];
+        let mut got = [0u8; 64];
+        assert_eq!(
+            cashaddr_decode_to_slice("bitcoincash:", CASHADDR, &mut want),
+            Ok((0, 20))
+        );
+        // all upper-case is valid, with or without the prefix
+        for addr in [UPPER, UPPER.split_once(':').unwrap().1] {
+            assert_eq!(
+                cashaddr_decode_to_slice("bitcoincash:", addr, &mut got),
+                Ok((0, 20)),
+                "{addr}"
+            );
+            assert_eq!(got[..20], want[..20]);
+        }
+        for mixed in [
+            "bitcoincash:qpusjxtjrpkyf843mmfzk78yp5qfhhcq3yv38ma5lM",
+            "bitcoincash:QPUSJXTJRPKYF843MMFZK78YP5QFHHCQ3YV38MA5LM",
+            "BITCOINCASH:qpusjxtjrpkyf843mmfzk78yp5qfhhcq3yv38ma5lm",
+            "qpusjxtjrpkyf843mmfzk78yp5qfhhcq3yv38ma5lM",
+        ] {
+            assert_eq!(
+                cashaddr_decode_to_slice("bitcoincash:", mixed, &mut got),
+                Err(Error::MixedCase),
+                "{mixed}"
+            );
+        }
+    }
+
+    #[test]
+    fn cashaddr_encode_rejects_wide_type() {
+        let mut out = [0u8; 64];
+        let hash = [0x55u8; 20];
+        // the high bits used to be shifted out: 16 and 32 encoded as type 0
+        for typ in [16, 17, 32, 0x80, 0xff] {
+            assert_eq!(
+                cashaddr_encode_to_slice("bitcoincash:", typ, &hash, &mut out),
+                Err(Error::InvalidVersionByte),
+                "{typ}"
+            );
+        }
+        let n = cashaddr_encode_to_slice("bitcoincash:", 15, &hash, &mut out).unwrap();
+        let addr = core::str::from_utf8(&out[..n]).unwrap();
+        let mut dec = [0u8; 64];
+        assert_eq!(
+            cashaddr_decode_to_slice("bitcoincash:", addr, &mut dec),
+            Ok((15, 20))
         );
     }
 

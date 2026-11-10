@@ -139,3 +139,27 @@ fn evm_lowercase_and_checksum() {
     let bad = "0x2aEb8ADD8337360E088B7D9ce4e857b9BE60f3a7";
     assert!(parse_evm_address(bad).is_err());
 }
+
+#[test]
+fn evm_address_of_oversized_script_is_an_error() {
+    // An "evm" output whose script is not a 20-byte address used to panic in
+    // the EIP-55 checksum (out-of-bounds read of the keccak digest).
+    for len in [0, 19, 21, 32, 33, 40, 100] {
+        for name in ["eth", "evm"] {
+            let out = crate::out::Out::make(name, vec![0xab; len], &["evm"]);
+            assert!(out.address(&[]).is_err(), "{name} {len}");
+        }
+    }
+    let out = crate::out::Out::make("eth", vec![0xab; 20], &["evm"]);
+    assert_eq!(out.address(&[]).unwrap().len(), 42);
+}
+
+#[test]
+fn uppercase_segwit_address_parses() {
+    // BIP-173: QR codes carry the all-upper-case form.
+    let lower = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    let want = parse_bitcoin_based_address("bitcoin", lower).unwrap();
+    let got = parse_bitcoin_based_address("auto", &lower.to_ascii_uppercase()).unwrap();
+    assert_eq!(got.script, want.script);
+    assert_eq!(got.address(&["bitcoin"]).unwrap(), lower);
+}

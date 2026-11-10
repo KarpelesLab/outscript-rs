@@ -13,8 +13,6 @@ use crate::hash::dsha256;
 #[cfg(feature = "evm")]
 use crate::hash::keccak256_once;
 use crate::hash::sha256_once;
-#[cfg(feature = "bitcoin")]
-use crate::pushbytes::parse_push_bytes;
 use crate::script::ScriptBytes;
 #[cfg(feature = "tron")]
 use crate::tron::ADDRESS_PREFIX as TRON_ADDRESS_PREFIX;
@@ -96,7 +94,12 @@ pub fn encode_address_to_slice(
         #[cfg(feature = "cardano")]
         "cardano" => crate::cardano::cardano_address_from_raw_to_slice(script, network, out),
         #[cfg(feature = "evm")]
-        "eth" | "evm" => eip55_to_slice(script, out).ok_or(Error::BufferTooSmall),
+        "eth" | "evm" => {
+            if script.len() != 20 {
+                return Err(Error::InvalidScript);
+            }
+            eip55_to_slice(script, out).ok_or(Error::BufferTooSmall)
+        }
         #[cfg(feature = "tron")]
         "tron" => match script {
             [TRON_ADDRESS_PREFIX, hash @ ..] if hash.len() == 20 => {
@@ -123,15 +126,13 @@ pub fn encode_address_to_slice(
         }
         #[cfg(feature = "bitcoin")]
         "p2pkh" | "p2pukh" | "p2sh" => {
-            let (p2sh, inner) = if base == "p2sh" {
-                (true, script.get(1..script.len().saturating_sub(1)))
-            } else {
-                (false, script.get(2..script.len().saturating_sub(2)))
+            // The script must be the exact template of the claimed format.
+            let p2sh = base == "p2sh";
+            let hash = match script {
+                [0x76, 0xa9, 0x14, hash @ .., 0x88, 0xac] if !p2sh && hash.len() == 20 => hash,
+                [0xa9, 0x14, hash @ .., 0x87] if p2sh && hash.len() == 20 => hash,
+                _ => return Err(Error::InvalidScript),
             };
-            let (hash, _) = inner
-                .and_then(parse_push_bytes)
-                .filter(|(hash, _)| hash.len() == 20)
-                .ok_or(Error::InvalidScript)?;
             if matches!(network, "bitcoin-cash" | "bitcoincash") {
                 return Ok(bech32::cashaddr_encode_to_slice(
                     "bitcoincash:",
@@ -149,10 +150,14 @@ pub fn encode_address_to_slice(
         }
         #[cfg(feature = "bitcoin")]
         "p2wpkh" | "p2wsh" | "p2tr" => {
-            let (hash, _) = script
-                .get(1..)
-                .and_then(parse_push_bytes)
-                .ok_or(Error::InvalidScript)?;
+            // The script must be the exact template of the claimed format:
+            // the witness version opcode and one push of the right length.
+            let hash = match (base, script) {
+                ("p2wpkh", [0x00, 0x14, hash @ ..]) if hash.len() == 20 => hash,
+                ("p2wsh", [0x00, 0x20, hash @ ..]) if hash.len() == 32 => hash,
+                ("p2tr", [0x51, 0x20, hash @ ..]) if hash.len() == 32 => hash,
+                _ => return Err(Error::InvalidScript),
+            };
             let (version, hrp) = if base == "p2tr" {
                 let hrp = match network {
                     "bitcoin" => "bc",
@@ -171,12 +176,19 @@ pub fn encode_address_to_slice(
     }
 }
 
-/// Writes the EIP-55 checksummed hex address (`0x...`) for `addr` (normally 20
-/// bytes) into `out`, returning the number of (ASCII) bytes written —
-/// `2 + 2 * addr.len()` — or `None` if `out` is too small.
+/// Writes the EIP-55 checksummed hex address (`0x...`) for the 20-byte `addr`
+/// into `out`, returning the number of (ASCII) bytes written (always 42).
+///
+/// Returns `None` if `addr` is not exactly 20 bytes or `out` is shorter than
+/// 42 bytes.
 #[cfg(feature = "evm")]
 pub fn eip55_to_slice(addr: &[u8], out: &mut [u8]) -> Option<usize> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
+    // The checksum takes one nibble of a 32-byte digest per hex digit, and an
+    // EVM address is 20 bytes: nothing else has an EIP-55 form.
+    if addr.len() != 20 {
+        return None;
+    }
     let len = 2 + addr.len() * 2;
     let out = out.get_mut(..len)?;
     out[0] = b'0';
@@ -202,11 +214,16 @@ pub fn eip55_to_slice(addr: &[u8], out: &mut [u8]) -> Option<usize> {
 }
 
 /// Computes the EIP-55 checksummed hex address (`0x...`) for a 20-byte address.
+///
+/// EIP-55 is only defined for 20-byte addresses: any other length yields an
+/// empty string (use [`eip55_to_slice`] to tell the cases apart).
 #[cfg(all(feature = "alloc", feature = "evm"))]
 pub fn eip55(addr: &[u8]) -> String {
-    let mut buf = vec![0u8; 2 + addr.len() * 2];
-    eip55_to_slice(addr, &mut buf).expect("buffer sized for the address");
-    String::from_utf8(buf).expect("hex output is ASCII")
+    let mut buf = [0u8; 42];
+    match eip55_to_slice(addr, &mut buf) {
+        Some(n) => String::from_utf8(buf[..n].to_vec()).expect("hex output is ASCII"),
+        None => String::new(),
+    }
 }
 
 /// Writes a base58check address built from a version byte and payload into
@@ -289,6 +306,24 @@ impl From<DecodedAddress> for Out {
     }
 }
 
+/// The network of a segwit human-readable part (matched case-insensitively,
+/// as an all-upper-case address is valid) and its canonical lower-case form.
+#[cfg(feature = "bitcoin")]
+fn segwit_network(hrp: &str) -> Option<(&'static str, &'static str)> {
+    const KNOWN: [(&str, &str); 6] = [
+        ("ltc", "litecoin"),
+        ("nc", "namecoin"),
+        ("bc", "bitcoin"),
+        ("tb", "bitcoin-testnet"),
+        ("mona", "monacoin"),
+        ("ep", "electraproto"),
+    ];
+    KNOWN
+        .iter()
+        .copied()
+        .find(|(known, _)| known.eq_ignore_ascii_case(hrp))
+}
+
 /// The single-network flag list for a known network name.
 #[cfg(feature = "bitcoin")]
 fn network_flags(net: &str) -> &'static [&'static str] {
@@ -358,6 +393,22 @@ fn p2sh(hash: &[u8], networks: &'static [&'static str]) -> DecodedAddress {
 
 /// Decodes a Bitcoin-family address for `network`, without allocating. The
 /// special network `"auto"` detects the network from the address.
+///
+/// # Ambiguous base58 versions in `"auto"` mode
+///
+/// Two base58 version bytes are shared between networks, so `"auto"` cannot
+/// tell which one an address belongs to and always picks the P2SH reading:
+///
+/// - `0x32` is Monacoin P2PKH **and** Litecoin P2SH — decoded as Litecoin
+///   P2SH;
+/// - `0x37` is Electraproto P2PKH **and** Monacoin P2SH — decoded as Monacoin
+///   P2SH.
+///
+/// A Monacoin or Electraproto P2PKH address therefore decodes under `"auto"`
+/// to a *different script* (P2SH instead of P2PKH) on a *different network*,
+/// and paying to it would lose the funds. Never rely on `"auto"` for these
+/// versions: pass the explicit network whenever Litecoin, Monacoin or
+/// Electraproto addresses may be involved.
 #[cfg(feature = "bitcoin")]
 pub fn decode_bitcoin_based_address(network: &str, address: &str) -> Result<DecodedAddress, Error> {
     // case 1: explicit bitcoincash: prefix
@@ -372,19 +423,19 @@ pub fn decode_bitcoin_based_address(network: &str, address: &str) -> Result<Deco
     if let Some(pos) = address.rfind('1')
         && pos > 0
     {
+        // The part is matched without regard to case: an all-upper-case
+        // address (as used in QR codes) is valid, and the decoder rejects
+        // mixed case.
         let hrp = &address[..pos];
+        let known = segwit_network(hrp);
+        let expected = known.map_or(hrp, |(lower, _)| lower);
         let mut program = [0u8; 40];
-        if let Ok((version, len)) = bech32::segwit_addr_decode_to_slice(hrp, address, &mut program)
+        if let Ok((version, len)) =
+            bech32::segwit_addr_decode_to_slice(expected, address, &mut program)
         {
             let program = &program[..len];
-            let net = match hrp {
-                "ltc" => "litecoin",
-                "nc" => "namecoin",
-                "bc" => "bitcoin",
-                "tb" => "bitcoin-testnet",
-                "mona" => "monacoin",
-                "ep" => "electraproto",
-                _ => return Err(Error::UnsupportedNetwork),
+            let Some((_, net)) = known else {
+                return Err(Error::UnsupportedNetwork);
             };
             if net != network && network != "auto" {
                 return Err(Error::NetworkMismatch);
@@ -462,6 +513,9 @@ fn decode_base58_versioned(
     hash: &[u8],
 ) -> Result<DecodedAddress, Error> {
     if network == "auto" {
+        // 0x32 (also Monacoin P2PKH) and 0x37 (also Electraproto P2PKH) are
+        // ambiguous and resolve to their P2SH reading: see the warning on
+        // `decode_bitcoin_based_address`.
         return match version {
             0x00 => Ok(p2pkh(hash, &["bitcoin", "bitcoin-cash"])),
             0x05 => Ok(p2sh(hash, &["bitcoin", "bitcoin-cash"])),
@@ -503,6 +557,22 @@ pub fn parse_evm_address(address: &str) -> Result<Out, Error> {
 
 /// Parses a Bitcoin-family address for the given network. The special network
 /// `"auto"` attempts to detect the network from the address.
+///
+/// # Ambiguous base58 versions in `"auto"` mode
+///
+/// Two base58 version bytes are shared between networks, so `"auto"` cannot
+/// tell which one an address belongs to and always picks the P2SH reading:
+///
+/// - `0x32` is Monacoin P2PKH **and** Litecoin P2SH — decoded as Litecoin
+///   P2SH;
+/// - `0x37` is Electraproto P2PKH **and** Monacoin P2SH — decoded as Monacoin
+///   P2SH.
+///
+/// A Monacoin or Electraproto P2PKH address therefore decodes under `"auto"`
+/// to a *different script* (P2SH instead of P2PKH) on a *different network*,
+/// and paying to it would lose the funds. Never rely on `"auto"` for these
+/// versions: pass the explicit network whenever Litecoin, Monacoin or
+/// Electraproto addresses may be involved.
 #[cfg(all(feature = "alloc", feature = "bitcoin"))]
 pub fn parse_bitcoin_based_address(network: &str, address: &str) -> Result<Out, Error> {
     decode_bitcoin_based_address(network, address).map(Out::from)
@@ -541,6 +611,134 @@ mod tests {
         assert_eq!(eip55_to_slice(&addr, &mut out), Some(42));
         assert_eq!(&out, b"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed");
         assert_eq!(eip55_to_slice(&addr, &mut out[..41]), None);
+    }
+
+    /// Only a 20-byte address has an EIP-55 form; longer inputs used to index
+    /// past the 32-byte keccak digest and panic.
+    #[cfg(feature = "evm")]
+    #[test]
+    fn eip55_rejects_other_lengths() {
+        let mut out = [0u8; 2 + 2 * 64];
+        for len in [0, 19, 21, 32, 33, 40, 64] {
+            let addr = [0xabu8; 64];
+            assert_eq!(eip55_to_slice(&addr[..len], &mut out), None, "{len}");
+            for fmt in ["eth", "evm"] {
+                assert_eq!(
+                    encode_address_to_slice(fmt, &addr[..len], "evm", &mut out),
+                    Err(Error::InvalidScript),
+                    "{fmt} {len}"
+                );
+            }
+            #[cfg(feature = "alloc")]
+            assert_eq!(eip55(&addr[..len]), "", "{len}");
+        }
+        assert_eq!(
+            encode_address_to_slice("eth", &[0xab; 20], "evm", &mut out),
+            Ok(42)
+        );
+    }
+
+    /// A script that is not the exact template of the claimed format has no
+    /// address, even when it holds a push of a plausible length.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn render_requires_matching_template() {
+        fn script(parts: &[&[u8]]) -> ScriptBytes {
+            let mut s = ScriptBytes::new();
+            for p in parts {
+                s.extend_from_slice(p).unwrap();
+            }
+            s
+        }
+        let h20 = [0x11u8; 20];
+        let h32 = [0x22u8; 32];
+        let p2pkh = script(&[&[0x76, 0xa9, 0x14], &h20, &[0x88, 0xac]]);
+        let p2sh = script(&[&[0xa9, 0x14], &h20, &[0x87]]);
+        let p2wpkh = script(&[&[0x00, 0x14], &h20]);
+        let p2wsh = script(&[&[0x00, 0x20], &h32]);
+        let p2tr = script(&[&[0x51, 0x20], &h32]);
+        let all: [(&str, &ScriptBytes); 5] = [
+            ("p2pkh", &p2pkh),
+            ("p2sh", &p2sh),
+            ("p2wpkh", &p2wpkh),
+            ("p2wsh", &p2wsh),
+            ("p2tr", &p2tr),
+        ];
+        let mut out = [0u8; MAX_ADDRESS_LEN];
+        for (fmt, _) in all {
+            for (other, s) in all {
+                let r = encode_address_to_slice(fmt, s, "bitcoin", &mut out);
+                if fmt == other {
+                    assert!(r.is_ok(), "{fmt}");
+                } else {
+                    assert_eq!(r, Err(Error::InvalidScript), "{fmt} with a {other} script");
+                }
+            }
+        }
+        // the uncompressed-key variant shares the P2PKH template
+        assert!(encode_address_to_slice("p2pukh", &p2pkh, "bitcoin", &mut out).is_ok());
+        // the same check guards the cashaddr rendering
+        assert!(encode_address_to_slice("p2pkh", &p2pkh, "bitcoin-cash", &mut out).is_ok());
+        assert_eq!(
+            encode_address_to_slice("p2pkh", &p2sh, "bitcoin-cash", &mut out),
+            Err(Error::InvalidScript)
+        );
+        // right pushes, wrong opcodes around them
+        let bad: [(&str, ScriptBytes); 6] = [
+            ("p2pkh", script(&[&[0x76, 0xa9, 0x14], &h20, &[0x88, 0xad]])),
+            ("p2pkh", script(&[&[0x00, 0x00, 0x14], &h20, &[0x00, 0x00]])),
+            ("p2sh", script(&[&[0xa9, 0x14], &h20, &[0x88]])),
+            ("p2wpkh", script(&[&[0x51, 0x14], &h20])),
+            ("p2tr", script(&[&[0x52, 0x20], &h32])),
+            ("p2tr", script(&[&[0x51, 0x20], &h32, &[0x00]])),
+        ];
+        for (fmt, s) in &bad {
+            assert_eq!(
+                encode_address_to_slice(fmt, s, "bitcoin", &mut out),
+                Err(Error::InvalidScript),
+                "{fmt}"
+            );
+        }
+        // a sub-format after the colon does not relax the template
+        assert!(encode_address_to_slice("p2sh:p2wpkh", &p2sh, "bitcoin", &mut out).is_ok());
+        assert!(encode_address_to_slice("p2wsh:p2pkh", &p2wsh, "bitcoin", &mut out).is_ok());
+    }
+
+    /// BIP-173: an all-upper-case address is valid, a mixed-case one is not.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn uppercase_segwit_addresses_decode() {
+        let lower = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        let upper = "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4";
+        let want = decode_bitcoin_based_address("bitcoin", lower).unwrap();
+        assert_eq!(want.format, "p2wpkh");
+        for net in ["bitcoin", "auto"] {
+            assert_eq!(decode_bitcoin_based_address(net, upper), Ok(want), "{net}");
+        }
+        assert_eq!(
+            decode_bitcoin_based_address("litecoin", upper),
+            Err(Error::NetworkMismatch)
+        );
+        // taproot (bech32m), upper-cased
+        let tr = "bc1pgf6m46mr8c55veujxg3qvqxfektwmmpfrt5mhwtvwrzeacmm7xaqdndj5l";
+        let mut buf = [0u8; 62];
+        buf.copy_from_slice(tr.as_bytes());
+        buf.make_ascii_uppercase();
+        let tr_upper = core::str::from_utf8(&buf).unwrap();
+        let want = decode_bitcoin_based_address("auto", tr).unwrap();
+        assert_eq!(want.format, "p2tr");
+        assert_eq!(decode_bitcoin_based_address("auto", tr_upper), Ok(want));
+        // mixed case stays invalid
+        for mixed in [
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3T4",
+            "BC1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            "Bc1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
+        ] {
+            assert!(
+                decode_bitcoin_based_address("auto", mixed).is_err(),
+                "{mixed}"
+            );
+        }
     }
 
     #[cfg(all(feature = "bitcoin", feature = "massa"))]
