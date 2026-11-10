@@ -12,7 +12,7 @@ use super::circuit::{Assignment, Circuit, synthesize};
 use super::commitment::Params;
 use super::plonk::{
     Advice, Any, Column, ConstraintSystem, Fixed, Hex, Instance, PermutationArgument,
-    PinnedConstraintSystem, Selector,
+    PinnedConstraintSystem, Selector, SelectorPlan,
 };
 use super::poly::EvaluationDomain;
 use super::{Error, Value};
@@ -420,6 +420,7 @@ struct Synthesized {
     cs: ConstraintSystem,
     fixed: Vec<Vec<Fp>>,
     permutations: Vec<Vec<Fp>>,
+    selector_plan: Vec<SelectorPlan>,
 }
 
 fn assemble<C: Circuit>(params: &Params, circuit: &C) -> Result<Synthesized, Error> {
@@ -442,7 +443,7 @@ fn assemble<C: Circuit>(params: &Params, circuit: &C) -> Result<Synthesized, Err
     synthesize(&mut assembly, circuit, config, cs.constants.clone())?;
 
     let mut fixed = assembly.fixed;
-    let (cs, selector_polys) = cs.compress_selectors(assembly.selectors);
+    let (cs, selector_polys, selector_plan) = cs.compress_selectors(assembly.selectors);
     fixed.extend(selector_polys);
     let permutations = assembly.permutation.build_permutations(&domain);
     Ok(Synthesized {
@@ -450,30 +451,48 @@ fn assemble<C: Circuit>(params: &Params, circuit: &C) -> Result<Synthesized, Err
         cs,
         fixed,
         permutations,
+        selector_plan,
     })
 }
 
-/// The constraint system and domain of a circuit, as key generation leaves
-/// them, without committing to anything; with the commitments it makes a
-/// verifying key.
-pub(crate) fn vk_from_commitments<C: Circuit>(
-    params: &Params,
+/// Rebuilds a verifying key from what key generation computed for the
+/// same circuit: how the selectors were merged into fixed columns, and the
+/// commitments. The circuit is configured but not synthesized, which makes
+/// this much cheaper than [`keygen_vk`].
+pub(crate) fn vk_from_parts<C: Circuit>(
+    k: u32,
     circuit: &C,
+    selector_plan: &[SelectorPlan],
     fixed_commitments: Vec<vesta::Affine>,
     permutation_commitments: Vec<vesta::Affine>,
 ) -> Result<VerifyingKey, Error> {
-    let s = assemble(params, circuit)?;
-    if fixed_commitments.len() != s.fixed.len()
-        || permutation_commitments.len() != s.permutations.len()
+    let mut cs = ConstraintSystem::default();
+    circuit.configure(&mut cs);
+    let domain = EvaluationDomain::new(cs.degree() as u32, k);
+    let cs = cs
+        .apply_selector_plan(selector_plan)
+        .ok_or(Error::Synthesis)?;
+    if fixed_commitments.len() != cs.num_fixed_columns
+        || permutation_commitments.len() != cs.permutation.columns.len()
     {
         return Err(Error::Synthesis);
     }
     Ok(VerifyingKey::from_parts(
-        s.domain,
+        domain,
         fixed_commitments,
         permutation_commitments,
-        s.cs,
+        cs,
     ))
+}
+
+/// Generates the verifying key of a circuit, and the plan by which its
+/// selectors were merged (see [`vk_from_parts`]).
+pub(crate) fn keygen_vk_with_plan<C: Circuit>(
+    params: &Params,
+    circuit: &C,
+) -> Result<(VerifyingKey, Vec<SelectorPlan>), Error> {
+    let s = assemble(params, circuit)?;
+    Ok((vk_of(params, &s), s.selector_plan))
 }
 
 /// Generates the verifying key of a circuit.

@@ -57,6 +57,19 @@ fn small_circuit_matches_the_reference() {
         lines[2].strip_prefix("pinned=").unwrap()
     );
 
+    // the key is rebuilt from its commitments without synthesis
+    let (vk2, plan) = super::keygen::keygen_vk_with_plan(&params, &mul_circuit()).unwrap();
+    assert_eq!(vk2.transcript_repr(), vk.transcript_repr());
+    let rebuilt = super::keygen::vk_from_parts(
+        4,
+        &mul_circuit(),
+        &plan,
+        vk.fixed_commitments().to_vec(),
+        vk.permutation_commitments().to_vec(),
+    )
+    .unwrap();
+    assert_eq!(rebuilt.transcript_repr(), vk.transcript_repr());
+
     let proof = hex::decode(lines[3].strip_prefix("proof=").unwrap()).unwrap();
     let instance = [Fp::from_u64(42)];
     let instances: [&[&[Fp]]; 2] = [&[&instance], &[&instance]];
@@ -98,8 +111,14 @@ fn small_circuit_matches_the_reference() {
 #[ignore = "slow in the test profile"]
 fn orchard_parameters_match_the_reference() {
     let lines: Vec<&str> = REFERENCE.lines().collect();
-    check_params(&Params::new(11), lines[1], true);
-    check_params(&Params::for_verifier(11, 10), lines[1], false);
+    let t = std::time::Instant::now();
+    let full = Params::new(11);
+    std::eprintln!("Params::new(11): {:?}", t.elapsed());
+    check_params(&full, lines[1], true);
+    let t = std::time::Instant::now();
+    let short = Params::for_verifier(11, 10);
+    std::eprintln!("Params::for_verifier(11, 10): {:?}", t.elapsed());
+    check_params(&short, lines[1], false);
 }
 
 /// Our proofs verify, and are rejected for other public inputs. Set

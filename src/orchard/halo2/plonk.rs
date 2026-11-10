@@ -765,8 +765,12 @@ impl ConstraintSystem {
 
     /// Replaces the selectors by fixed columns, merging simple selectors
     /// that are never active on the same row. Returns the new constraint
-    /// system and the values of the new fixed columns.
-    pub(crate) fn compress_selectors(mut self, selectors: Vec<Vec<bool>>) -> (Self, Vec<Vec<Fp>>) {
+    /// system, the values of the new fixed columns, and the plan that was
+    /// applied (see [`ConstraintSystem::apply_selector_plan`]).
+    pub(crate) fn compress_selectors(
+        self,
+        selectors: Vec<Vec<bool>>,
+    ) -> (Self, Vec<Vec<Fp>>, Vec<SelectorPlan>) {
         assert_eq!(selectors.len(), self.num_selectors);
 
         // The maximum degree of the gates each simple selector is in.
@@ -778,8 +782,7 @@ impl ConstraintSystem {
         }
 
         let max_degree = self.degree();
-        let mut new_columns = vec![];
-        let (polys, selector_assignment) = compress_selectors_process(
+        let (polys, plan) = compress_selectors_process(
             selectors
                 .into_iter()
                 .zip(degrees)
@@ -791,22 +794,68 @@ impl ConstraintSystem {
                 })
                 .collect(),
             max_degree,
-            || {
-                let column = self.fixed_column();
-                new_columns.push(column);
-                Expression::Fixed(FixedQuery {
-                    index: self.query_fixed_index(column),
-                    column_index: column.index,
-                    rotation: Rotation::cur(),
-                })
-            },
         );
+        let cs = self
+            .apply_selector_plan(&plan)
+            .expect("a plan made for this constraint system");
+        (cs, polys, plan)
+    }
 
-        let mut selector_map = vec![None; selector_assignment.len()];
-        let mut selector_replacements = vec![None; selector_assignment.len()];
-        for assignment in selector_assignment {
-            selector_replacements[assignment.selector] = Some(assignment.expression);
+    /// Replaces the selectors by fixed columns according to a plan computed
+    /// by [`ConstraintSystem::compress_selectors`] for the same circuit
+    /// (which lets a verifying key be rebuilt without synthesizing the
+    /// circuit). `None` if the plan does not fit.
+    pub(crate) fn apply_selector_plan(mut self, plan: &[SelectorPlan]) -> Option<Self> {
+        if plan.len() != self.num_selectors {
+            return None;
+        }
+        // One new fixed column per combination, in order.
+        let combinations = plan
+            .iter()
+            .map(|p| p.combination_index + 1)
+            .max()
+            .unwrap_or(0);
+        let mut new_columns = Vec::with_capacity(combinations);
+        let mut queries = Vec::with_capacity(combinations);
+        for _ in 0..combinations {
+            let column = self.fixed_column();
+            new_columns.push(column);
+            queries.push(Expression::Fixed(FixedQuery {
+                index: self.query_fixed_index(column),
+                column_index: column.index,
+                rotation: Rotation::cur(),
+            }));
+        }
+
+        let mut selector_map = vec![None; plan.len()];
+        let mut selector_replacements = vec![None; plan.len()];
+        for assignment in plan {
+            let query = &queries[assignment.combination_index];
+            let expression = if assignment.combination_len == 0 {
+                query.clone()
+            } else {
+                // Nonzero only where the fixed column holds this selector's
+                // root.
+                let assigned_root = Fp::from_u64(assignment.assigned_root as u64);
+                let mut expression = query.clone();
+                let mut root = Fp::ONE;
+                for _ in 0..assignment.combination_len {
+                    if root != assigned_root {
+                        expression = expression * (Expression::Constant(root) - query.clone());
+                    }
+                    root += Fp::ONE;
+                }
+                expression
+            };
+            let slot = selector_replacements.get_mut(assignment.selector)?;
+            if slot.is_some() {
+                return None;
+            }
+            *slot = Some(expression);
             selector_map[assignment.selector] = Some(new_columns[assignment.combination_index]);
+        }
+        if selector_map.iter().any(|a| a.is_none()) {
+            return None;
         }
 
         self.selector_map = selector_map.into_iter().map(|a| a.unwrap()).collect();
@@ -852,7 +901,7 @@ impl ConstraintSystem {
             replace_selectors(expr, &selector_replacements, true);
         }
 
-        (self, polys)
+        Some(self)
     }
 
     /// Allocates a simple selector.
@@ -1007,10 +1056,17 @@ struct SelectorDescription {
     max_degree: usize,
 }
 
-struct SelectorAssignment {
-    selector: usize,
-    combination_index: usize,
-    expression: Expression,
+/// How one selector is replaced by a fixed column: the index of the new
+/// column (among those added), and for a selector sharing its column with
+/// `combination_len - 1` others, the value the column holds where it is
+/// active (`combination_len` is zero for a selector with a column of its
+/// own holding zeros and ones).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SelectorPlan {
+    pub(crate) selector: usize,
+    pub(crate) combination_index: usize,
+    pub(crate) assigned_root: usize,
+    pub(crate) combination_len: usize,
 }
 
 /// `halo2_proofs::plonk::circuit::compress_selectors::process`: greedily
@@ -1019,8 +1075,7 @@ struct SelectorAssignment {
 fn compress_selectors_process(
     mut selectors: Vec<SelectorDescription>,
     max_degree: usize,
-    mut allocate_fixed_column: impl FnMut() -> Expression,
-) -> (Vec<Vec<Fp>>, Vec<SelectorAssignment>) {
+) -> (Vec<Vec<Fp>>, Vec<SelectorPlan>) {
     if selectors.is_empty() {
         return (vec![], vec![]);
     }
@@ -1034,7 +1089,6 @@ fn compress_selectors_process(
     // selectors or do not appear in a gate. Let's address these first.
     selectors.retain(|selector| {
         if selector.max_degree == 0 {
-            let expression = allocate_fixed_column();
             let combination_assignment = selector
                 .activations
                 .iter()
@@ -1042,10 +1096,11 @@ fn compress_selectors_process(
                 .collect::<Vec<_>>();
             let combination_index = combination_assignments.len();
             combination_assignments.push(combination_assignment);
-            selector_assignments.push(SelectorAssignment {
+            selector_assignments.push(SelectorPlan {
                 selector: selector.selector,
                 combination_index,
-                expression,
+                assigned_root: 1,
+                combination_len: 0,
             });
             false
         } else {
@@ -1112,34 +1167,26 @@ fn compress_selectors_process(
         let mut combination_assignment = vec![Fp::ZERO; n];
         let combination_len = combination.len();
         let combination_index = combination_assignments.len();
-        let query = allocate_fixed_column();
 
-        let mut assigned_root = Fp::ONE;
+        let mut assigned_root = 1usize;
         selector_assignments.extend(combination.into_iter().map(|selector| {
-            // The expression is nonzero only where the fixed column holds
-            // this selector's root.
-            let mut expression = query.clone();
-            let mut root = Fp::ONE;
-            for _ in 0..combination_len {
-                if root != assigned_root {
-                    expression = expression * (Expression::Constant(root) - query.clone());
-                }
-                root += Fp::ONE;
-            }
+            let root = Fp::from_u64(assigned_root as u64);
             for (combination, selector) in combination_assignment
                 .iter_mut()
                 .zip(selector.activations.iter())
             {
                 if *selector {
-                    *combination = assigned_root;
+                    *combination = root;
                 }
             }
-            assigned_root += Fp::ONE;
-            SelectorAssignment {
+            let plan = SelectorPlan {
                 selector: selector.selector,
                 combination_index,
-                expression,
-            }
+                assigned_root,
+                combination_len,
+            };
+            assigned_root += 1;
+            plan
         }));
         combination_assignments.push(combination_assignment);
     }
