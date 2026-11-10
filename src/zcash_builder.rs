@@ -36,7 +36,7 @@
 //!
 //! - **The chain context**: the consensus branch id of the network upgrade
 //!   in force when the transaction will be mined
-//!   ([`branch`](crate::zcashtx::branch)), an expiry height and a lock
+//!   ([`zcashtx::branch`](crate::zcashtx::branch)), an expiry height and a lock
 //!   time. A transaction made for one upgrade is invalid under another.
 //! - **Transparent inputs**: the outpoint, the amount and scriptPubKey of
 //!   the output it spends (a P2PKH output), and its private key.
@@ -198,13 +198,15 @@ impl From<crate::orchard::builder::BuildError> for Error {
 /// `BundleVersion::circuit_version` (`src/bundle.rs`) maps those to the
 /// circuits `InsecurePreNu6_2`, `FixedPostNu6_2` and `PostNu6_3`, which
 /// are the versions of
-/// [`CircuitVersion`](crate::orchard::circuit::CircuitVersion). That is
-/// what `zcash_primitives` 0.31.0 builds and verifies transactions with
-/// (`transaction::builder`).
+/// [`CircuitVersion`]. That is
+/// how `zcash_primitives` 0.31.0 reads the Orchard bundle of a v5
+/// transaction (`transaction::components::orchard::bundle_version_for_branch`),
+/// and transactions built here for each of the three versions were
+/// checked to parse and verify with it.
 ///
 /// Later branches are left out on purpose, NU7 included: the same table
-/// gives it `V3`, but that upgrade was not final when this was written
-/// and brings its own transaction format.
+/// gives it `V3`, but it comes with a new transaction format and this
+/// crate cannot tell whether v5 transactions stay valid under it.
 #[cfg(feature = "zcash-orchard-prover")]
 pub const fn orchard_circuit_version(consensus_branch_id: u32) -> Option<CircuitVersion> {
     match consensus_branch_id {
@@ -404,7 +406,7 @@ impl core::fmt::Debug for Builder<'_> {
 
 impl<'k> Builder<'k> {
     /// A builder of a transaction for the network upgrade of
-    /// `consensus_branch_id` (see [`branch`](crate::zcashtx::branch)),
+    /// `consensus_branch_id` (see [`zcashtx::branch`](crate::zcashtx::branch)),
     /// that can no longer be mined from the block height `expiry_height`
     /// (0 for no expiry; wallets use the current height plus 40) nor
     /// before `lock_time` (as in Bitcoin; 0 for no lock, and a lock only
