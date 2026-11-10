@@ -523,7 +523,7 @@ from `purecrypto`. All chains are enabled by default.
 | `zcash-sapling` | `sapling`: Jubjub, ZIP-32 keys, `zs` addresses, notes, note encryption and scanning, RedJubjub, typed bundles | `zcash` |
 | `zcash-orchard` | `orchard`: Pallas/Vesta, Sinsemilla, Poseidon, ZIP-32 keys, unified addresses, notes, note encryption and scanning, RedPallas, typed bundles | `zcash` |
 | `zcash-shielded` | both shielded pools | `zcash-sapling`, `zcash-orchard` |
-| `zcash-sapling-prover` | Sapling Groth16 proofs and shielded builder (not in the default set; in progress) | `zcash-sapling`, `alloc` |
+| `zcash-sapling-prover` | `sapling::groth16`, `sapling::circuit`, `sapling::prover`, `sapling::builder`: Sapling spend and output proofs and a shielded bundle builder. Needs the Sapling parameter files at run time; not in the default set | `zcash-sapling`, `alloc` |
 | `zcash-orchard-prover` | Orchard Halo2 proofs and shielded builder (not in the default set; in progress) | `zcash-orchard`, `alloc` |
 | `monero` | `monero`: addresses, keys, mnemonic seeds, scanning, CLSAG, and with `alloc` transactions, Bulletproofs+ and transaction building | `ed25519` |
 | `zano` | `zano`: addresses, wallet keys, scanning, and with `alloc` transactions, proofs and offline signing | `ed25519` |
