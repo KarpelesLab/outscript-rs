@@ -46,8 +46,10 @@
 //! - `cardano`: Shelley addresses, BIP32-Ed25519 derivation and (with
 //!   `alloc`) `CardanoTx`. Implies `ed25519`.
 //! - `massa`: addresses. Implies `ed25519`.
-//! - `zcash`: transparent addresses, and `zcashtx` (v5 transactions:
-//!   ZIP-244 ids and signature digests, signing). Implies `secp256k1`.
+//! - `zcash`: transparent addresses, `zcashtx` (v5 and v6 transactions:
+//!   ids and signature digests, signing, ZIP-317 fees) and, with `alloc`,
+//!   `zcash_builder` (whole transactions with transparent and shielded
+//!   parts). Implies `secp256k1`.
 //! - `tron`: `T...` addresses, and `trontx` (protobuf transactions: TRX,
 //!   TRC-10 and smart-contract/TRC-20 calls, ids, signing, parsing). Implies
 //!   `secp256k1`.
@@ -105,7 +107,7 @@
 //!   control blocks), `psbt` (BIP-174 creator, updater, signer, combiner,
 //!   finalizer and extractor, including taproot script paths) and `evmraw`
 //!   (legacy/EIP-2930/EIP-1559 signing, encoding, hashing and sender
-//!   recovery), `zcashtx` (v5 transaction serialization, ZIP-244 ids and
+//!   recovery), `zcashtx` (v5/v6 transaction serialization, ZIP-244 ids and
 //!   sighashes, signing), `trontx` (protobuf encoding and parsing, ids,
 //!   signing, signer recovery);
 //! - `cryptonote` (hashing to scalars and points, key derivation, key images,

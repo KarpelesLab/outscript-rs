@@ -29,8 +29,8 @@ All cryptography is provided by the pure-Rust
 | Massa | AU (user) / AS (smart contract) | - |
 | Solana | Base58 (32 bytes) | `SolanaTx` |
 | Cardano | Shelley bech32 (addr / addr_test / stake) | `CardanoTx` |
-| Zcash (transparent) | t1 / t3 base58check (tm / t2 on testnet) | `zcashtx::ZcashTx` (v5, ZIP-244) |
-| Zcash (shielded) | Sapling `zs`, unified `u1` (Orchard, Sapling and transparent receivers) | `sapling` / `orchard`: keys, notes, scanning, signatures, typed bundles |
+| Zcash (transparent) | t1 / t3 base58check (tm / t2 on testnet) | `zcashtx::ZcashTx` (v5 and v6, ZIP-244 / ZIP-229), `zcash_builder::Builder` |
+| Zcash (shielded) | Sapling `zs`, unified `u1` (Orchard, Sapling and transparent receivers) | `sapling` / `orchard` (Orchard and Ironwood pools): keys, notes, scanning, signatures, proofs, bundle builders |
 | Tron | T... base58check | `trontx::TronTx` (TRX, TRC-10, TRC-20 / smart-contract calls) |
 | Monero | standard, integrated and subaddresses (mainnet, testnet, stagenet) | `monero::Transaction`, `monero::TransactionBuilder` (RingCT, CLSAG, Bulletproofs+) |
 | Zano | standard, integrated and auditable | `zano::Transaction`, offline signing of wallet-prepared transactions |
@@ -381,8 +381,11 @@ let txid = tx.txid()?;
 
 `sighash` gives any ZIP-244 signature digest (all hash types, with or without
 `ANYONECANPAY`, and the shielded one), `sign_input_to_slice` one scriptSig,
-and `parse_into` reads a v5 transaction back. Shielded spends and outputs are
-not produced: that needs the Sapling/Orchard provers. Addresses go through
+and `parse_into` reads a v5 or v6 transaction back. Shielded spends and outputs
+(Sapling, Orchard and, in v6, Ironwood) are built with `zcash_builder::Builder`
+and the `zcash-sapling-prover` / `zcash-orchard-prover` features, which also
+verify proofs. Keys, shielded addresses and note scanning are in the `sapling`
+and `orchard` modules. Transparent addresses go through
 `decode_zcash_address` / `parse_zcash_address`, and `encode_address_to_slice`
 with the `zcash` or `zcash-testnet` network.
 
@@ -514,15 +517,15 @@ from `purecrypto`. All chains are enabled by default.
 | `solana` | addresses, program-derived addresses, `SolanaTx` | `ed25519` |
 | `cardano` | Shelley addresses, BIP32-Ed25519 derivation, `CardanoTx` | `ed25519` |
 | `massa` | addresses | `ed25519` |
-| `zcash` | transparent addresses, `zcashtx` (v5 transactions, ZIP-244 ids and sighashes, signing) | `secp256k1` |
+| `zcash` | transparent addresses, `zcashtx` (v5 and v6 transactions, their ids and sighashes, signing, ZIP-317 fees), and with `alloc` `zcash_builder` (one builder for transparent, Sapling, Orchard and Ironwood parts; the shielded parts need the prover features) | `secp256k1` |
 | `tron` | addresses, `trontx` (protobuf transactions: TRX, TRC-10 and smart-contract calls, ids, signing, parsing) | `secp256k1` |
 | `zcash-sapling` | `sapling`: Jubjub, ZIP-32 keys, `zs` addresses, notes, note encryption and scanning, RedJubjub, typed bundles | `zcash` |
 | `zcash-orchard` | `orchard`: Pallas/Vesta, Sinsemilla, Poseidon, ZIP-32 keys, unified addresses, notes, note encryption and scanning, RedPallas, typed bundles | `zcash` |
 | `zcash-shielded` | both shielded pools | `zcash-sapling`, `zcash-orchard` |
 | `zcash-sapling-prover` | `sapling::groth16`, `sapling::circuit`, `sapling::prover`, `sapling::builder`: Sapling spend and output proofs and a shielded bundle builder. Needs the Sapling parameter files at run time; not in the default set | `zcash-sapling`, `alloc` |
 | `zcash-orchard-prover` | `orchard::halo2`, `orchard::circuit`, `orchard::builder`: Orchard Action proofs (create and verify, embedded verifying keys) and a shielded bundle builder. Needs no parameter files; not in the default set | `zcash-orchard`, `alloc` |
-| `monero` | `monero`: addresses, keys, mnemonic seeds, scanning, CLSAG, and with `alloc` transactions, Bulletproofs+ and transaction building | `ed25519` |
-| `zano` | `zano`: addresses, wallet keys, scanning, and with `alloc` transactions, proofs and offline signing | `ed25519` |
+| `monero` | `monero`: addresses, keys, mnemonic seeds (12 languages), scanning over the whole chain history, CLSAG, fee estimates, and with `alloc` transactions, verification of every signature and range-proof type, Bulletproofs+, decoy selection and transaction building | `ed25519` |
+| `zano` | `zano`: addresses, wallet keys, scanning, and with `alloc` transactions of every mainnet era, full transaction verification (incl. assets and PoS proofs), proofs and offline signing | `ed25519` |
 
 The transports are features too, independent of any chain and enabled by
 default:
@@ -593,7 +596,7 @@ Without `alloc` you still get:
   Bitcoin-family, EVM, Tron, Massa, Solana and Cardano addresses.
 - **Transaction signing** — `psbt::Psbt` (the full BIP-174 workflow),
   `btcraw::RawTx` (legacy, BIP-143, taproot and unified sighashes,
-  serialization, txid), `zcashtx::ZcashTx` (v5 serialization, ZIP-244 ids
+  serialization, txid), `zcashtx::ZcashTx` (v5 and v6 serialization, ZIP-244 ids
   and sighashes, signing), `trontx::TronTx` (protobuf encoding and parsing,
   ids, signing, signer recovery) and `evmraw::RawEvmTx`
   (legacy/EIP-2930/EIP-1559 signing, encoding, hash, sender recovery).
