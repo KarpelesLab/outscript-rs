@@ -108,16 +108,16 @@ pub fn guess_out(script: &[u8], pubkey_hint: Option<&PubKey>) -> Out {
     }
 
     if script[0] == 0 {
-        // segwit
-        return match script.len() {
-            22 => Out::make("p2wpkh", script.to_vec(), &[]),
-            34 => Out::make("p2wsh", script.to_vec(), &[]),
+        // segwit v0: OP_0 followed by a single 20- or 32-byte push
+        return match (script.len(), script.get(1)) {
+            (22, Some(0x14)) => Out::make("p2wpkh", script.to_vec(), &[]),
+            (34, Some(0x20)) => Out::make("p2wsh", script.to_vec(), &[]),
             _ => Out::make("invalid", script.to_vec(), &[]),
         };
     }
     if script[0] == 0x51 {
-        // OP_1 (p2tr)
-        if script.len() == 34 {
+        // OP_1 followed by a single 32-byte push (p2tr)
+        if script.len() == 34 && script[1] == 0x20 {
             return Out::make("p2tr", script.to_vec(), &[]);
         }
         return Out::make("invalid", script.to_vec(), &[]);
@@ -215,5 +215,38 @@ mod tests {
         assert_eq!(Out::make("cardano", vec![0x01], &[]).hash(), None);
         // unknown formats have no hash either
         assert_eq!(Out::make("nope", vec![1, 2, 3], &[]).hash(), None);
+    }
+
+    /// Witness programs are recognized by their exact template, not just by
+    /// the first byte and the total length.
+    #[cfg(feature = "bitcoin")]
+    #[test]
+    fn guess_out_requires_exact_witness_templates() {
+        let script = |version: u8, push: u8, len: usize| {
+            let mut s = vec![version, push];
+            s.resize(len, 0x11);
+            s
+        };
+        for (version, push, len, want) in [
+            (0x00, 0x14, 22, "p2wpkh"),
+            (0x00, 0x20, 34, "p2wsh"),
+            (0x51, 0x20, 34, "p2tr"),
+            // right first byte and length, wrong push opcode
+            (0x00, 0x15, 22, "invalid"),
+            (0x00, 0x20, 22, "invalid"),
+            (0x00, 0x14, 34, "invalid"),
+            (0x00, 0x21, 34, "invalid"),
+            (0x51, 0x21, 34, "invalid"),
+            (0x51, 0x14, 34, "invalid"),
+            // wrong length
+            (0x00, 0x14, 21, "invalid"),
+            (0x00, 0x20, 35, "invalid"),
+            (0x51, 0x20, 33, "invalid"),
+        ] {
+            let s = script(version, push, len);
+            assert_eq!(guess_out(&s, None).name, want, "{}", hex::encode(&s));
+        }
+        assert_eq!(guess_out(&[0x00], None).name, "invalid");
+        assert_eq!(guess_out(&[0x51], None).name, "invalid");
     }
 }
