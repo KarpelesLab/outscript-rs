@@ -507,9 +507,7 @@ mod tests {
                 Some(s.note)
             );
             assert_eq!(
-                try_output_recovery_with_ovk(
-                    &s.ovk, &s.cv, &s.cmu, &s.epk, &s.enc, &s.out, zip212
-                ),
+                try_output_recovery_with_ovk(&s.ovk, &s.cv, &s.cmu, &s.epk, &s.enc, &s.out, zip212),
                 Some((s.note, s.memo))
             );
         }
@@ -561,13 +559,7 @@ mod tests {
         identity_with_sign[0] = 1;
         identity_with_sign[31] = 0x80;
         assert_eq!(
-            try_compact_note_decryption(
-                &s.ivk,
-                &identity_with_sign,
-                &s.cmu,
-                &compact(&s.enc),
-                On
-            ),
+            try_compact_note_decryption(&s.ivk, &identity_with_sign, &s.cmu, &compact(&s.enc), On),
             None
         );
         // tampered ciphertexts
@@ -649,11 +641,8 @@ mod tests {
         let seal = |pt: &[u8; NOTE_PLAINTEXT_SIZE]| {
             let mut enc = [0u8; ENC_CIPHERTEXT_SIZE];
             enc[..NOTE_PLAINTEXT_SIZE].copy_from_slice(pt);
-            let tag = ChaCha20Poly1305::new(&key).encrypt(
-                &NONCE,
-                &[],
-                &mut enc[..NOTE_PLAINTEXT_SIZE],
-            );
+            let tag =
+                ChaCha20Poly1305::new(&key).encrypt(&NONCE, &[], &mut enc[..NOTE_PLAINTEXT_SIZE]);
             enc[NOTE_PLAINTEXT_SIZE..].copy_from_slice(&tag);
             enc
         };

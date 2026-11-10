@@ -187,8 +187,14 @@ impl Point {
     /// The sum of two points (complete: valid for every pair of inputs).
     pub const fn add(&self, rhs: &Point) -> Point {
         // add-2008-hwcd-3 for a = -1
-        let a = self.v.const_sub(&self.u).const_mul(&rhs.v.const_sub(&rhs.u));
-        let b = self.v.const_add(&self.u).const_mul(&rhs.v.const_add(&rhs.u));
+        let a = self
+            .v
+            .const_sub(&self.u)
+            .const_mul(&rhs.v.const_sub(&rhs.u));
+        let b = self
+            .v
+            .const_add(&self.u)
+            .const_mul(&rhs.v.const_add(&rhs.u));
         let c = self.t.const_mul(&D2).const_mul(&rhs.t);
         let d = self.z.double().const_mul(&rhs.z);
         let e = b.const_sub(&a);
@@ -210,7 +216,12 @@ impl Point {
         let b = self.v.square();
         let c = self.z.square().double();
         let d = a.const_neg();
-        let e = self.u.const_add(&self.v).square().const_sub(&a).const_sub(&b);
+        let e = self
+            .u
+            .const_add(&self.v)
+            .square()
+            .const_sub(&a)
+            .const_sub(&b);
         let g = d.const_add(&b);
         let f = g.const_sub(&c);
         let h = d.const_sub(&b);

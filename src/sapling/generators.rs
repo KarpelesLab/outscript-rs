@@ -402,9 +402,6 @@ mod tests {
         assert_eq!(to_montgomery(&two), Some((Fq::ZERO, Fq::ZERO)));
         // A = 2 (a + d) / (a - d)
         let a = -Fq::ONE;
-        assert_eq!(
-            MONTGOMERY_A * (a - D),
-            (a + D).double()
-        );
+        assert_eq!(MONTGOMERY_A * (a - D), (a + D).double());
     }
 }

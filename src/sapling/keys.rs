@@ -92,10 +92,11 @@ pub(crate) fn bech32_encode<'a>(
     data: &[u8],
     out: &'a mut [u8],
 ) -> Result<&'a str, Error> {
-    let n = bech32::encode_to_slice(hrp, data, bech32::Variant::Bech32, out).map_err(|e| match e {
-        bech32::Error::BufferTooSmall => Error::BufferTooSmall,
-        e => Error::Bech32(e),
-    })?;
+    let n =
+        bech32::encode_to_slice(hrp, data, bech32::Variant::Bech32, out).map_err(|e| match e {
+            bech32::Error::BufferTooSmall => Error::BufferTooSmall,
+            e => Error::Bech32(e),
+        })?;
     // the bech32 alphabet and the prefixes are ASCII
     core::str::from_utf8(&out[..n]).map_err(|_| Error::InvalidEncoding)
 }
@@ -777,7 +778,10 @@ mod tests {
         );
         // a zero ivk has no addresses
         let zero = IncomingViewingKey::from_bytes(&[0; 32]).unwrap();
-        assert_eq!(zero.to_payment_address(*sample_address().diversifier()), None);
+        assert_eq!(
+            zero.to_payment_address(*sample_address().diversifier()),
+            None
+        );
     }
 
     #[test]

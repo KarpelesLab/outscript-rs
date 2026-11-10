@@ -337,8 +337,7 @@ impl PartialEq for ExtendedSpendingKey {
     fn eq(&self, other: &Self) -> bool {
         let secret = self.expsk == other.expsk
             && bool::from(
-                self.dk.0.ct_eq(&other.dk.0)
-                    & self.meta.chain_code.ct_eq(&other.meta.chain_code),
+                self.dk.0.ct_eq(&other.dk.0) & self.meta.chain_code.ct_eq(&other.meta.chain_code),
             );
         secret && self.meta == other.meta
     }
@@ -929,18 +928,14 @@ mod tests {
             Some(Error::MaxDepthExceeded)
         );
         assert_eq!(
-            deepest
-                .to_extended_full_viewing_key()
-                .derive_child(0)
-                .err(),
+            deepest.to_extended_full_viewing_key().derive_child(0).err(),
             Some(Error::MaxDepthExceeded)
         );
     }
 
     #[test]
     fn bech32_encodings() {
-        let account =
-            ExtendedSpendingKey::from_seed_account(&seed(), COIN_TYPE_TEST, 7).unwrap();
+        let account = ExtendedSpendingKey::from_seed_account(&seed(), COIN_TYPE_TEST, 7).unwrap();
         let xfvk = account.to_extended_full_viewing_key();
         let mut buf = [0u8; EXTENDED_KEY_MAX_ENCODED_LEN];
         for network in Network::ALL {
@@ -963,11 +958,7 @@ mod tests {
         }
         let s = account.encode(Network::Regtest, &mut buf).unwrap();
         assert_eq!(s.len(), EXTENDED_KEY_MAX_ENCODED_LEN);
-        assert!(
-            account
-                .encode(Network::Main, &mut buf[..100])
-                .is_err()
-        );
+        assert!(account.encode(Network::Main, &mut buf[..100]).is_err());
         assert_eq!(
             format!("{account:?}"),
             "ExtendedSpendingKey(depth 3, index 2147483655, ..)"

@@ -556,9 +556,8 @@ mod tests {
             s: &str,
             from: impl Fn(u64) -> F,
         ) -> F {
-            s.bytes().fold(from(0), |acc, d| {
-                acc * from(10) + from(u64::from(d - b'0'))
-            })
+            s.bytes()
+                .fold(from(0), |acc, d| acc * from(10) + from(u64::from(d - b'0')))
         }
         // q - 1 and r - 1, which are representable
         assert_eq!(
@@ -601,7 +600,11 @@ mod tests {
         }
         // 7 generates the multiplicative group, so it is not a square
         assert!(Fq::MULTIPLICATIVE_GENERATOR.sqrt().is_none());
-        assert!((Fq::MULTIPLICATIVE_GENERATOR * Fq::from_u64(9)).sqrt().is_none());
+        assert!(
+            (Fq::MULTIPLICATIVE_GENERATOR * Fq::from_u64(9))
+                .sqrt()
+                .is_none()
+        );
     }
 
     #[test]

@@ -31,7 +31,7 @@
 //! chunk encoding and segment generators ([`pedersen`]), and the bit
 //! decompositions the circuits consume ([`pedersen::Bits`], [`note`]).
 
-// TMP pub mod bundle;
+pub mod bundle;
 pub mod field;
 pub mod generators;
 pub mod group_hash;

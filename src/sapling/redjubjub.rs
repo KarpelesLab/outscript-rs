@@ -147,11 +147,7 @@ pub fn sign_spend(ask: &Fr, alpha: &Fr, sighash: &[u8; 32], random: &[u8; 80]) -
 }
 
 /// Verifies a spend authorization signature under `rk`.
-pub fn verify_spend(
-    rk: &[u8; 32],
-    sighash: &[u8; 32],
-    signature: &Signature,
-) -> Result<(), Error> {
+pub fn verify_spend(rk: &[u8; 32], sighash: &[u8; 32], signature: &Signature) -> Result<(), Error> {
     verify(SigType::SpendAuth, rk, sighash, signature)
 }
 
@@ -191,11 +187,7 @@ pub fn sign_binding(bsk: &Fr, sighash: &[u8; 32], random: &[u8; 80]) -> Signatur
 }
 
 /// Verifies a binding signature under the binding validating key.
-pub fn verify_binding(
-    bvk: &Point,
-    sighash: &[u8; 32],
-    signature: &Signature,
-) -> Result<(), Error> {
+pub fn verify_binding(bvk: &Point, sighash: &[u8; 32], signature: &Signature) -> Result<(), Error> {
     verify(SigType::Binding, &bvk.to_bytes(), sighash, signature)
 }
 
@@ -211,46 +203,49 @@ mod tests {
     fn sapling_signatures() {
         let nonces = rows(include_str!("testdata/redjubjub_nonces.json"));
         let mut seen = 0;
-        for_each_row(include_str!("testdata/sapling_signatures.json"), |i, row| {
-            seen += 1;
-            let nonce = |j: usize| -> [u8; 80] {
-                hex::decode(nonces[i][j].as_str().unwrap())
-                    .unwrap()
-                    .try_into()
-                    .unwrap()
-            };
-            let sk = Fr::from_bytes(&row.array("sk")).unwrap();
-            let vk = verification_key(SigType::SpendAuth, &sk);
-            assert_eq!(vk.to_bytes(), row.array::<32>("vk"));
-            let alpha = Fr::from_bytes(&row.array("alpha")).unwrap();
-            let rsk = randomize_private(&sk, &alpha);
-            assert_eq!(rsk.to_bytes(), row.array::<32>("rsk"));
-            let rvk = randomized_spend_key(&vk, &alpha);
-            assert_eq!(rvk.to_bytes(), row.array::<32>("rvk"));
-            assert_eq!(verification_key(SigType::SpendAuth, &rsk), rvk);
+        for_each_row(
+            include_str!("testdata/sapling_signatures.json"),
+            |i, row| {
+                seen += 1;
+                let nonce = |j: usize| -> [u8; 80] {
+                    hex::decode(nonces[i][j].as_str().unwrap())
+                        .unwrap()
+                        .try_into()
+                        .unwrap()
+                };
+                let sk = Fr::from_bytes(&row.array("sk")).unwrap();
+                let vk = verification_key(SigType::SpendAuth, &sk);
+                assert_eq!(vk.to_bytes(), row.array::<32>("vk"));
+                let alpha = Fr::from_bytes(&row.array("alpha")).unwrap();
+                let rsk = randomize_private(&sk, &alpha);
+                assert_eq!(rsk.to_bytes(), row.array::<32>("rsk"));
+                let rvk = randomized_spend_key(&vk, &alpha);
+                assert_eq!(rvk.to_bytes(), row.array::<32>("rvk"));
+                assert_eq!(verification_key(SigType::SpendAuth, &rsk), rvk);
 
-            let m = row.bytes("m");
-            let sig = Signature(row.array("sig"));
-            let rsig = Signature(row.array("rsig"));
-            assert_eq!(sign(SigType::SpendAuth, &sk, &m, &nonce(0)), sig);
-            assert_eq!(sign(SigType::SpendAuth, &rsk, &m, &nonce(1)), rsig);
-            let sighash: [u8; 32] = m.clone().try_into().unwrap();
-            assert_eq!(sign_spend(&sk, &alpha, &sighash, &nonce(1)), rsig);
+                let m = row.bytes("m");
+                let sig = Signature(row.array("sig"));
+                let rsig = Signature(row.array("rsig"));
+                assert_eq!(sign(SigType::SpendAuth, &sk, &m, &nonce(0)), sig);
+                assert_eq!(sign(SigType::SpendAuth, &rsk, &m, &nonce(1)), rsig);
+                let sighash: [u8; 32] = m.clone().try_into().unwrap();
+                assert_eq!(sign_spend(&sk, &alpha, &sighash, &nonce(1)), rsig);
 
-            let (vk, rvk) = (vk.to_bytes(), rvk.to_bytes());
-            assert_eq!(verify(SigType::SpendAuth, &vk, &m, &sig), Ok(()));
-            assert_eq!(verify_spend(&rvk, &sighash, &rsig), Ok(()));
-            let bad = Err(Error::InvalidSignature);
-            assert_eq!(verify(SigType::SpendAuth, &vk, &m, &rsig), bad);
-            assert_eq!(verify(SigType::SpendAuth, &rvk, &m, &sig), bad);
-            assert_eq!(verify(SigType::Binding, &vk, &m, &sig), bad);
-            assert_eq!(verify(SigType::SpendAuth, &vk, &m[..31], &sig), bad);
-            for flip in [0, 31, 32, 63] {
-                let mut tampered = sig;
-                tampered.0[flip] ^= 1;
-                assert_eq!(verify(SigType::SpendAuth, &vk, &m, &tampered), bad);
-            }
-        });
+                let (vk, rvk) = (vk.to_bytes(), rvk.to_bytes());
+                assert_eq!(verify(SigType::SpendAuth, &vk, &m, &sig), Ok(()));
+                assert_eq!(verify_spend(&rvk, &sighash, &rsig), Ok(()));
+                let bad = Err(Error::InvalidSignature);
+                assert_eq!(verify(SigType::SpendAuth, &vk, &m, &rsig), bad);
+                assert_eq!(verify(SigType::SpendAuth, &rvk, &m, &sig), bad);
+                assert_eq!(verify(SigType::Binding, &vk, &m, &sig), bad);
+                assert_eq!(verify(SigType::SpendAuth, &vk, &m[..31], &sig), bad);
+                for flip in [0, 31, 32, 63] {
+                    let mut tampered = sig;
+                    tampered.0[flip] ^= 1;
+                    assert_eq!(verify(SigType::SpendAuth, &vk, &m, &tampered), bad);
+                }
+            },
+        );
         assert_eq!(seen, 10);
     }
 
