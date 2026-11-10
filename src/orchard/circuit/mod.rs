@@ -109,6 +109,65 @@ impl CircuitVersion {
         CircuitVersion::PostNu6_3,
     ];
 
+    /// The circuit version of the Orchard pool under a consensus branch
+    /// (the `nConsensusBranchId` of a transaction), or `None` for a branch
+    /// without Orchard (before NU5) or not known here.
+    ///
+    /// The mapping is that of the reference implementation:
+    /// `BranchId::orchard_protocol_revision` of `zcash_protocol` 0.11.0
+    /// (NU5, NU6 and NU6.1 give `InsecureV1`, NU6.2 `V2`, NU6.3 and NU7
+    /// `V3`), which `BundleVersion::circuit_version` of `orchard` 0.16.0
+    /// maps to the circuit versions in this order. The branch ids are those
+    /// of `zcash_protocol` and of ZIPs 252 (NU5), 253 (NU6), 255 (NU6.1),
+    /// 257 (NU6.2: "This changes the Orchard verifying key"), 258 (NU6.3)
+    /// and 259 (NU7).
+    ///
+    /// This is about the Orchard pool only: the Ironwood pool NU6.3
+    /// introduces, which shares the NU6.3 circuit, is not handled by this
+    /// module.
+    pub const fn for_branch_id(consensus_branch_id: u32) -> Option<Self> {
+        match consensus_branch_id {
+            // NU5, NU6, NU6.1
+            0xc2d6_d0b4 | 0xc8e7_1055 | 0x4dec_4df0 => Some(CircuitVersion::InsecurePreNu6_2),
+            // NU6.2
+            0x5437_f330 => Some(CircuitVersion::FixedPostNu6_2),
+            // NU6.3, NU7
+            0x37a5_165b | 0x7719_0ad9 => Some(CircuitVersion::PostNu6_3),
+            _ => None,
+        }
+    }
+
+    /// The circuit version of the Orchard pool for a transaction mined at
+    /// `height` on `network`, or `None` before NU5 and on a regression test
+    /// network (whose activation heights are a matter of configuration).
+    ///
+    /// The activation heights are those of `zcash_protocol` 0.11.0
+    /// (`MainNetwork` and `TestNetwork`) and of ZIPs 252, 257 and 258: NU5
+    /// at 1 687 104 on the main network and 1 842 420 on the test network,
+    /// NU6.2 at 3 364 600 and 4 052 000, NU6.3 at 3 428 143 and 4 134 000.
+    /// No later upgrade known here (NU7, at 3 543 405 and 4 465 026)
+    /// changes the circuit.
+    ///
+    /// (Shortly before NU6.2, from heights 3 363 426 and 4 048 500, the
+    /// networks accepted no Orchard action at all, see ZIP 257; this
+    /// function does not tell.)
+    pub const fn for_height(network: super::unified::Network, height: u32) -> Option<Self> {
+        let (nu5, nu6_2, nu6_3) = match network {
+            super::unified::Network::Main => (1_687_104, 3_364_600, 3_428_143),
+            super::unified::Network::Test => (1_842_420, 4_052_000, 4_134_000),
+            super::unified::Network::Regtest => return None,
+        };
+        if height < nu5 {
+            None
+        } else if height < nu6_2 {
+            Some(CircuitVersion::InsecurePreNu6_2)
+        } else if height < nu6_3 {
+            Some(CircuitVersion::FixedPostNu6_2)
+        } else {
+            Some(CircuitVersion::PostNu6_3)
+        }
+    }
+
     /// Whether the circuit enforces the `disableCrossAddress` public input
     /// (which must be zero for the versions that do not).
     pub const fn supports_cross_address_restriction(self) -> bool {

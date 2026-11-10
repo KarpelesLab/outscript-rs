@@ -255,3 +255,48 @@ fn mainnet_proof_verifies() {
         );
     }
 }
+
+/// The circuit version of each consensus branch and height, as
+/// `zcash_protocol` 0.11.0 and `orchard` 0.16.0 give them.
+#[test]
+fn circuit_version_selection() {
+    use crate::orchard::unified::Network;
+    use CircuitVersion::*;
+    for (branch, expected) in [
+        (0u32, None),
+        (0x5ba8_1b19, None),
+        (0x76b8_09bb, None),
+        (0x2bb4_0e60, None),
+        (0xf5b9_230b, None),
+        (0xe9ff_75a6, None),
+        (0xc2d6_d0b4, Some(InsecurePreNu6_2)),
+        (0xc8e7_1055, Some(InsecurePreNu6_2)),
+        (0x4dec_4df0, Some(InsecurePreNu6_2)),
+        (0x5437_f330, Some(FixedPostNu6_2)),
+        (0x37a5_165b, Some(PostNu6_3)),
+        (0x7719_0ad9, Some(PostNu6_3)),
+        (0xffff_ffff, None),
+    ] {
+        assert_eq!(CircuitVersion::for_branch_id(branch), expected);
+    }
+    for (network, height, expected) in [
+        (Network::Main, 0, None),
+        (Network::Main, 1_687_103, None),
+        (Network::Main, 1_687_104, Some(InsecurePreNu6_2)),
+        (Network::Main, 3_364_599, Some(InsecurePreNu6_2)),
+        (Network::Main, 3_364_600, Some(FixedPostNu6_2)),
+        (Network::Main, 3_428_142, Some(FixedPostNu6_2)),
+        (Network::Main, 3_428_143, Some(PostNu6_3)),
+        (Network::Main, 3_543_405, Some(PostNu6_3)),
+        (Network::Main, u32::MAX, Some(PostNu6_3)),
+        (Network::Test, 1_842_419, None),
+        (Network::Test, 1_842_420, Some(InsecurePreNu6_2)),
+        (Network::Test, 4_051_999, Some(InsecurePreNu6_2)),
+        (Network::Test, 4_052_000, Some(FixedPostNu6_2)),
+        (Network::Test, 4_133_999, Some(FixedPostNu6_2)),
+        (Network::Test, 4_134_000, Some(PostNu6_3)),
+        (Network::Regtest, 4_134_000, None),
+    ] {
+        assert_eq!(CircuitVersion::for_height(network, height), expected);
+    }
+}
