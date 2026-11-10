@@ -137,10 +137,14 @@ pub mod hash;
 pub mod inline;
 #[cfg(feature = "massa")]
 pub mod massa;
+#[cfg(feature = "zcash-orchard")]
+pub mod orchard;
 #[cfg(feature = "bitcoin")]
 pub mod psbt;
 pub mod pubkey;
 pub mod pushbytes;
+#[cfg(feature = "zcash-sapling")]
+pub mod sapling;
 pub mod script;
 #[cfg(feature = "solana")]
 pub mod solana;
@@ -154,10 +158,6 @@ pub mod tron;
 pub mod trontx;
 #[cfg(feature = "zcash")]
 pub mod zcash;
-#[cfg(feature = "zcash-orchard")]
-pub mod orchard;
-#[cfg(feature = "zcash-sapling")]
-pub mod sapling;
 #[cfg(feature = "zcash")]
 pub mod zcashtx;
 
