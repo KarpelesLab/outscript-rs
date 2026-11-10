@@ -15,8 +15,9 @@
 //! re-exports (`psbt::Error`, `btctx::Error` and `outscript::Error` are the
 //! same type), so `?` composes across modules. The self-contained codecs
 //! ([`base58`], [`base64`], [`bech32`], `bcur`, `bbqr`, `cbor`, `rlp`,
-//! `crypto::secp256k1` and Solana's compact-u16) keep their own
-//! small error types, which convert into [`Error`].
+//! `crypto::secp256k1`, `cryptonote` and Solana's compact-u16) keep their own
+//! small error types, which convert into [`Error`]; so do the `monero` and
+//! `zano` modules.
 //!
 //! # Secrets
 //!
@@ -50,6 +51,14 @@
 //! - `tron`: `T...` addresses, and `trontx` (protobuf transactions: TRX,
 //!   TRC-10 and smart-contract/TRC-20 calls, ids, signing, parsing). Implies
 //!   `secp256k1`.
+//! - `monero`: the `monero` module, on the shared `cryptonote` primitives.
+//!   Implies `cryptonote`.
+//! - `zano`: the `zano` module, on the shared `cryptonote` primitives.
+//!   Implies `cryptonote`.
+//! - `cryptonote`: what the CryptoNote family shares (the `cryptonote`
+//!   module) — Keccak hashing to scalars and points, one-time key derivation,
+//!   key images, the varint, the block-wise base58 and the address framing.
+//!   Implies `ed25519`.
 //! - `secp256k1` / `ed25519`: the raw [`crypto`] helpers and the matching
 //!   [`PubKey`] variant, without any chain.
 //!
@@ -88,6 +97,8 @@
 //!   recovery), `zcashtx` (v5 transaction serialization, ZIP-244 ids and
 //!   sighashes, signing), `trontx` (protobuf encoding and parsing, ids,
 //!   signing, signer recovery);
+//! - `cryptonote` (hashing to scalars and points, key derivation, key images,
+//!   signatures, varint, base58 and address framing);
 //! - `solana` keys, program-derived addresses and compact-u16; `evmabi`
 //!   selectors, words and ERC-20 calldata; `BtcAmount` parsing/formatting;
 //!   `btcguess` script heuristics;
@@ -129,6 +140,8 @@ pub mod cardano;
 #[cfg(feature = "cardano")]
 pub mod cardano_derive;
 pub mod crypto;
+#[cfg(feature = "cryptonote")]
+pub mod cryptonote;
 #[cfg(feature = "evm")]
 pub mod evmabi;
 #[cfg(feature = "evm")]
@@ -137,6 +150,8 @@ pub mod hash;
 pub mod inline;
 #[cfg(feature = "massa")]
 pub mod massa;
+#[cfg(feature = "monero")]
+pub mod monero;
 #[cfg(feature = "zcash-orchard")]
 pub mod orchard;
 #[cfg(feature = "bitcoin")]
@@ -156,6 +171,8 @@ pub mod taproot;
 pub mod tron;
 #[cfg(feature = "tron")]
 pub mod trontx;
+#[cfg(feature = "zano")]
+pub mod zano;
 #[cfg(feature = "zcash")]
 pub mod zcash;
 #[cfg(feature = "zcash")]

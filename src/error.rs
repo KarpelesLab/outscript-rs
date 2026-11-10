@@ -7,7 +7,8 @@
 /// wrapping. The self-contained codecs keep their own small error types
 /// ([`base58`](crate::base58), [`base64`](crate::base64),
 /// [`bech32`](crate::bech32), `bcur`, `bbqr`, `cbor`, `rlp`,
-/// `crypto::secp256k1` and Solana's compact-u16), which convert into this one.
+/// `crypto::secp256k1`, `cryptonote` and Solana's compact-u16), which convert
+/// into this one, as do the `monero` and `zano` modules.
 ///
 /// Each module re-exports this type, so `psbt::Error`, `btctx::Error` and
 /// `outscript::Error` all name it.
@@ -223,6 +224,17 @@ pub enum Error {
     /// An RLP error.
     #[cfg(feature = "alloc")]
     Rlp(crate::rlp::Error),
+
+    // --- CryptoNote family ---
+    /// A CryptoNote primitive error (varint, base58, address framing, keys).
+    #[cfg(feature = "cryptonote")]
+    CryptoNote(crate::cryptonote::Error),
+    /// A Monero error.
+    #[cfg(feature = "monero")]
+    Monero(crate::monero::Error),
+    /// A Zano error.
+    #[cfg(feature = "zano")]
+    Zano(crate::zano::Error),
 }
 
 impl core::fmt::Display for Error {
@@ -338,6 +350,12 @@ impl core::fmt::Display for Error {
             Error::Cbor(e) => e.fmt(f),
             #[cfg(feature = "alloc")]
             Error::Rlp(e) => e.fmt(f),
+            #[cfg(feature = "cryptonote")]
+            Error::CryptoNote(e) => e.fmt(f),
+            #[cfg(feature = "monero")]
+            Error::Monero(e) => e.fmt(f),
+            #[cfg(feature = "zano")]
+            Error::Zano(e) => e.fmt(f),
         }
     }
 }
@@ -416,6 +434,30 @@ impl From<crate::cbor::Error> for Error {
 impl From<crate::rlp::Error> for Error {
     fn from(e: crate::rlp::Error) -> Self {
         Error::Rlp(e)
+    }
+}
+
+#[cfg(feature = "cryptonote")]
+impl From<crate::cryptonote::Error> for Error {
+    fn from(e: crate::cryptonote::Error) -> Self {
+        match e {
+            crate::cryptonote::Error::BufferTooSmall => Error::BufferTooSmall,
+            e => Error::CryptoNote(e),
+        }
+    }
+}
+
+#[cfg(feature = "monero")]
+impl From<crate::monero::Error> for Error {
+    fn from(e: crate::monero::Error) -> Self {
+        Error::Monero(e)
+    }
+}
+
+#[cfg(feature = "zano")]
+impl From<crate::zano::Error> for Error {
+    fn from(e: crate::zano::Error) -> Self {
+        Error::Zano(e)
     }
 }
 

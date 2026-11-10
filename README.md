@@ -517,6 +517,8 @@ from `purecrypto`. All chains are enabled by default.
 | `massa` | addresses | `ed25519` |
 | `zcash` | transparent addresses, `zcashtx` (v5 transactions, ZIP-244 ids and sighashes, signing) | `secp256k1` |
 | `tron` | addresses, `trontx` (protobuf transactions: TRX, TRC-10 and smart-contract calls, ids, signing, parsing) | `secp256k1` |
+| `monero` | Monero (`monero` module), on the shared `cryptonote` primitives | `ed25519` |
+| `zano` | Zano (`zano` module), on the shared `cryptonote` primitives | `ed25519` |
 
 The transports are features too, independent of any chain and enabled by
 default:

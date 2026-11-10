@@ -20,7 +20,7 @@ name = "outscript"
 # Chains are opt-in: each chain feature enables its modules, formats and
 # address codecs, and pulls in only the curve arithmetic it needs. The default
 # enables every chain.
-default = ["std", "bitcoin", "evm", "solana", "cardano", "massa", "zcash", "zcash-sapling", "zcash-orchard", "tron", "bcur", "bbqr"]
+default = ["std", "bitcoin", "evm", "solana", "cardano", "massa", "zcash", "zcash-sapling", "zcash-orchard", "tron", "monero", "zano", "bcur", "bbqr"]
 std = [
     "alloc",
     "purecrypto/std",
@@ -65,6 +65,18 @@ zcash-shielded = ["zcash-sapling", "zcash-orchard"]
 # Tron: addresses and `trontx` (protobuf transactions: TRX, TRC-10 and
 # smart-contract calls, ids, signing).
 tron = ["secp256k1"]
+# Monero: the `monero` module (addresses, keys and transactions), built on
+# the shared `cryptonote` primitives.
+monero = ["cryptonote"]
+# Zano: the `zano` module (addresses, keys and transactions), built on the
+# shared `cryptonote` primitives.
+zano = ["cryptonote"]
+
+# --- shared chain foundations (enabled by the chains above) ---
+# The `cryptonote` module, common to the CryptoNote family (Monero, Zano):
+# Keccak hashing to scalars and points, one-time key derivation, key images,
+# the varint, the block-wise base58 and the address framing.
+cryptonote = ["ed25519"]
 
 # --- transports (chain-independent text encodings for moving PSBTs and other
 # payloads between devices, typically as QR codes; only the strings are
