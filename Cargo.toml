@@ -56,7 +56,7 @@ massa = ["ed25519"]
 zcash = ["secp256k1"]
 # Zcash Sapling shielded pool: Jubjub, ZIP-32 keys, `zs` addresses, notes,
 # note encryption and scanning, RedJubjub, Sapling bundles.
-zcash-sapling = ["zcash"]
+zcash-sapling = ["zcash", "purecrypto/cipher"]
 # Zcash Orchard shielded pool: Pallas/Vesta, ZIP-32 keys, unified addresses,
 # notes, note encryption and scanning, RedPallas, Orchard bundles.
 zcash-orchard = ["zcash"]
