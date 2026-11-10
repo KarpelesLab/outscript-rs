@@ -35,7 +35,15 @@ pub enum Error {
     InvalidHex,
     /// An integer field is longer than 8 bytes.
     IntegerTooLong,
+    /// Lists are nested deeper than [`MAX_DEPTH`].
+    TooDeep,
 }
+
+/// The deepest list nesting [`decode`] and [`decode_one`] accept: a list
+/// directly in the input is at depth 1. Deeper input fails with
+/// [`Error::TooDeep`], which bounds the recursion of decoding, and of
+/// encoding, comparing and dropping what was decoded.
+pub const MAX_DEPTH: usize = 32;
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -47,6 +55,7 @@ impl core::fmt::Display for Error {
             Error::StringPrefix => f.write_str("string must start with 0x"),
             Error::InvalidHex => f.write_str("invalid hex string"),
             Error::IntegerTooLong => f.write_str("integer field longer than 8 bytes"),
+            Error::TooDeep => f.write_str("lists nested too deeply"),
         }
     }
 }
@@ -112,6 +121,10 @@ impl RlpItem {
     }
 
     /// Decodes a `0x`-prefixed hex string into a byte string item.
+    ///
+    /// An odd number of digits is read as a number, with a leading zero
+    /// digit. Do not use this for fixed-size data such as addresses, where a
+    /// missing digit must be an error and not a different value.
     pub fn hex_str(s: &str) -> Result<RlpItem, Error> {
         let body = s.strip_prefix("0x").ok_or(Error::StringPrefix)?;
         if body.is_empty() {
@@ -162,8 +175,13 @@ impl RlpItem {
 }
 
 /// Decodes one RLP item from the front of `buf`, returning the item and the
-/// remaining bytes.
+/// remaining bytes. Lists nested deeper than [`MAX_DEPTH`] are rejected.
 pub fn decode_one(buf: &[u8]) -> Result<(RlpItem, &[u8]), Error> {
+    decode_one_at(buf, 0)
+}
+
+/// [`decode_one`] for an item inside `depth` lists.
+fn decode_one_at(buf: &[u8], depth: usize) -> Result<(RlpItem, &[u8]), Error> {
     if buf.is_empty() {
         return Err(Error::UnexpectedEof);
     }
@@ -201,7 +219,10 @@ pub fn decode_one(buf: &[u8]) -> Result<(RlpItem, &[u8]), Error> {
     let rest = &buf[ln..];
 
     if is_array {
-        let items = decode(v)?;
+        if depth >= MAX_DEPTH {
+            return Err(Error::TooDeep);
+        }
+        let items = decode_at(v, depth + 1)?;
         return Ok((RlpItem::List(items), rest));
     }
 
@@ -212,12 +233,18 @@ pub fn decode_one(buf: &[u8]) -> Result<(RlpItem, &[u8]), Error> {
     Ok((RlpItem::Bytes(v.to_vec()), rest))
 }
 
-/// Decodes a sequence of RLP items from `buf`.
+/// Decodes a sequence of RLP items from `buf`. Lists nested deeper than
+/// [`MAX_DEPTH`] are rejected.
 pub fn decode(buf: &[u8]) -> Result<Vec<RlpItem>, Error> {
+    decode_at(buf, 0)
+}
+
+/// [`decode`] for the content of a list inside `depth - 1` others.
+fn decode_at(buf: &[u8], depth: usize) -> Result<Vec<RlpItem>, Error> {
     let mut res = Vec::new();
     let mut buf = buf;
     while !buf.is_empty() {
-        let (item, rest) = decode_one(buf)?;
+        let (item, rest) = decode_one_at(buf, depth)?;
         res.push(item);
         buf = rest;
     }
@@ -298,6 +325,33 @@ mod tests {
         let dec = decode(&enc).unwrap();
         assert_eq!(dec.len(), 1);
         assert_eq!(dec[0], item);
+    }
+
+    /// `depth` nested lists, the innermost empty.
+    fn nested_lists(depth: usize) -> Vec<u8> {
+        let mut enc = vec![0xc0];
+        for _ in 1..depth {
+            let mut outer = encode_len(enc.len(), true);
+            outer.extend_from_slice(&enc);
+            enc = outer;
+        }
+        enc
+    }
+
+    #[test]
+    fn decode_depth_limit() {
+        let ok = nested_lists(MAX_DEPTH);
+        let dec = decode(&ok).unwrap();
+        assert_eq!(dec[0].encode(), ok);
+        assert_eq!(decode_one(&ok).unwrap().0, dec[0]);
+
+        let deep = nested_lists(MAX_DEPTH + 1);
+        assert_eq!(decode(&deep), Err(Error::TooDeep));
+        assert_eq!(decode_one(&deep).map(drop), Err(Error::TooDeep));
+
+        // 20,000 nested lists used to overflow the stack
+        let bomb = nested_lists(20_000);
+        assert_eq!(decode(&bomb), Err(Error::TooDeep));
     }
 
     #[test]
