@@ -204,6 +204,9 @@ pub(crate) struct OutputSecrets {
     pub h: Scalar,
     /// The eight bytes the amount is XORed with.
     pub amount_mask: u64,
+    /// The eight bytes the payment id of a version 4 output is XORed with:
+    /// the next 64 bits of the same hash.
+    pub payment_id_mask: u64,
     /// The blinding mask `y` of the amount commitment.
     pub amount_blinding_mask: Scalar,
     /// The blinding mask `s` of the asset id (unused for a bare native id).
@@ -223,6 +226,10 @@ impl OutputSecrets {
             // `h` is a reduced scalar by construction.
             h: Scalar::from_bytes_canonical(&h).unwrap_or(Scalar::ZERO),
             amount_mask: u64::from_le_bytes(low),
+            payment_id_mask: mask
+                .get(8..16)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map_or(0, u64::from_le_bytes),
             amount_blinding_mask: output_scalar(HDS_OUT_AMOUNT_BLINDING_MASK, &h),
             asset_blinding_mask: output_scalar(HDS_OUT_ASSET_BLINDING_MASK, &h),
             concealing: output_scalar(HDS_OUT_CONCEALING_POINT, &h),

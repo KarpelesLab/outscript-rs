@@ -4,8 +4,8 @@
 //!
 //! Both are the binary serialization of the structure, encrypted with
 //! ChaCha8 under a key derived from the secret view key. The format is not
-//! versioned and follows the wallet's C++ structures: it matches Zano
-//! 2.1.0.382 to 2.1.19.477.
+//! versioned and follows the wallet's C++ structures, which changed with
+//! the release that brought hard fork 6 ([`FtpFormat`]).
 
 use purecrypto::zeroize::{Zeroize, Zeroizing};
 
@@ -14,8 +14,21 @@ use crate::prelude::*;
 
 use super::Error;
 use super::chacha8::chacha8_crypt;
-use super::ser::{self, Reader, Wire, write_bytes, write_vec};
-use super::tx::{AccountPublicAddr, Transaction, Variant, wire_struct};
+use super::ser::{Reader, Wire, write_bytes, write_varints, write_vec};
+use super::tx::{
+    AccountPublicAddr, TX_FLAG_SIGNATURE_MODE_SEPARATE, Transaction, Variant, wire_struct,
+};
+
+/// Which release of Zano's wallet a blob is laid out for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FtpFormat {
+    /// Zano 2.1.0.382 to 2.1.19.477 (hard fork 5).
+    Legacy,
+    /// Zano 2.2 (hard forks 6 and 7): sources carry their asset id and a
+    /// gateway origin, destinations a payment id and tagged addresses.
+    #[default]
+    Current,
+}
 
 /// One member of the ring of a source (`tx_source_entry::output_entry`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,13 +55,14 @@ wire_struct!(TxSourceOutputEntry, min = 130, {
 /// The blinding masks are secret; they are wiped when the source is dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxSource {
-    /// The ring: the real output and its decoys, by increasing global index.
+    /// The ring: the real output and its decoys.
     pub outputs: Vec<TxSourceOutputEntry>,
     /// The position of the real output in `outputs`.
     pub real_output: u64,
     /// The public key of the transaction that created the real output.
     pub real_out_tx_key: [u8; 32],
-    /// The blinding mask of the real output's amount commitment.
+    /// The blinding mask of the real output's amount commitment (zero for a
+    /// transparent output).
     pub real_out_amount_blinding_mask: [u8; 32],
     /// The blinding mask of the real output's asset id.
     pub real_out_asset_id_blinding_mask: [u8; 32],
@@ -68,36 +82,33 @@ pub struct TxSource {
     pub separately_signed_tx_complete: bool,
     /// For an HTLC input, its origin.
     pub htlc_origin: Vec<u8>,
-    /// The asset id of the real output, unblinded. It is not part of the
-    /// blob: a source parsed from one has `None`, which stands for the asset
-    /// of the first destination when signing, and for the native coin when
-    /// working out the fee.
+    /// The asset id of the real output, unblinded. The current blob format
+    /// carries it; a source parsed from a [`FtpFormat::Legacy`] blob has
+    /// `None`, which stands for the asset of the first destination when
+    /// signing, and for the native coin when working out the fee.
     pub asset_id: Option<[u8; 32]>,
     /// Whether the source is a confidential (Zarcanum) output. Not part of
-    /// the blob either: a parsed source counts as one when its asset
-    /// blinding mask is not zero.
+    /// the blob: a parsed source counts as one when a blinding mask is not
+    /// zero.
     pub is_zc_input: bool,
 }
 
 impl TxSource {
-    /// Whether this source is a confidential output.
+    /// Whether this source is a confidential output (`is_zc`: its amount
+    /// blinding mask is not zero).
     pub fn is_zc(&self) -> bool {
-        self.is_zc_input || self.real_out_asset_id_blinding_mask != [0u8; 32]
+        self.is_zc_input
+            || self.real_out_amount_blinding_mask != [0u8; 32]
+            || self.real_out_asset_id_blinding_mask != [0u8; 32]
     }
-}
 
-impl Drop for TxSource {
-    fn drop(&mut self) {
-        self.real_out_amount_blinding_mask.zeroize();
-        self.real_out_asset_id_blinding_mask.zeroize();
+    /// Whether this source is a multisig output (`is_multisig`).
+    pub fn is_multisig(&self) -> bool {
+        self.ms_sigs_count > 0
     }
-}
 
-impl Wire for TxSource {
-    const MIN_SIZE: usize = 211;
-
-    fn read(r: &mut Reader<'_>) -> Result<Self, Error> {
-        Ok(TxSource {
+    fn read(r: &mut Reader<'_>, format: FtpFormat) -> Result<Self, Error> {
+        let mut source = TxSource {
             outputs: r.vec()?,
             real_output: r.u64()?,
             real_out_tx_key: r.key()?,
@@ -113,10 +124,19 @@ impl Wire for TxSource {
             htlc_origin: r.bytes()?,
             asset_id: None,
             is_zc_input: false,
-        })
+        };
+        if format == FtpFormat::Current {
+            source.asset_id = Some(r.key()?);
+            // A source that spends from a gateway address (hard fork 6
+            // only) cannot be signed here.
+            if r.key()? != [0u8; 32] {
+                return Err(Error::Unsupported);
+            }
+        }
+        Ok(source)
     }
 
-    fn write(&self, out: &mut Vec<u8>) {
+    fn write(&self, out: &mut Vec<u8>, format: FtpFormat) {
         write_vec(out, &self.outputs);
         out.extend_from_slice(&self.real_output.to_le_bytes());
         out.extend_from_slice(&self.real_out_tx_key);
@@ -130,6 +150,17 @@ impl Wire for TxSource {
         out.extend_from_slice(&self.ms_keys_count.to_le_bytes());
         out.push(u8::from(self.separately_signed_tx_complete));
         write_bytes(out, &self.htlc_origin);
+        if format == FtpFormat::Current {
+            out.extend_from_slice(&self.asset_id.unwrap_or(super::NATIVE_COIN_ASSET_ID));
+            out.extend_from_slice(&[0u8; 32]);
+        }
+    }
+}
+
+impl Drop for TxSource {
+    fn drop(&mut self) {
+        self.real_out_amount_blinding_mask.zeroize();
+        self.real_out_asset_id_blinding_mask.zeroize();
     }
 }
 
@@ -142,6 +173,16 @@ pub struct TxDestHtlcOut {
     pub htlc_hash: [u8; 32],
 }
 wire_struct!(TxDestHtlcOut, min = 40, { expiration: u64, htlc_hash: key });
+
+/// `tdef_explicit_native_asset_id`: the output shows the native asset id
+/// unblinded. Only for the native coin.
+pub const TX_DEST_FLAG_EXPLICIT_NATIVE_ASSET_ID: u64 = 1;
+/// `tdef_explicit_amount_to_provide`.
+pub const TX_DEST_FLAG_EXPLICIT_AMOUNT_TO_PROVIDE: u64 = 2;
+/// `tdef_zero_amount_blinding_mask`: the amount commitment is not blinded
+/// (used to burn native coins; only acted on for an output to the null
+/// address, which this module does not build).
+pub const TX_DEST_FLAG_ZERO_AMOUNT_BLINDING_MASK: u64 = 4;
 
 /// An output to create (`tx_destination_entry`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -162,27 +203,70 @@ pub struct TxDest {
     pub htlc_options: TxDestHtlcOut,
     /// The asset id, unblinded.
     pub asset_id: [u8; 32],
-    /// The `tx_destination_entry_flags`.
+    /// The `tx_destination_entry_flags` (`TX_DEST_FLAG_*`).
     pub flags: u64,
+    /// The payment id of the output (version 4 transactions; zero for
+    /// none). Not in a [`FtpFormat::Legacy`] blob.
+    pub payment_id: u64,
 }
-wire_struct!(TxDest, min = 105, {
-    amount: u64, addr: vec, minimum_sigs: u64, amount_to_provide: u64, unlock_time: u64,
-    htlc_options: obj, asset_id: key, flags: u64
-});
 
-/// A varint, as an element of a sequence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct VarintItem(u64);
-
-impl Wire for VarintItem {
-    const MIN_SIZE: usize = 1;
-
-    fn read(r: &mut Reader<'_>) -> Result<Self, Error> {
-        Ok(VarintItem(r.varint()?))
+impl TxDest {
+    fn read(r: &mut Reader<'_>, format: FtpFormat) -> Result<Self, Error> {
+        let amount = r.u64()?;
+        let addr = match format {
+            FtpFormat::Legacy => r.vec()?,
+            FtpFormat::Current => {
+                // address_v: a tagged account address, or a gateway address
+                // (hard fork 6 only), which cannot be paid here.
+                let n = r.count(AccountPublicAddr::MIN_SIZE + 1)?;
+                let mut addr = Vec::with_capacity(n.min(16));
+                for _ in 0..n {
+                    match r.u8()? {
+                        72 => addr.push(Wire::read(r)?),
+                        22 => return Err(Error::Unsupported),
+                        tag => return Err(Error::UnsupportedVariant(tag)),
+                    }
+                }
+                addr
+            }
+        };
+        Ok(TxDest {
+            amount,
+            addr,
+            minimum_sigs: r.u64()?,
+            amount_to_provide: r.u64()?,
+            unlock_time: r.u64()?,
+            htlc_options: Wire::read(r)?,
+            asset_id: r.key()?,
+            flags: r.u64()?,
+            payment_id: match format {
+                FtpFormat::Legacy => 0,
+                FtpFormat::Current => r.u64()?,
+            },
+        })
     }
 
-    fn write(&self, out: &mut Vec<u8>) {
-        push_varint(out, self.0);
+    fn write(&self, out: &mut Vec<u8>, format: FtpFormat) {
+        out.extend_from_slice(&self.amount.to_le_bytes());
+        match format {
+            FtpFormat::Legacy => write_vec(out, &self.addr),
+            FtpFormat::Current => {
+                push_varint(out, self.addr.len() as u64);
+                for addr in &self.addr {
+                    out.push(72);
+                    addr.write(out);
+                }
+            }
+        }
+        out.extend_from_slice(&self.minimum_sigs.to_le_bytes());
+        out.extend_from_slice(&self.amount_to_provide.to_le_bytes());
+        out.extend_from_slice(&self.unlock_time.to_le_bytes());
+        self.htlc_options.write(out);
+        out.extend_from_slice(&self.asset_id);
+        out.extend_from_slice(&self.flags.to_le_bytes());
+        if format == FtpFormat::Current {
+            out.extend_from_slice(&self.payment_id.to_le_bytes());
+        }
     }
 }
 
@@ -202,7 +286,7 @@ pub struct FinalizeTxParam {
     pub tx_outs_attr: u8,
     /// Whether to shuffle the outputs.
     pub shuffle: bool,
-    /// The transaction flags.
+    /// The transaction flags (`TX_FLAG_*`).
     pub flags: u8,
     /// For a multisig transaction, the id of the multisig output.
     pub multisig_id: [u8; 32],
@@ -218,34 +302,62 @@ pub struct FinalizeTxParam {
     pub spend_pub_key: [u8; 32],
     /// The transaction version to build.
     pub tx_version: u64,
-    /// The hardfork id to put in a version 3 transaction.
+    /// The hardfork id to put in a transaction of version 3 and above.
     pub tx_hardfork_id: u64,
-    /// The fee mode of a separately signed transaction.
+    /// The fee of a separately signed transaction.
     pub mode_separate_fee: u64,
+    /// The layout of the blob this was parsed from, and that
+    /// [`to_bytes`](Self::to_bytes) writes.
+    pub format: FtpFormat,
 }
 
-impl Wire for FinalizeTxParam {
-    const MIN_SIZE: usize = 180;
-
-    fn read(r: &mut Reader<'_>) -> Result<Self, Error> {
-        Ok(FinalizeTxParam {
-            unlock_time: r.u64()?,
-            extra: r.vec()?,
-            attachments: r.vec()?,
-            crypt_address: Wire::read(r)?,
-            tx_outs_attr: r.u8()?,
-            shuffle: r.bool()?,
-            flags: r.u8()?,
-            multisig_id: r.key()?,
-            sources: r.vec()?,
-            selected_transfers: r.vec::<VarintItem>()?.into_iter().map(|v| v.0).collect(),
-            prepared_destinations: r.vec()?,
+impl FinalizeTxParam {
+    fn read(r: &mut Reader<'_>, format: FtpFormat) -> Result<Self, Error> {
+        let unlock_time = r.u64()?;
+        let extra = r.vec()?;
+        let attachments = r.vec()?;
+        let crypt_address = Wire::read(r)?;
+        let tx_outs_attr = r.u8()?;
+        let shuffle = r.bool()?;
+        let flags = r.u8()?;
+        let multisig_id = r.key()?;
+        // The sizes are those of the legacy layout, the smaller ones.
+        let n = r.count(211)?;
+        let mut sources = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            sources.push(TxSource::read(r, format)?);
+        }
+        let selected_transfers = r.varints()?;
+        let n = r.count(105)?;
+        let mut prepared_destinations = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            prepared_destinations.push(TxDest::read(r, format)?);
+        }
+        let ftp = FinalizeTxParam {
+            unlock_time,
+            extra,
+            attachments,
+            crypt_address,
+            tx_outs_attr,
+            shuffle,
+            flags,
+            multisig_id,
+            sources,
+            selected_transfers,
+            prepared_destinations,
             expiration_time: r.u64()?,
             spend_pub_key: r.key()?,
             tx_version: r.u64()?,
             tx_hardfork_id: r.u64()?,
             mode_separate_fee: r.u64()?,
-        })
+            format,
+        };
+        // A separately signed transaction comes with the state of its
+        // construction, which this module neither reads nor continues.
+        if u64::from(ftp.flags) & TX_FLAG_SIGNATURE_MODE_SEPARATE != 0 {
+            return Err(Error::Unsupported);
+        }
+        Ok(ftp)
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -257,17 +369,46 @@ impl Wire for FinalizeTxParam {
         out.push(u8::from(self.shuffle));
         out.push(self.flags);
         out.extend_from_slice(&self.multisig_id);
-        write_vec(out, &self.sources);
-        push_varint(out, self.selected_transfers.len() as u64);
-        for index in &self.selected_transfers {
-            push_varint(out, *index);
+        push_varint(out, self.sources.len() as u64);
+        for source in &self.sources {
+            source.write(out, self.format);
         }
-        write_vec(out, &self.prepared_destinations);
+        write_varints(out, &self.selected_transfers);
+        push_varint(out, self.prepared_destinations.len() as u64);
+        for dest in &self.prepared_destinations {
+            dest.write(out, self.format);
+        }
         out.extend_from_slice(&self.expiration_time.to_le_bytes());
         out.extend_from_slice(&self.spend_pub_key);
         out.extend_from_slice(&self.tx_version.to_le_bytes());
         out.extend_from_slice(&self.tx_hardfork_id.to_le_bytes());
         out.extend_from_slice(&self.mode_separate_fee.to_le_bytes());
+    }
+}
+
+/// Parses `data` as a whole with `read`, in the current layout or else in
+/// the legacy one.
+fn parse<T>(
+    data: &[u8],
+    read: impl Fn(&mut Reader<'_>, FtpFormat) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let attempt = |format| {
+        let mut r = Reader::new(data);
+        let value = read(&mut r, format)?;
+        r.finish()?;
+        Ok(value)
+    };
+    match attempt(FtpFormat::Current) {
+        Ok(value) => Ok(value),
+        Err(current) => attempt(FtpFormat::Legacy).map_err(|legacy| {
+            // What this module cannot sign is reported as such, rather
+            // than as whatever the other layout makes of the bytes.
+            if current == Error::Unsupported {
+                current
+            } else {
+                legacy
+            }
+        }),
     }
 }
 
@@ -279,14 +420,22 @@ fn crypt(blob: &[u8], view_secret_key: &[u8; 32]) -> Zeroizing<Vec<u8>> {
 }
 
 impl FinalizeTxParam {
-    /// Parses the plain serialization, which must take the whole of `data`.
+    /// Parses the plain serialization, which must take the whole of `data`:
+    /// in the current layout or, failing that, in the legacy one
+    /// ([`format`](Self::format) tells which).
+    ///
+    /// Fails with [`Error::Unsupported`] for a blob with a gateway source
+    /// or destination, or of a separately signed transaction.
     pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
-        ser::from_bytes(data)
+        parse(data, Self::read)
     }
 
-    /// The plain serialization. It holds secrets (the blinding masks).
+    /// The plain serialization, in the layout of
+    /// [`format`](Self::format). It holds secrets (the blinding masks).
     pub fn to_bytes(&self) -> Vec<u8> {
-        ser::to_bytes(self)
+        let mut out = Vec::new();
+        self.write(&mut out);
+        out
     }
 
     /// Decrypts and parses an unsigned transaction blob with the wallet's
@@ -323,7 +472,7 @@ wire_struct!(KeyImageIndex, min = 40, { out_index: u64, image: key });
 pub struct FinalizedTx {
     /// The transaction.
     pub tx: Transaction,
-    /// The transaction id. The offline signer leaves it zero, as Zano does.
+    /// The transaction id.
     pub tx_id: [u8; 32],
     /// The one-time secret key of the transaction.
     pub one_time_key: [u8; 32],
@@ -331,17 +480,13 @@ pub struct FinalizedTx {
     pub ftp: FinalizeTxParam,
     /// For an HTLC transaction, its origin.
     pub htlc_origin: Vec<u8>,
-    /// The key images of the change outputs.
+    /// The key images of the outputs that come back to the wallet (change).
     pub outs_key_images: Vec<KeyImageIndex>,
-    /// The key derivation. The offline signer leaves it zero, as Zano does.
+    /// The key derivation attachments are encrypted with.
     pub derivation: [u8; 32],
     /// Whether the transaction was not prepared, for a legitimate reason.
     pub was_not_prepared: bool,
 }
-wire_struct!(FinalizedTx, min = 290, {
-    tx: obj, tx_id: key, one_time_key: key, ftp: obj, htlc_origin: bytes,
-    outs_key_images: vec, derivation: key, was_not_prepared: bool
-});
 
 impl Drop for FinalizedTx {
     fn drop(&mut self) {
@@ -350,14 +495,38 @@ impl Drop for FinalizedTx {
 }
 
 impl FinalizedTx {
-    /// Parses the plain serialization, which must take the whole of `data`.
-    pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
-        ser::from_bytes(data)
+    fn read(r: &mut Reader<'_>, format: FtpFormat) -> Result<Self, Error> {
+        Ok(FinalizedTx {
+            tx: Wire::read(r)?,
+            tx_id: r.key()?,
+            one_time_key: r.key()?,
+            ftp: FinalizeTxParam::read(r, format)?,
+            htlc_origin: r.bytes()?,
+            outs_key_images: r.vec()?,
+            derivation: r.key()?,
+            was_not_prepared: r.bool()?,
+        })
     }
 
-    /// The plain serialization. It holds secrets.
+    /// Parses the plain serialization, which must take the whole of `data`
+    /// (in either layout, as [`FinalizeTxParam::from_bytes`]).
+    pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
+        parse(data, Self::read)
+    }
+
+    /// The plain serialization, in the layout of its `ftp`. It holds
+    /// secrets.
     pub fn to_bytes(&self) -> Vec<u8> {
-        ser::to_bytes(self)
+        let mut out = Vec::new();
+        self.tx.write(&mut out);
+        out.extend_from_slice(&self.tx_id);
+        out.extend_from_slice(&self.one_time_key);
+        self.ftp.write(&mut out);
+        write_bytes(&mut out, &self.htlc_origin);
+        write_vec(&mut out, &self.outs_key_images);
+        out.extend_from_slice(&self.derivation);
+        out.push(u8::from(self.was_not_prepared));
+        out
     }
 
     /// Decrypts and parses a signed transaction blob with the wallet's

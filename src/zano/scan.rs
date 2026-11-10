@@ -147,6 +147,52 @@ pub const TX_SERVICE_ATTACHMENT_ENCRYPT_BODY_ISOLATE_AUDITABLE: u8 = 1 << 2;
 /// Service attachment flag: a proof is attached to the encrypted body.
 pub const TX_SERVICE_ATTACHMENT_ENCRYPT_ADD_PROOF: u8 = 1 << 3;
 
+impl Wallet {
+    /// Tests whether the transparent (pre-Zarcanum) output `index` of a
+    /// transaction, paid to the one-time key `key`, belongs to the wallet,
+    /// given the transaction's [`key_derivation`](Self::key_derivation).
+    ///
+    /// The amount of such an output is in the open; the output found has
+    /// the native asset id and zero blinding masks.
+    pub fn scan_bare_output(
+        &self,
+        derivation: &[u8; 32],
+        index: u64,
+        amount: u64,
+        key: &[u8; 32],
+    ) -> Result<Option<ReceivedOutput>, Error> {
+        let secrets = OutputSecrets::derive(derivation, index);
+        let spend_public = crypto::point(self.spend_public_key())?;
+        if EdwardsPoint::mul_base(&secrets.h)
+            .add(&spend_public)
+            .compress()
+            != *key
+        {
+            return Ok(None);
+        }
+        Ok(Some(ReceivedOutput {
+            output_index: index,
+            amount,
+            asset_id: NATIVE_COIN_ASSET_ID,
+            is_native: true,
+            stealth_address: *key,
+            amount_blinding_mask: [0u8; 32],
+            asset_id_blinding_mask: [0u8; 32],
+        }))
+    }
+}
+
+/// Decrypts the payment id of output `index` of a version 4 transaction
+/// (`tx_out_zarcanum::encrypted_payment_id`), given the transaction's
+/// [`key_derivation`](Wallet::key_derivation): zero means no payment id.
+/// The same call encrypts.
+///
+/// The result is only meaningful for an output of the wallet the
+/// derivation is of.
+pub fn crypt_output_payment_id(derivation: &[u8; 32], index: u64, payment_id: u64) -> u64 {
+    payment_id ^ OutputSecrets::derive(derivation, index).payment_id_mask
+}
+
 /// What a transaction pays to a wallet.
 #[cfg(feature = "alloc")]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -155,8 +201,14 @@ pub struct ScanResult {
     pub tx_pub_key: Option<[u8; 32]>,
     /// The outputs that belong to the wallet.
     pub outputs: Vec<ReceivedOutput>,
-    /// The payment id the sender attached (decrypted), if any.
+    /// The payment id the sender attached (decrypted), if any: the body of
+    /// the payment id attachment or, for a version 4 transaction without
+    /// one, the eight bytes of the first non-zero payment id of the
+    /// wallet's outputs.
     pub payment_id: Option<Vec<u8>>,
+    /// For each of `outputs`, its own payment id (version 4 outputs carry
+    /// one each); zero for none.
+    pub output_payment_ids: Vec<u64>,
 }
 
 #[cfg(feature = "alloc")]
@@ -170,14 +222,19 @@ impl ScanResult {
 #[cfg(feature = "alloc")]
 impl Wallet {
     /// Finds the outputs of `tx` that belong to the wallet, decoding the
-    /// amount and asset of each, and recovers the payment id if the
+    /// amount and asset of each — and, for the outputs of a version 4
+    /// transaction, its payment id — and recovers the payment id if the
     /// transaction carries one (`lookup_acc_outs`). Only the view key is
     /// used.
     ///
     /// A transaction without a public key, or with nothing for the wallet,
-    /// gives an empty result. Only Zarcanum outputs are looked at.
+    /// gives an empty result. Confidential outputs and transparent outputs
+    /// to one key are looked at; multisig and gateway outputs are not.
+    ///
+    /// The payment id attachment of a version 4 transaction is encrypted
+    /// in a way this module does not implement: it is returned as it is.
     pub fn scan_tx(&self, tx: &super::Transaction) -> Result<ScanResult, Error> {
-        use super::tx::Variant;
+        use super::tx::{TRANSACTION_VERSION_POST_HF6, Variant};
 
         let mut result = ScanResult::default();
         let Some(tx_pub_key) = tx.tx_pub_key() else {
@@ -187,12 +244,25 @@ impl Wallet {
         let derivation = self.key_derivation(&tx_pub_key)?;
 
         for (index, out) in tx.vout.iter().enumerate() {
-            let Variant::OutZarcanum(out) = out else {
-                continue;
-            };
             let index = u64::try_from(index).map_err(|_| Error::TooLarge)?;
-            if let Some(found) = self.scan_output(&derivation, index, out)? {
+            let (found, payment_id) = match out {
+                Variant::OutZarcanum(out) => (self.scan_output(&derivation, index, out)?, 0),
+                Variant::OutZarcanumHf6(out) => (
+                    self.scan_output(&derivation, index, &out.base())?,
+                    crypt_output_payment_id(&derivation, index, out.encrypted_payment_id),
+                ),
+                Variant::OutBare(out) => match &*out.target {
+                    Variant::ToKeyTarget(target) => (
+                        self.scan_bare_output(&derivation, index, out.amount, &target.key)?,
+                        0,
+                    ),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            if let Some(found) = found {
                 result.outputs.push(found);
+                result.output_payment_ids.push(payment_id);
             }
         }
 
@@ -210,10 +280,14 @@ impl Wallet {
             });
         if let Some(attachment) = attachment {
             let mut body = attachment.body.clone();
-            if attachment.flags & TX_SERVICE_ATTACHMENT_ENCRYPT_BODY != 0 {
+            if attachment.flags & TX_SERVICE_ATTACHMENT_ENCRYPT_BODY != 0
+                && tx.version < TRANSACTION_VERSION_POST_HF6
+            {
                 crypt_payment_id(&derivation, &mut body);
             }
             result.payment_id = Some(body);
+        } else if let Some(id) = result.output_payment_ids.iter().find(|id| **id != 0) {
+            result.payment_id = Some(id.to_le_bytes().to_vec());
         }
         Ok(result)
     }

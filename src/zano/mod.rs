@@ -109,6 +109,8 @@
 
 mod address;
 #[cfg(feature = "alloc")]
+mod asset;
+#[cfg(feature = "alloc")]
 mod bge;
 #[cfg(feature = "alloc")]
 mod bpp;
@@ -120,6 +122,8 @@ mod crypto;
 pub mod epee;
 #[cfg(feature = "alloc")]
 mod ftp;
+#[cfg(feature = "alloc")]
+mod nlsag;
 mod scan;
 #[cfg(feature = "alloc")]
 mod schnorr;
@@ -132,8 +136,14 @@ mod transfer;
 #[cfg(feature = "alloc")]
 mod tx;
 #[cfg(feature = "alloc")]
+mod tx_ext;
+#[cfg(feature = "alloc")]
+mod verify;
+#[cfg(feature = "alloc")]
 mod view;
 mod wallet;
+#[cfg(feature = "alloc")]
+mod zarcanum;
 
 #[cfg(test)]
 mod tests;
@@ -149,10 +159,13 @@ pub use crypto::{
 pub use scan::{
     PAYMENT_ID_SERVICE_ID, ReceivedOutput, TX_SERVICE_ATTACHMENT_DEFLATE_BODY,
     TX_SERVICE_ATTACHMENT_ENCRYPT_ADD_PROOF, TX_SERVICE_ATTACHMENT_ENCRYPT_BODY,
-    TX_SERVICE_ATTACHMENT_ENCRYPT_BODY_ISOLATE_AUDITABLE, TxOutZarcanum, crypt_payment_id,
+    TX_SERVICE_ATTACHMENT_ENCRYPT_BODY_ISOLATE_AUDITABLE, TxOutZarcanum, crypt_output_payment_id,
+    crypt_payment_id,
 };
 pub use wallet::Wallet;
 
+#[cfg(all(feature = "alloc", feature = "secp256k1"))]
+pub use asset::verify_eth_signature;
 #[cfg(feature = "alloc")]
 pub use bge::{BGE_MAX_RING_SIZE, generate_bge_proof, verify_bge_proof};
 #[cfg(feature = "alloc")]
@@ -161,8 +174,13 @@ pub use bpp::{BPP_MAX_VALUES, generate_bpp, verify_bpp};
 pub use clsag::{ClsagGgxInput, generate_clsag_ggx, verify_clsag_ggx};
 #[cfg(feature = "alloc")]
 pub use ftp::{
-    FinalizeTxParam, FinalizedTx, KeyImageIndex, TxDest, TxDestHtlcOut, TxSource,
-    TxSourceOutputEntry,
+    FinalizeTxParam, FinalizedTx, FtpFormat, KeyImageIndex,
+    TX_DEST_FLAG_EXPLICIT_AMOUNT_TO_PROVIDE, TX_DEST_FLAG_EXPLICIT_NATIVE_ASSET_ID,
+    TX_DEST_FLAG_ZERO_AMOUNT_BLINDING_MASK, TxDest, TxDestHtlcOut, TxSource, TxSourceOutputEntry,
+};
+#[cfg(feature = "alloc")]
+pub use nlsag::{
+    generate_ring_signature, generate_schnorr_sig, verify_ring_signature, verify_schnorr_sig,
 };
 #[cfg(feature = "alloc")]
 pub use scan::ScanResult;
@@ -178,13 +196,31 @@ pub use transfer::{RingMember, TransferDest, TransferInput};
 #[cfg(feature = "alloc")]
 pub use tx::{
     AccountPublicAddr, BgeProof, BppSignature, ClsagGgxSig, DoubleSchnorrSig, ExtraAttachmentInfo,
-    RefById, SignedParts, TRANSACTION_VERSION_INITIAL, TRANSACTION_VERSION_POST_HF4,
-    TRANSACTION_VERSION_POST_HF5, TRANSACTION_VERSION_PRE_HF4, Transaction, TxCryptoChecksum,
-    TxInToKey, TxInZcInput, TxServiceAttachment, UgAggProof, Variant, ZcAssetSurjectionProof,
-    ZcBalanceProof, ZcOutsRangeProof, ZcSig,
+    HARDFORK_04_ZARCANUM, HARDFORK_05, HARDFORK_06, HARDFORK_07, MAINNET_HARDFORK_HEIGHTS, RefById,
+    SignedParts, TRANSACTION_VERSION_INITIAL, TRANSACTION_VERSION_POST_HF4,
+    TRANSACTION_VERSION_POST_HF5, TRANSACTION_VERSION_POST_HF6, TRANSACTION_VERSION_PRE_HF4,
+    TX_FLAG_SIGNATURE_MODE_SEPARATE, Transaction, TxCryptoChecksum, TxInToKey, TxInZcInput,
+    TxServiceAttachment, UgAggProof, Variant, ZcAssetSurjectionProof, ZcBalanceProof,
+    ZcOutsRangeProof, ZcSig, mainnet_hardfork_id, mainnet_tx_version, tx_version_for_hardfork,
 };
 #[cfg(feature = "alloc")]
+pub use tx_ext::{
+    ASSET_DESCRIPTOR_BASE_HF4_VER, ASSET_DESCRIPTOR_BASE_HF5_VER, ASSET_DESCRIPTOR_OPERATION_EMIT,
+    ASSET_DESCRIPTOR_OPERATION_HF4_VER, ASSET_DESCRIPTOR_OPERATION_HF5_VER,
+    ASSET_DESCRIPTOR_OPERATION_PUBLIC_BURN, ASSET_DESCRIPTOR_OPERATION_REGISTER,
+    ASSET_DESCRIPTOR_OPERATION_UPDATE, AccountPublicAddrOld, AssetDescriptorBase,
+    AssetDescriptorOperation, AssetOperationProof, AssetOwnershipProof, AssetOwnershipProofEth,
+    BppeSignature, ClsagGgxxgSig, ExtraAliasEntry, ExtraAliasEntryOld, GatewayAddressDescriptor,
+    GatewayAddressOperation, GatewayOwnerKey, GatewaySignature, LinearCompositionProof, NlsagSig,
+    SchnorrSig, TxInGateway, TxInMultisig, TxOutBare, TxOutGateway, TxOutMultisig, TxOutToKey,
+    TxOutZarcanumHf6, ZarcanumSig, ZcGwBalanceProof,
+};
+#[cfg(feature = "alloc")]
+pub use verify::{VerifyContext, VerifyError};
+#[cfg(feature = "alloc")]
 pub use view::ViewWalletData;
+#[cfg(feature = "alloc")]
+pub use zarcanum::{StakeContext, verify_bppe, verify_clsag_ggxxg, verify_zarcanum_proof};
 
 /// Errors specific to Zano.
 ///

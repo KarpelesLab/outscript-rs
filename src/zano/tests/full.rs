@@ -100,10 +100,15 @@ fn on_chain_transactions() {
             "unlock_time"
         ]
     );
-    assert_eq!(names(&tx.vout), ["tx_out_zarcanum", "tx_out_zarcanum"]);
+    assert_eq!(
+        names(&tx.vout),
+        ["tx_out_zarcanum_v1", "tx_out_zarcanum_v1"]
+    );
     assert_eq!(tx.fee(), None);
-    // Not a confidential-input transaction.
+    // A coinbase: its proofs need the reward of its block (one coin).
     assert!(!tx.verify_proofs());
+    assert!(tx.verify_coinbase_proofs(1_000_000_000_000));
+    assert!(!tx.verify_coinbase_proofs(1_000_000_000_001));
 
     let tx = Transaction::from_bytes(TRANSFER_V3).unwrap();
     assert_eq!(tx.to_bytes(), TRANSFER_V3);
@@ -122,7 +127,10 @@ fn on_chain_transactions() {
             "zarcanum_tx_data_v1"
         ]
     );
-    assert_eq!(names(&tx.vout), ["tx_out_zarcanum", "tx_out_zarcanum"]);
+    assert_eq!(
+        names(&tx.vout),
+        ["tx_out_zarcanum_v1", "tx_out_zarcanum_v1"]
+    );
     assert!(tx.fee().is_some() && tx.tx_pub_key().is_some());
     assert_eq!(cn_fast_hash(&tx.prefix_bytes()), tx.prefix_hash());
 
@@ -581,14 +589,21 @@ fn zano_signed_fixture() {
 }
 
 /// Signing zanolib's fixture with the same one-time key and the same
-/// "random" bytes gives, byte for byte, the transaction zanolib signs.
+/// "random" bytes gives, byte for byte, the transaction zanolib signs —
+/// without shuffling the outputs, which zanolib does not do. The fixture is
+/// of the legacy blob format, whose wallet left the id, the derivation and
+/// the key images of the signed blob empty.
 #[test]
 fn sign_matches_zanolib() {
     let w = wallet();
     let fin = w.parse_finalized(SIGNED).unwrap();
-    let signed = w
-        .sign(&mut stream(0), &fin.ftp, Some(&fin.one_time_key))
+    assert_eq!(fin.ftp.format, FtpFormat::Legacy);
+    let mut unshuffled = fin.ftp.clone();
+    unshuffled.shuffle = false;
+    let mut signed = w
+        .sign(&mut stream(0), &unshuffled, Some(&fin.one_time_key))
         .unwrap();
+    signed.ftp.shuffle = true;
     let v = &vectors("sign")[0];
     assert_eq!(signed.tx.prefix_hash(), h32(v[3]));
     assert_eq!(cn_fast_hash(&signed.tx.to_bytes()), h32(v[1]));
@@ -651,10 +666,228 @@ fn sign_matches_zanolib() {
         Error::ViewOnly
     );
     let signer = LocalInputSigner::new(w.spend_secret_key().unwrap()).unwrap();
-    let delegated = view
-        .sign_with(&mut stream(0), &fin.ftp, Some(&fin.one_time_key), &signer)
+    let mut delegated = view
+        .sign_with(
+            &mut stream(0),
+            &unshuffled,
+            Some(&fin.one_time_key),
+            &signer,
+        )
         .unwrap();
+    delegated.ftp.shuffle = true;
     assert_eq!(delegated, signed);
+}
+
+/// What `construct_tx` does and zanolib did not: the ring of a source is
+/// sorted, the outputs are shuffled when the blob asks, the extra entries
+/// and attachments of the blob go into the transaction (encrypted where
+/// the reference encrypts), and the current blob format gets the id, the
+/// derivation and the key images of the change back.
+#[test]
+fn sign_as_construct_tx() {
+    let w = wallet();
+    let fin = w.parse_finalized(SIGNED).unwrap();
+    let key = Some(&fin.one_time_key);
+    // A small transaction, to keep the test quick: the first source of the
+    // fixture with a ring of three, into the two destinations.
+    let mut plain = fin.ftp.clone();
+    plain.shuffle = false;
+    plain.sources.truncate(1);
+    let source = &mut plain.sources[0];
+    let real = source.real_output as usize;
+    let real_entry = source.outputs[real].clone();
+    let mut n = 0;
+    source.outputs.retain(|_| {
+        n += 1;
+        (n - 1 + 16 - real) % 16 < 3
+    });
+    source.real_output = source
+        .outputs
+        .iter()
+        .position(|o| *o == real_entry)
+        .unwrap() as u64;
+    plain.prepared_destinations[0].amount = 500_000_000_000;
+    plain.prepared_destinations[1].amount = 390_000_000_000;
+    let mut shuffled = plain.clone();
+    shuffled.shuffle = true;
+    let reference = w.sign(&mut stream(0), &plain, key).unwrap();
+    assert!(verify_all(&reference.tx, &plain));
+
+    // A ring in any order gives the same transaction: it is sorted, and the
+    // real output found again.
+    let mut ftp = plain.clone();
+    for source in &mut ftp.sources {
+        let real = source.outputs[source.real_output as usize].clone();
+        source.outputs.reverse();
+        source.real_output = source.outputs.iter().position(|o| *o == real).unwrap() as u64;
+    }
+    let signed = w.sign(&mut stream(0), &ftp, key).unwrap();
+    assert_eq!(signed.tx, reference.tx);
+
+    // Shuffled: the same outputs up to their order (which changes what is
+    // derived from the index), and a valid transaction. Some stream gives
+    // the other order.
+    let orders: Vec<Vec<u64>> = (0..4)
+        .map(|seed| {
+            let signed = w.sign(&mut stream(seed * 1000), &shuffled, key).unwrap();
+            assert!(verify_all(&signed.tx, &shuffled));
+            let found = w.scan_tx(&signed.tx).unwrap();
+            assert_eq!(found.outputs.len(), 2);
+            found.outputs.iter().map(|o| o.amount).collect()
+        })
+        .collect();
+    assert!(orders.contains(&vec![500_000_000_000, 390_000_000_000]));
+    assert!(orders.contains(&vec![390_000_000_000, 500_000_000_000]));
+
+    // Extra entries and attachments are copied; a comment, a receiver and
+    // a flagged attachment are encrypted for the crypt address, with the
+    // checksum that lets both sides find the key again.
+    let recipient = Wallet::generate(&mut stream(77), 0).unwrap();
+    let mut ftp = plain.clone();
+    ftp.crypt_address = AccountPublicAddr::from(&recipient.address());
+    ftp.unlock_time = 5;
+    ftp.expiration_time = 7;
+    ftp.extra = vec![
+        Variant::Comment(b"hello".to_vec()),
+        Variant::UserData(b"data".to_vec()),
+    ];
+    ftp.attachments = vec![
+        Variant::ServiceAttachment(TxServiceAttachment {
+            service_id: PAYMENT_ID_SERVICE_ID.as_bytes().to_vec(),
+            body: b"payment".to_vec(),
+            flags: TX_SERVICE_ATTACHMENT_ENCRYPT_BODY,
+            ..Default::default()
+        }),
+        Variant::ServiceAttachment(TxServiceAttachment {
+            service_id: b"X".to_vec(),
+            body: b"plain".to_vec(),
+            ..Default::default()
+        }),
+    ];
+    let signed = w.sign(&mut stream(0), &ftp, key).unwrap();
+    assert!(verify_all(&signed.tx, &ftp));
+    assert_eq!(
+        names(&signed.tx.extra),
+        [
+            "comment",
+            "user_data",
+            "unlock_time",
+            "expiration_time",
+            "pub_key",
+            "etc_tx_flags16",
+            "checksum",
+            "derivation_hint",
+            "derivation_hint",
+            "zarcanum_tx_data_v1",
+            "extra_attach_info"
+        ]
+    );
+    assert!(signed.tx.extra.contains(&Variant::UnlockTime(5)));
+    assert!(signed.tx.extra.contains(&Variant::ExpirationTime(7)));
+    assert!(
+        signed
+            .tx
+            .extra
+            .contains(&Variant::UserData(b"data".to_vec()))
+    );
+    assert_eq!(signed.tx.attachment.len(), 2);
+    assert_eq!(signed.tx.attachment[1], ftp.attachments[1]);
+    // The recipient decrypts with its own derivation.
+    let derivation = recipient
+        .key_derivation(&signed.tx.tx_pub_key().unwrap())
+        .unwrap();
+    let Variant::Comment(comment) = &signed.tx.extra[0] else {
+        panic!()
+    };
+    assert_ne!(comment, b"hello");
+    let mut comment = comment.clone();
+    chacha8_crypt(&derivation, &mut comment);
+    assert_eq!(comment, b"hello");
+    assert_eq!(
+        recipient.scan_tx(&signed.tx).unwrap().payment_id,
+        Some(b"payment".to_vec())
+    );
+    let Some(Variant::CryptoChecksum(checksum)) = signed
+        .tx
+        .extra
+        .iter()
+        .find(|e| matches!(e, Variant::CryptoChecksum(_)))
+    else {
+        panic!()
+    };
+    let hash = cn_fast_hash(&derivation[..]);
+    assert_eq!(checksum.derivation_hash.to_le_bytes(), hash[..4]);
+    // And the sender, with its spend key.
+    let mut sender_copy = checksum.encrypted_key_derivation;
+    chacha8_crypt(w.spend_secret_key().unwrap(), &mut sender_copy);
+    assert_eq!(sender_copy, *derivation);
+    // The attachment info is the size, hash and count of the attachments.
+    let Some(Variant::ExtraAttachmentInfo(info)) = signed.tx.extra.last() else {
+        panic!()
+    };
+    let bytes = signed.tx.to_bytes();
+    let prefix_len = signed.tx.prefix_bytes().len();
+    let serialized = &bytes[prefix_len..prefix_len + info.sz as usize];
+    assert_eq!((info.cnt, info.hsh), (2, cn_fast_hash(serialized)));
+
+    // The current blob format: sources name their asset, and the signed
+    // blob carries the id, the derivation and the change's key images.
+    let mut ftp = plain.clone();
+    ftp.format = FtpFormat::Current;
+    for source in &mut ftp.sources {
+        source.asset_id = Some(NATIVE_COIN_ASSET_ID);
+    }
+    assert_eq!(FinalizeTxParam::from_bytes(&ftp.to_bytes()).unwrap(), ftp);
+    assert_ne!(ftp.to_bytes().len(), plain.to_bytes().len());
+    let signed = w.sign(&mut stream(0), &ftp, key).unwrap();
+    assert_eq!(signed.tx, reference.tx);
+    assert_eq!(signed.tx_id, signed.tx.prefix_hash());
+    assert_eq!(FinalizedTx::from_bytes(&signed.to_bytes()).unwrap(), signed);
+    // Both outputs of the fixture go back to the wallet.
+    let images: Vec<u64> = signed.outs_key_images.iter().map(|k| k.out_index).collect();
+    let own: Vec<u64> = w
+        .scan_tx(&signed.tx)
+        .unwrap()
+        .outputs
+        .iter()
+        .map(|o| o.output_index)
+        .collect();
+    assert_eq!(images, own);
+    assert!(!images.is_empty());
+    // A source that names another asset than its output has is refused.
+    ftp.sources[0].asset_id = Some(POINT_U);
+    assert_eq!(
+        w.sign(&mut stream(0), &ftp, key).unwrap_err(),
+        Error::SecretMismatch
+    );
+
+    // Version 4: the outputs carry the payment ids of the destinations.
+    let mut ftp = plain.clone();
+    ftp.format = FtpFormat::Current;
+    ftp.tx_version = TRANSACTION_VERSION_POST_HF6;
+    ftp.tx_hardfork_id = 7;
+    ftp.prepared_destinations[0].payment_id = 0x1122_3344_5566_7788;
+    let signed = w.sign(&mut stream(0), &ftp, key).unwrap();
+    assert_eq!((signed.tx.version, signed.tx.hardfork_id), (4, 7));
+    assert_eq!(
+        names(&signed.tx.vout),
+        ["tx_out_zarcanum", "tx_out_zarcanum"]
+    );
+    assert!(verify_all(&signed.tx, &ftp));
+    let back = Transaction::from_bytes(&signed.tx.to_bytes()).unwrap();
+    assert_eq!(back, signed.tx);
+    let found = w.scan_tx(&signed.tx).unwrap();
+    assert_eq!(found.output_payment_ids, [0x1122_3344_5566_7788, 0]);
+    assert_eq!(
+        found.payment_id,
+        Some(0x1122_3344_5566_7788u64.to_le_bytes().to_vec())
+    );
+    // Entries that version 4 encrypts are not supported.
+    ftp.extra.push(Variant::Comment(b"hello".to_vec()));
+    assert_eq!(
+        w.sign(&mut stream(0), &ftp, key).unwrap_err(),
+        Error::Unsupported
+    );
 }
 
 #[test]
@@ -696,15 +929,36 @@ fn sign_errors() {
     let mut ftp = fin.ftp.clone();
     ftp.sources[0].real_out_in_tx_index += 1;
     assert_eq!(sign(&ftp), Error::KeyMismatch);
+    // A global index twice in a ring.
     let mut ftp = fin.ftp.clone();
-    ftp.sources[1].outputs.swap(0, 1);
-    assert_eq!(sign(&ftp), Error::InvalidRing);
+    ftp.sources[1].outputs[0].out_reference = ftp.sources[1].outputs[1].out_reference.clone();
+    assert!(matches!(
+        sign(&ftp),
+        Error::InvalidRing | Error::KeyMismatch
+    ));
     let mut ftp = fin.ftp.clone();
-    ftp.sources[1].outputs[2].out_reference = Variant::RefById(RefById::default());
+    ftp.sources[1].outputs[2].out_reference = Variant::Uint32(1);
     assert_eq!(sign(&ftp), Error::Unsupported);
+    // Without its asset blinding mask the output is of another asset.
     let mut ftp = fin.ftp.clone();
     ftp.sources[2].real_out_asset_id_blinding_mask = [0; 32];
+    assert_eq!(sign(&ftp), Error::Unbalanced);
+    // Not built: multisig sources, the separate mode, asset operations.
+    let mut ftp = fin.ftp.clone();
+    ftp.sources[0].ms_sigs_count = 1;
     assert_eq!(sign(&ftp), Error::Unsupported);
+    let mut ftp = fin.ftp.clone();
+    ftp.flags = 1;
+    assert_eq!(sign(&ftp), Error::Unsupported);
+    let mut ftp = fin.ftp.clone();
+    ftp.extra.push(Variant::AssetOperation(Box::default()));
+    assert_eq!(sign(&ftp), Error::Unsupported);
+    // A destination that must show the native asset id cannot be of
+    // another asset.
+    let mut ftp = fin.ftp.clone();
+    ftp.prepared_destinations[0].flags = TX_DEST_FLAG_EXPLICIT_NATIVE_ASSET_ID;
+    ftp.prepared_destinations[0].asset_id = POINT_U;
+    assert_eq!(sign(&ftp), Error::Unbalanced);
     // A wrong blinding mask does not open the output.
     let mut ftp = fin.ftp.clone();
     ftp.sources[3].real_out_amount_blinding_mask[0] ^= 1;

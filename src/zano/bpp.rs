@@ -15,13 +15,11 @@ use crate::prelude::*;
 use super::Error;
 use super::crypto::{
     self, Transcript, generator_u, msm_vartime, mul_vartime, random_scalar, scalar_1div8,
-    scalar_u64,
 };
 use super::tx::BppSignature;
 
 /// The number of bits of a value.
 const N: usize = 64;
-const LOG2_N: usize = 6;
 /// The most values one proof covers (`c_bpp_values_max`).
 pub const BPP_MAX_VALUES: usize = 32;
 
@@ -85,11 +83,25 @@ fn challenges_yz(commitments_1div8: &[[u8; 32]], a0: &[u8; 32]) -> (Transcript, 
 
 /// The vector `d`: `d[i * N + j] = 2^j * z^(2 * (i + 1))`.
 fn d_vector(m: usize, z_sq: &Scalar) -> Vec<Scalar> {
-    let mut d = Vec::with_capacity(m * N);
+    d_vector_n(m, N, z_sq)
+}
+
+/// `2^bits - 1`, for `bits` up to 248.
+fn all_ones(bits: usize) -> Scalar {
+    let mut bytes = [0u8; 32];
+    for byte in bytes.iter_mut().take(bits / 8) {
+        *byte = 0xff;
+    }
+    Scalar::from_bytes_canonical(&bytes).unwrap_or(Scalar::ZERO)
+}
+
+/// The vector `d` for values of `n` bits.
+fn d_vector_n(m: usize, n: usize, z_sq: &Scalar) -> Vec<Scalar> {
+    let mut d = Vec::with_capacity(m * n);
     let mut z_power = z_sq.clone();
     for _ in 0..m {
         let mut v = z_power.clone();
-        for _ in 0..N {
+        for _ in 0..n {
             let next = v.add(&v);
             d.push(v);
             v = next;
@@ -317,35 +329,81 @@ pub fn verify_bpp(sig: &BppSignature, commitments_1div8: &[[u8; 32]]) -> bool {
 }
 
 fn verify(sig: &BppSignature, commitments_1div8: &[[u8; 32]]) -> Option<bool> {
-    let (m, log2_m) = dimensions(commitments_1div8.len())?;
-    let log2_mn = log2_m + LOG2_N;
-    let mn = m * N;
+    let delta = crypto::scalar(&sig.delta).ok()?;
+    verify_range(
+        &RangeProof {
+            bits: N,
+            max_values: BPP_MAX_VALUES,
+            lv: &sig.lv,
+            rv: &sig.rv,
+            a0: &sig.a0,
+            a: &sig.a,
+            b: &sig.b,
+            r: &sig.r,
+            s: &sig.s,
+            value_generator: generator_u(),
+            masks: &[(delta, EdwardsPoint::generator())],
+        },
+        commitments_1div8,
+    )
+}
+
+/// A Bulletproofs+ range proof with the parameters of its crypto trait
+/// (`bpp_crypto_trait_zano`).
+pub(crate) struct RangeProof<'a> {
+    /// The number of bits of a value (`c_bpp_n`), a power of two.
+    pub bits: usize,
+    /// The most values a proof covers (`c_bpp_values_max`).
+    pub max_values: usize,
+    pub lv: &'a [[u8; 32]],
+    pub rv: &'a [[u8; 32]],
+    pub a0: &'a [u8; 32],
+    pub a: &'a [u8; 32],
+    pub b: &'a [u8; 32],
+    pub r: &'a [u8; 32],
+    pub s: &'a [u8; 32],
+    /// The generator of the values (`bpp_G`).
+    pub value_generator: EdwardsPoint,
+    /// The final responses for the masks, each with its generator
+    /// (`delta` and `bpp_H`; for a double-blinded proof also `delta_2` and
+    /// `bpp_H2`).
+    pub masks: &'a [(Scalar, EdwardsPoint)],
+}
+
+/// `bpp_verify` / `bppe_verify` for one proof.
+pub(crate) fn verify_range(sig: &RangeProof<'_>, commitments_1div8: &[[u8; 32]]) -> Option<bool> {
+    if commitments_1div8.is_empty() || commitments_1div8.len() > sig.max_values {
+        return None;
+    }
+    let n = sig.bits;
+    let m = commitments_1div8.len().next_power_of_two();
+    let log2_mn = (m.trailing_zeros() + n.trailing_zeros()) as usize;
+    let mn = m * n;
     if sig.lv.len() != log2_mn || sig.rv.len() != log2_mn {
         return None;
     }
-    let r = crypto::scalar(&sig.r).ok()?;
-    let s = crypto::scalar(&sig.s).ok()?;
-    let delta = crypto::scalar(&sig.delta).ok()?;
+    let r = crypto::scalar(sig.r).ok()?;
+    let s = crypto::scalar(sig.s).ok()?;
     let point = |bytes: &[u8; 32]| crypto::point(bytes).ok();
 
     // Restore the challenges.
-    let (mut hsc, y, z) = challenges_yz(commitments_1div8, &sig.a0);
+    let (mut hsc, y, z) = challenges_yz(commitments_1div8, sig.a0);
     let z_sq = z.mul(&z);
     let mut e = z.clone();
     let mut e_sq = Vec::with_capacity(log2_mn);
     let mut e_inv = Vec::with_capacity(log2_mn);
-    for (l, r) in sig.lv.iter().zip(&sig.rv) {
+    for (l, r) in sig.lv.iter().zip(sig.rv) {
         hsc.scalar(&e).bytes(l).bytes(r);
         e = hsc.take_scalar();
         e_sq.push(e.mul(&e));
         e_inv.push(e.invert());
     }
-    hsc.scalar(&e).bytes(&sig.a).bytes(&sig.b);
+    hsc.scalar(&e).bytes(sig.a).bytes(sig.b);
     let e_final = hsc.take_scalar();
     let e_final_sq = e_final.mul(&e_final);
     let y_inv = y.invert();
 
-    let d = d_vector(m, &z_sq);
+    let d = d_vector_n(m, n, &z_sq);
     // sum(d) = (2^N - 1) * (z^2 + z^4 + ... + z^(2m))
     let mut z_powers_sum = Scalar::ZERO;
     let mut z_power = z_sq.clone();
@@ -353,7 +411,7 @@ fn verify(sig: &BppSignature, commitments_1div8: &[[u8; 32]]) -> Option<bool> {
         z_powers_sum = z_powers_sum.add(&z_power);
         z_power = z_power.mul(&z_sq);
     }
-    let sum_d = scalar_u64(u64::MAX).mul(&z_powers_sum);
+    let sum_d = all_ones(n).mul(&z_powers_sum);
 
     // s_vec[i] = prod_j e_j^(+1 if bit (log2_mn - 1 - j) of i is set, else -1)
     let mut s_vec: Vec<Scalar> = Vec::with_capacity(mn);
@@ -398,23 +456,23 @@ fn verify(sig: &BppSignature, commitments_1div8: &[[u8; 32]]) -> Option<bool> {
         .mul(&s)
         .add(&e_sq_y.mul(&sum_d).mul(&z))
         .sub(&e_final_sq.mul(&z.sub(&z_sq)).mul(&sum_y));
-    terms.push((g_scalar, generator_u()));
-    terms.push((delta, EdwardsPoint::generator()));
+    terms.push((g_scalar, sig.value_generator));
+    terms.extend(sig.masks.iter().cloned());
     let fixed = msm_vartime(&terms);
 
     // The points of the proof, all to be multiplied by 8.
     let mut terms = Vec::with_capacity(commitments_1div8.len() + 2 * log2_mn + 3);
-    terms.push((e_final_sq.clone(), point(&sig.a0)?));
+    terms.push((e_final_sq.clone(), point(sig.a0)?));
     let mut v_scalar = e_sq_y;
     for commitment in commitments_1div8 {
         v_scalar = v_scalar.mul(&z_sq);
         terms.push((v_scalar.clone(), point(commitment)?));
     }
-    for (((l, r), e_sq), e_inv) in sig.lv.iter().zip(&sig.rv).zip(&e_sq).zip(&e_inv) {
+    for (((l, r), e_sq), e_inv) in sig.lv.iter().zip(sig.rv).zip(&e_sq).zip(&e_inv) {
         terms.push((e_final_sq.mul(e_sq), point(l)?));
         terms.push((e_final_sq.mul(&e_inv.mul(e_inv)), point(r)?));
     }
-    terms.push((e_final, point(&sig.a)?));
-    terms.push((Scalar::ONE, point(&sig.b)?));
+    terms.push((e_final, point(sig.a)?));
+    terms.push((Scalar::ONE, point(sig.b)?));
     Some(fixed == msm_vartime(&terms).mul_by_cofactor())
 }

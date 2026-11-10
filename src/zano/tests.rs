@@ -15,6 +15,8 @@ use super::*;
 use crate::cryptonote::{EdwardsPoint, Scalar, hash_to_ec, scalar_from_bytes};
 
 #[cfg(feature = "alloc")]
+mod chain;
+#[cfg(feature = "alloc")]
 mod full;
 
 pub(super) const VECTORS: &str = include_str!("testdata/go_vectors.txt");
