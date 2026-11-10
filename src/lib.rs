@@ -186,6 +186,8 @@ pub mod trontx;
 pub mod zano;
 #[cfg(feature = "zcash")]
 pub mod zcash;
+#[cfg(all(feature = "alloc", feature = "zcash"))]
+pub mod zcash_builder;
 #[cfg(feature = "zcash")]
 pub mod zcashtx;
 
