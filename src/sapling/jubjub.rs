@@ -109,6 +109,15 @@ impl AffinePoint {
     }
 }
 
+impl Zeroize for AffinePoint {
+    /// Overwrites the point with the neutral element.
+    fn zeroize(&mut self) {
+        self.u.zeroize();
+        self.v.zeroize();
+        *self = AffinePoint::IDENTITY;
+    }
+}
+
 impl ConditionallySelectable for AffinePoint {
     fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
         AffinePoint {
@@ -326,6 +335,18 @@ impl Point {
     /// subgroup and not the identity.
     pub fn is_prime_order(&self) -> bool {
         self.is_torsion_free() && !self.is_identity()
+    }
+}
+
+impl Zeroize for Point {
+    /// Overwrites the point with the neutral element: for points that are
+    /// secret, such as the shared secret of a key agreement.
+    fn zeroize(&mut self) {
+        self.u.zeroize();
+        self.v.zeroize();
+        self.z.zeroize();
+        self.t.zeroize();
+        *self = Point::IDENTITY;
     }
 }
 

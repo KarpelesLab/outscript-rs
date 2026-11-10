@@ -74,15 +74,40 @@ pub fn ka_derive_public(esk: &Fr, g_d: &Point) -> Point {
 
 /// `KA.Agree(sk, P) = [8·sk] P`: the shared secret, from either side
 /// (`esk` and `pk_d`, or `ivk` and `epk`).
+///
+/// The result is secret: wipe it (a [`Point`] is
+/// [`Zeroize`](purecrypto::zeroize::Zeroize)) once the key is derived.
 pub fn ka_agree(sk: &Fr, p: &Point) -> Point {
-    p.mul(sk).mul_by_cofactor()
+    let mut partial = p.mul(sk);
+    let shared = partial.mul_by_cofactor();
+    partial.zeroize();
+    shared
 }
 
 /// The symmetric key of the note ciphertext for a shared secret.
 fn note_key(shared_secret: &Point, ephemeral_key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let mut affine = shared_secret.to_affine();
+    let key = affine_note_key(&affine, ephemeral_key);
+    affine.zeroize();
+    key
+}
+
+/// [`note_key`] for a shared secret in affine coordinates.
+fn affine_note_key(
+    shared_secret: &super::jubjub::AffinePoint,
+    ephemeral_key: &[u8; 32],
+) -> Zeroizing<[u8; 32]> {
     let mut secret = shared_secret.to_bytes();
     let key = Zeroizing::new(kdf_sapling(&secret, ephemeral_key));
     secret.zeroize();
+    key
+}
+
+/// `KA.Agree` then the key derivation, wiping the shared secret.
+fn agreed_note_key(sk: &Fr, p: &Point, ephemeral_key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let mut shared = ka_agree(sk, p);
+    let key = note_key(&shared, ephemeral_key);
+    shared.zeroize();
     key
 }
 
@@ -113,7 +138,7 @@ pub fn encrypt_note_with_esk(
 ) -> ([u8; 32], [u8; ENC_CIPHERTEXT_SIZE]) {
     let recipient = note.recipient();
     let ephemeral_key = ka_derive_public(esk, recipient.g_d()).to_bytes();
-    let key = note_key(&ka_agree(esk, recipient.pk_d()), &ephemeral_key);
+    let key = agreed_note_key(esk, recipient.pk_d(), &ephemeral_key);
     let mut out = [0u8; ENC_CIPHERTEXT_SIZE];
     let mut pt = note_plaintext(note, memo);
     let (body, tag) = out.split_at_mut(NOTE_PLAINTEXT_SIZE);
@@ -219,7 +244,7 @@ fn parse_and_check(
 fn ivk_note_key(ivk: &IncomingViewingKey, ephemeral_key: &[u8; 32]) -> Option<Zeroizing<[u8; 32]>> {
     // ZIP-216: only canonical encodings are points
     let epk = Point::from_bytes(ephemeral_key)?;
-    Some(note_key(&ka_agree(ivk.to_scalar(), &epk), ephemeral_key))
+    Some(agreed_note_key(ivk.to_scalar(), &epk, ephemeral_key))
 }
 
 /// Decrypts and authenticates a note ciphertext, returning the plaintext.
@@ -313,7 +338,7 @@ pub fn try_output_recovery_with_ock(
     let pk_d = Point::from_bytes_prime_order(pk_d)?;
     let mut esk = Fr::from_bytes(esk.try_into().ok()?)?;
 
-    let key = note_key(&ka_agree(&esk, &pk_d), ephemeral_key);
+    let key = agreed_note_key(&esk, &pk_d, ephemeral_key);
     let result = (|| {
         let pt = open_note(&key, enc_ciphertext)?;
         let (compact, memo) = split_plaintext(&pt)?;
@@ -357,6 +382,141 @@ pub fn try_output_recovery_with_ovk(
         out_ciphertext,
         zip212,
     )
+}
+
+/// The number of key agreements [`try_note_decryption_batch`] and
+/// [`try_compact_note_decryption_batch`] normalize together.
+const BATCH_SIZE: usize = 16;
+
+/// One pending trial of a batch: which output and key, the output itself
+/// and its ephemeral key.
+type Pending<T> = Option<(usize, usize, T, [u8; 32])>;
+
+/// The shared part of batched trial decryption: derives the note key of
+/// every (output, key) pair and hands it to `trial` with the indices of the
+/// output and of the key, in that order.
+///
+/// Each ephemeral key is decoded once for all the keys, and the shared
+/// secrets are brought to affine coordinates [`BATCH_SIZE`] at a time, with
+/// one field inversion for the lot.
+fn batch_note_keys<'a, T: Copy>(
+    ivks: &[IncomingViewingKey],
+    outputs: impl Iterator<Item = (&'a [u8; 32], T)>,
+    mut trial: impl FnMut(usize, usize, T, &[u8; 32], &[u8; 32]),
+) {
+    let mut pending: [Pending<T>; BATCH_SIZE] = [None; BATCH_SIZE];
+    let mut shared = [Point::IDENTITY; BATCH_SIZE];
+    let mut filled = 0;
+    let mut flush = |pending: &mut [Pending<T>], shared: &mut [Point]| {
+        let mut affine = [super::jubjub::AffinePoint::IDENTITY; BATCH_SIZE];
+        let affine = &mut affine[..shared.len()];
+        Point::batch_to_affine(shared, affine);
+        for (entry, secret) in pending.iter_mut().zip(affine.iter()) {
+            if let Some((output, ivk, item, ephemeral_key)) = entry.take() {
+                let key = affine_note_key(secret, &ephemeral_key);
+                trial(output, ivk, item, &ephemeral_key, &key);
+            }
+        }
+        shared.zeroize();
+        affine.zeroize();
+    };
+    for (index, (ephemeral_key, item)) in outputs.enumerate() {
+        // ZIP-216: only canonical encodings are points
+        let Some(epk) = Point::from_bytes(ephemeral_key) else {
+            continue;
+        };
+        for (ivk_index, ivk) in ivks.iter().enumerate() {
+            shared[filled] = ka_agree(ivk.to_scalar(), &epk);
+            pending[filled] = Some((index, ivk_index, item, *ephemeral_key));
+            filled += 1;
+            if filled == BATCH_SIZE {
+                flush(&mut pending, &mut shared);
+                filled = 0;
+            }
+        }
+    }
+    flush(&mut pending[..filled], &mut shared[..filled]);
+}
+
+/// Trial-decrypts many outputs with many incoming viewing keys: the batched
+/// form of [`try_note_decryption`], with the same checks and the same
+/// results.
+///
+/// Each output is given as its ephemeral key, its note commitment `cmu` and
+/// its note ciphertext. `found` is called for every output a key decrypts,
+/// with the index of the output, the index of the key in `ivks`, the note
+/// and its memo, in the order of the outputs.
+///
+/// The work that does not depend on the key is done once per output (the
+/// decoding of the ephemeral key), and the shared secrets are normalized in
+/// groups with a single field inversion, which makes scanning with several
+/// keys cheaper than as many calls of [`try_note_decryption`]. Nothing is
+/// allocated.
+pub fn try_note_decryption_batch<'a>(
+    ivks: &[IncomingViewingKey],
+    outputs: impl IntoIterator<Item = (&'a [u8; 32], &'a [u8; 32], &'a [u8; ENC_CIPHERTEXT_SIZE])>,
+    zip212: Zip212Enforcement,
+    mut found: impl FnMut(usize, usize, Note, &[u8; MEMO_SIZE]),
+) {
+    let outputs = outputs
+        .into_iter()
+        .map(|(ephemeral_key, cmu, enc)| (ephemeral_key, (cmu, enc)));
+    batch_note_keys(
+        ivks,
+        outputs,
+        |output, ivk_index, (cmu, enc), ephemeral_key, key| {
+            let Some(ivk) = ivks.get(ivk_index) else {
+                return;
+            };
+            let decrypted = (|| {
+                let pt = open_note(key, enc)?;
+                let (compact, memo) = split_plaintext(&pt)?;
+                let recipient = Recipient::Ivk(ivk);
+                let note = parse_and_check(compact, recipient, ephemeral_key, cmu, None, zip212)?;
+                Some((note, memo))
+            })();
+            if let Some((note, mut memo)) = decrypted {
+                found(output, ivk_index, note, &memo);
+                memo.zeroize();
+            }
+        },
+    );
+}
+
+/// Trial-decrypts many compact outputs (ZIP-307) with many incoming viewing
+/// keys: the batched form of [`try_compact_note_decryption`], with the same
+/// checks and the same results. This is how a light client scans blocks.
+///
+/// Each output is given as its ephemeral key, its note commitment `cmu` and
+/// the first 52 bytes of its note ciphertext. `found` is called for every
+/// output a key decrypts, with the index of the output, the index of the
+/// key in `ivks` and the note, in the order of the outputs. See
+/// [`try_note_decryption_batch`] for what the batch shares.
+pub fn try_compact_note_decryption_batch<'a>(
+    ivks: &[IncomingViewingKey],
+    outputs: impl IntoIterator<Item = (&'a [u8; 32], &'a [u8; 32], &'a [u8; COMPACT_NOTE_SIZE])>,
+    zip212: Zip212Enforcement,
+    mut found: impl FnMut(usize, usize, Note),
+) {
+    let outputs = outputs
+        .into_iter()
+        .map(|(ephemeral_key, cmu, compact)| (ephemeral_key, (cmu, compact)));
+    batch_note_keys(
+        ivks,
+        outputs,
+        |output, ivk_index, (cmu, compact), ephemeral_key, key| {
+            let Some(ivk) = ivks.get(ivk_index) else {
+                return;
+            };
+            let mut pt = Zeroizing::new(*compact);
+            // the AEAD's keystream for the message starts at block 1
+            ChaCha20::new(key).apply_keystream(&NONCE, 1, &mut pt[..]);
+            let recipient = Recipient::Ivk(ivk);
+            if let Some(note) = parse_and_check(&pt, recipient, ephemeral_key, cmu, None, zip212) {
+                found(output, ivk_index, note);
+            }
+        },
+    );
 }
 
 #[cfg(test)]
@@ -686,5 +846,83 @@ mod tests {
             try_note_decryption(&s.ivk, &s.epk, &s.cmu, &seal(&bad), GracePeriod),
             None
         );
+    }
+
+    /// Batched trial decryption gives exactly what the single functions
+    /// give, for every pair of key and output: the ten outputs of
+    /// `sapling_note_encryption.json` and their keys, a ZIP-212 output, and
+    /// outputs no key can read. With more pairs than one batch holds.
+    #[test]
+    fn batch_matches_single() {
+        type Out = ([u8; 32], [u8; 32], [u8; ENC_CIPHERTEXT_SIZE]);
+        let mut ivks = Vec::new();
+        let mut outputs: Vec<Out> = Vec::new();
+        let json = include_str!("testdata/sapling_note_encryption.json");
+        for_each_row(json, |_, row| {
+            ivks.push(IncomingViewingKey::from_bytes(&row.array("ivk")).unwrap());
+            outputs.push((row.array("epk"), row.array("cmu"), row.array("c_enc")));
+        });
+        let s = zip212_output();
+        ivks.insert(3, s.ivk.clone());
+        outputs.insert(1, (s.epk, s.cmu, s.enc));
+        // not a point; a tampered ciphertext; another commitment
+        outputs.insert(4, ([0xff; 32], s.cmu, s.enc));
+        let mut tampered = s.enc;
+        tampered[100] ^= 1;
+        outputs.push((s.epk, s.cmu, tampered));
+        let mut cmu = s.cmu;
+        cmu[5] ^= 1;
+        outputs.push((s.epk, cmu, s.enc));
+        assert!(ivks.len() * outputs.len() > 3 * BATCH_SIZE);
+
+        for zip212 in [Off, GracePeriod, On] {
+            let mut expected = Vec::new();
+            let mut expected_compact = Vec::new();
+            for (o, (epk, cmu, enc)) in outputs.iter().enumerate() {
+                for (i, ivk) in ivks.iter().enumerate() {
+                    if let Some((note, memo)) = try_note_decryption(ivk, epk, cmu, enc, zip212) {
+                        expected.push((o, i, note, memo));
+                    }
+                    let c = compact(enc);
+                    if let Some(note) = try_compact_note_decryption(ivk, epk, cmu, &c, zip212) {
+                        expected_compact.push((o, i, note));
+                    }
+                }
+            }
+            let mut got = Vec::new();
+            try_note_decryption_batch(
+                &ivks,
+                outputs.iter().map(|(epk, cmu, enc)| (epk, cmu, enc)),
+                zip212,
+                |o, i, note, memo| got.push((o, i, note, *memo)),
+            );
+            assert_eq!(got, expected);
+            let compacts: Vec<_> = outputs.iter().map(|(_, _, enc)| compact(enc)).collect();
+            let mut got = Vec::new();
+            try_compact_note_decryption_batch(
+                &ivks,
+                outputs
+                    .iter()
+                    .zip(&compacts)
+                    .map(|((epk, cmu, _), c)| (epk, cmu, c)),
+                zip212,
+                |o, i, note| got.push((o, i, note)),
+            );
+            assert_eq!(got, expected_compact);
+            // the tampered ciphertext still decrypts in compact form
+            let n = match zip212 {
+                Off => 10,
+                GracePeriod => 11,
+                On => 1,
+            };
+            assert_eq!(expected.len(), n);
+            assert_eq!(
+                expected_compact.len(),
+                if zip212 == Off { 10 } else { n + 1 }
+            );
+        }
+        // no keys, no outputs
+        try_note_decryption_batch(&[], [(&s.epk, &s.cmu, &s.enc)], On, |_, _, _, _| panic!());
+        try_compact_note_decryption_batch(&ivks, [], On, |_, _, _| panic!());
     }
 }
