@@ -243,6 +243,7 @@ fn check_count(data: &[u8], pos: usize, count: u64) -> Result<usize, Error> {
 pub const MAX_DEPTH: usize = 64;
 
 fn decode_value(data: &[u8], pos: &mut usize, depth: usize) -> Result<Cbor, Error> {
+    let initial = data.get(*pos).copied();
     let (major, arg, indefinite) = read_head(data, pos)?;
     if indefinite && matches!(major, 0 | 2 | 4 | 5) {
         return Err(Error::UnsupportedIndefiniteLength);
@@ -273,10 +274,13 @@ fn decode_value(data: &[u8], pos: &mut usize, depth: usize) -> Result<Cbor, Erro
             }
             Ok(Cbor::Map(entries))
         }
-        7 => match arg {
-            20 => Ok(Cbor::Bool(false)),
-            21 => Ok(Cbor::Bool(true)),
-            22 | 23 => Ok(Cbor::Null),
+        // Only the one-byte false, true and null. The argument alone does not
+        // tell them from a float or a two-byte simple value that happens to
+        // carry 20..=22 (`f9 00 14`, `f8 14`), and undefined (23) is not null.
+        7 => match initial {
+            Some(0xf4) => Ok(Cbor::Bool(false)),
+            Some(0xf5) => Ok(Cbor::Bool(true)),
+            Some(0xf6) => Ok(Cbor::Null),
             _ => Err(Error::UnsupportedSimpleValue(arg)),
         },
         _ => Err(Error::UnsupportedMajorType(major)),
@@ -607,6 +611,40 @@ mod tests {
         let (dec, n) = Cbor::decode(&enc).unwrap();
         assert_eq!(n, enc.len());
         assert_eq!(dec, v);
+    }
+
+    /// Major type 7 decodes by its exact initial byte: floats, two-byte simple
+    /// values, undefined and the break code are not false, true or null.
+    #[test]
+    fn simple_values_are_exact() {
+        assert_eq!(Cbor::decode(&[0xf4]), Ok((Cbor::Bool(false), 1)));
+        assert_eq!(Cbor::decode(&[0xf5]), Ok((Cbor::Bool(true), 1)));
+        assert_eq!(Cbor::decode(&[0xf6]), Ok((Cbor::Null, 1)));
+        for (data, arg) in [
+            (&[0xf7][..], 23),                      // undefined
+            (&[0xf8, 0x14], 20),                    // simple(20), two bytes
+            (&[0xf8, 0x16], 22),                    // simple(22), two bytes
+            (&[0xf9, 0x00, 0x14], 20),              // half float
+            (&[0xf9, 0x00, 0x15], 21),              // half float
+            (&[0xfa, 0x00, 0x00, 0x00, 0x16], 22),  // single float
+            (&[0xfb, 0, 0, 0, 0, 0, 0, 0, 20], 20), // double float
+            (&[0xf3], 19),                          // unassigned
+            (&[0xff], 0),                           // break
+        ] {
+            assert_eq!(
+                Cbor::decode(data),
+                Err(Error::UnsupportedSimpleValue(arg)),
+                "{data:x?}"
+            );
+            // and inside a container
+            let mut wrapped = vec![0x81];
+            wrapped.extend_from_slice(data);
+            assert_eq!(
+                Cbor::decode(&wrapped),
+                Err(Error::UnsupportedSimpleValue(arg)),
+                "{wrapped:x?}"
+            );
+        }
     }
 
     #[test]
