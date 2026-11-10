@@ -46,7 +46,10 @@ use super::{Fp, Fq, pallas};
 
 mod action;
 pub(crate) mod add_chip;
+pub(crate) mod commit_ivk;
 pub(crate) mod ecc;
+pub(crate) mod gadget;
+pub(crate) mod note_commit;
 pub(crate) mod poseidon;
 pub(crate) mod sinsemilla;
 pub(crate) mod utilities;
