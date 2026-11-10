@@ -1426,7 +1426,11 @@ fn sign_unified_mixed_inputs() {
         .unified_sighash(&keys, 0, 0x21, &UnifiedSpend::Legacy(&p2pkh))
         .unwrap();
     assert!(ecdsa_ok(0, &digest, 0x21));
-    assert_ne!(digest, tx.legacy_sighash(0, &p2pkh, 0x21).unwrap());
+    assert_ne!(digest, tx.legacy_sighash(0, &p2pkh, 1).unwrap());
+    assert_eq!(
+        tx.legacy_sighash(0, &p2pkh, 0x21),
+        Err(Error::UnsupportedSighash)
+    );
 
     let pk_hash = crate::hash::hash160(&pk.serialize_compressed());
     let digest = tx.segwit_v0_midstate().sighash(
@@ -1546,4 +1550,142 @@ fn sign_unified_tapscript() {
         .unified_sighash(&probe, 0, 0x21, &UnifiedSpend::KEY_PATH)
         .unwrap();
     assert_ne!(digest, key_path);
+}
+
+/// Outside the unified sighash, ECDSA inputs are signed with `SIGHASH_ALL`
+/// only (plus the Bitcoin Cash `ALL|FORKID` for non-segwit schemes): every
+/// other type is refused rather than signed over the wrong preimage.
+#[test]
+fn sign_rejects_unsupported_ecdsa_sighash() {
+    let k = key("eb696a065ef48a2192da5b28b694f87544b30fae8327c4510137a922f32c6dcf");
+    let mut tx = BtcTx {
+        version: 2,
+        ..Default::default()
+    };
+    tx.inputs.push(BtcTxInput {
+        txid: [7; 32],
+        ..Default::default()
+    });
+    tx.add_output("bc1q0yy3juscd3zfavw76g4h3eqdqzda7qyf58rj4m", 1_000)
+        .unwrap();
+    let sign = |scheme: &str, sighash: u32| {
+        let mut tx = tx.clone();
+        tx.sign(&[BtcTxSign::new(&k, scheme).amount(5_000).sighash(sighash)])
+    };
+
+    let legacy = ["p2pk", "p2puk", "p2pkh", "p2pukh"];
+    let segwit = [
+        "p2wpkh",
+        "p2sh:p2wpkh",
+        "p2wsh",
+        "p2wsh:p2pk",
+        "p2wsh:p2puk",
+        "p2wsh:p2pkh",
+        "p2wsh:p2pukh",
+    ];
+    for scheme in legacy.iter().chain(&segwit) {
+        // 0 defaults to SIGHASH_ALL
+        for ok in [0u32, 0x01] {
+            assert_eq!(sign(scheme, ok), Ok(()), "{scheme} {ok:#x}");
+        }
+        // NONE, SINGLE, their ANYONECANPAY forms, bare flags, and types that
+        // do not fit the signature's single byte
+        for bad in [
+            0x02u32, 0x03, 0x04, 0x40, 0x42, 0x43, 0x80, 0x81, 0x82, 0x83, 0xc1, 0x101, 0x141,
+            0x4f41,
+        ] {
+            assert_eq!(
+                sign(scheme, bad),
+                Err(Error::UnsupportedSighash),
+                "{scheme} {bad:#x}"
+            );
+        }
+    }
+    // the fork id exists only where there is no segwit
+    for scheme in segwit {
+        assert_eq!(
+            sign(scheme, 0x41),
+            Err(Error::UnsupportedSighash),
+            "{scheme}"
+        );
+    }
+    // a refused input is left unsigned
+    let mut unsigned = tx.clone();
+    let r = unsigned.sign(&[BtcTxSign::new(&k, "p2pkh").sighash(0x02)]);
+    assert_eq!(r, Err(Error::UnsupportedSighash));
+    assert!(unsigned.inputs[0].script.is_empty());
+}
+
+/// `ALL|FORKID` (Bitcoin Cash) signs every non-segwit scheme, bare keys
+/// included, over the BIP-143 preimage of its scriptPubKey and amount.
+#[test]
+fn sign_fork_id_uses_bip143_preimage() {
+    use crate::crypto::secp256k1::parse_der_signature;
+    use crate::pushbytes::parse_push_bytes;
+
+    let k = key("eb696a065ef48a2192da5b28b694f87544b30fae8327c4510137a922f32c6dcf");
+    let pk = k.public_key();
+    let s = Script::new(k.public_key());
+    let mut tx = BtcTx {
+        version: 2,
+        ..Default::default()
+    };
+    tx.inputs.push(BtcTxInput {
+        txid: [7; 32],
+        vout: 3,
+        sequence: 0xffff_fffe,
+        ..Default::default()
+    });
+    tx.add_output("bc1q0yy3juscd3zfavw76g4h3eqdqzda7qyf58rj4m", 1_000)
+        .unwrap();
+
+    for scheme in ["p2pk", "p2puk", "p2pkh", "p2pukh"] {
+        let spk = s.generate(scheme).unwrap();
+        let mut signed = tx.clone();
+        signed
+            .sign(&[BtcTxSign::new(&k, scheme).amount(5_000).sighash(0x41)])
+            .unwrap();
+        let inp = &signed.inputs[0];
+        assert!(inp.witnesses.is_empty(), "{scheme}");
+
+        let (sig, used) = parse_push_bytes(&inp.script).unwrap();
+        let (der, flag) = sig.split_at(sig.len() - 1);
+        assert_eq!(flag, [0x41], "{scheme}");
+        let (r, sv) = parse_der_signature(der).unwrap();
+
+        // the scriptCode of a bare or P2PKH spend is its scriptPubKey
+        let mid = signed.segwit_v0_midstate();
+        let digest = mid.sighash(&inp.raw(), &spk, 5_000, 0x41);
+        assert!(pk.verify(&digest, &r, &sv), "{scheme}");
+        // it commits to the amount, unlike the legacy sighash
+        let other = mid.sighash(&inp.raw(), &spk, 5_001, 0x41);
+        assert!(!pk.verify(&other, &r, &sv), "{scheme}");
+        let legacy = signed.legacy_sighash(0, &spk, 1).unwrap();
+        assert!(!pk.verify(&legacy, &r, &sv), "{scheme}");
+
+        // what follows the signature: nothing for a bare key, else the key
+        let rest = &inp.script[used..];
+        match scheme {
+            "p2pk" | "p2puk" => assert!(rest.is_empty(), "{scheme}"),
+            _ => {
+                let name = if scheme == "p2pkh" {
+                    "pubkey:comp"
+                } else {
+                    "pubkey:uncomp"
+                };
+                let want = s.generate(name).unwrap();
+                assert_eq!(parse_push_bytes(rest).unwrap().0, want, "{scheme}");
+            }
+        }
+
+        // SIGHASH_ALL still signs the legacy preimage
+        let mut signed = tx.clone();
+        signed.sign(&[BtcTxSign::new(&k, scheme)]).unwrap();
+        let (sig, _) = parse_push_bytes(&signed.inputs[0].script).unwrap();
+        let (der, flag) = sig.split_at(sig.len() - 1);
+        assert_eq!(flag, [0x01], "{scheme}");
+        let (r, sv) = parse_der_signature(der).unwrap();
+        let legacy = signed.legacy_sighash(0, &spk, 1).unwrap();
+        assert!(pk.verify(&legacy, &r, &sv), "{scheme}");
+    }
 }

@@ -149,6 +149,11 @@ pub struct BtcTxSign<'a> {
     /// Sighash flag. 0 defaults to `SIGHASH_ALL`, except for taproot where it
     /// is `SIGHASH_DEFAULT`; taproot accepts every BIP-341 type. Setting
     /// [`SIGHASH_UNIFIED`] opts into the unified sighash (see [`BtcTx::sign`]).
+    ///
+    /// Otherwise the ECDSA schemes only sign `SIGHASH_ALL` (1), or for the
+    /// non-segwit ones (`p2pk`, `p2puk`, `p2pkh`, `p2pukh`) the Bitcoin Cash
+    /// `ALL|FORKID` (0x41), which uses the BIP-143 preimage and so needs the
+    /// `amount`. Any other value fails with [`Error::UnsupportedSighash`].
     pub sighash: u32,
     /// scriptPubKey of the output being spent (required for taproot, and for
     /// every input once any input uses the unified sighash).
@@ -209,6 +214,22 @@ impl<'a> BtcTxSign<'a> {
     }
 }
 
+/// `SIGHASH_ALL`, the only type the legacy and BIP-143 preimages built here
+/// commit with.
+const SIGHASH_ALL: u32 = 0x01;
+/// `SIGHASH_ALL|SIGHASH_FORKID` of the Bitcoin Cash style networks (fork id
+/// 0): non-segwit inputs signed over the BIP-143 preimage.
+const SIGHASH_ALL_FORKID: u32 = 0x41;
+
+/// How an ECDSA-signed input is spent, which selects its sighash algorithm.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EcdsaSpend {
+    /// Bare or P2SH script.
+    Legacy,
+    /// Segwit v0 program.
+    SegwitV0,
+}
+
 fn signer_pubkey_script(key: &dyn Signer, name: &str) -> Result<Vec<u8>, Error> {
     let pk = key.ecdsa_public_key().ok_or(Error::NoPublicKey)?;
     Script::new(PubKey::Secp256k1(pk)).generate(name)
@@ -222,6 +243,11 @@ impl BtcTx {
     /// `doc/unified-sighash.md`) rather than the legacy, BIP-143 or BIP-341
     /// one, whatever the scheme. It commits to every spent output, so every
     /// entry then needs its `amount` and `prev_script`.
+    ///
+    /// Without it, ECDSA inputs are signed with `SIGHASH_ALL` (or the Bitcoin
+    /// Cash `ALL|FORKID` for non-segwit schemes); other types fail with
+    /// [`Error::UnsupportedSighash`] rather than produce a signature over the
+    /// wrong message.
     pub fn sign(&mut self, keys: &[BtcTxSign]) -> Result<(), Error> {
         if self.inputs.is_empty() || self.inputs.len() != keys.len() {
             return Err(Error::KeyCount);
@@ -241,21 +267,28 @@ impl BtcTx {
             let key = k.key.ok_or(Error::MissingKey)?;
 
             match k.scheme.as_str() {
-                "p2pk" => {
-                    let script_code = signer_pubkey_script(key, "p2pk")?;
-                    let digest = self.ecdsa_digest(&mut cache, n, &script_code, false, sighash)?;
+                "p2pk" | "p2puk" => {
+                    let script_code = signer_pubkey_script(key, &k.scheme)?;
+                    let digest = self.ecdsa_digest(
+                        &mut cache,
+                        n,
+                        &script_code,
+                        EcdsaSpend::Legacy,
+                        sighash,
+                    )?;
                     let mut sig: Vec<u8> = key.sign_ecdsa_der(&digest)?.into();
                     sig.push((sighash & 0xff) as u8);
                     self.inputs[n].script = push_bytes(&sig);
                 }
                 "p2pkh" | "p2pukh" => {
-                    if sighash & 0x40 == 0x40 {
-                        // bitcoin-cash forkid: same preimage as segwit
-                        self.p2wpkh_sign(&mut cache, n, k, sighash)?;
-                        continue;
-                    }
                     let script_code = signer_pubkey_script(key, &k.scheme)?;
-                    let digest = self.ecdsa_digest(&mut cache, n, &script_code, false, sighash)?;
+                    let digest = self.ecdsa_digest(
+                        &mut cache,
+                        n,
+                        &script_code,
+                        EcdsaSpend::Legacy,
+                        sighash,
+                    )?;
                     let mut sig: Vec<u8> = key.sign_ecdsa_der(&digest)?.into();
                     sig.push((sighash & 0xff) as u8);
                     let pubkey = if k.scheme == "p2pkh" {
@@ -283,14 +316,18 @@ impl BtcTx {
     }
 
     /// The digest an ECDSA signature on input `n` commits to: the unified
-    /// sighash if `sighash` opts in, otherwise BIP-143 for segwit inputs and
-    /// the legacy one for the rest.
+    /// sighash if `sighash` opts in, otherwise BIP-143 for segwit inputs (and
+    /// for legacy ones signing with the Bitcoin Cash fork id) and the legacy
+    /// one for the rest.
+    ///
+    /// Outside the unified sighash only the `SIGHASH_ALL` preimages are
+    /// implemented, so every other type is refused.
     fn ecdsa_digest(
         &self,
         cache: &mut SighashCache<'_, '_>,
         n: usize,
         script_code: &[u8],
-        segwit: bool,
+        spend: EcdsaSpend,
         sighash: u32,
     ) -> Result<[u8; 32], Error> {
         if sighash & u32::from(SIGHASH_UNIFIED) != 0 {
@@ -299,14 +336,18 @@ impl BtcTx {
                 Ok(t) if t & 0x40 == 0 => t,
                 _ => return Err(Error::UnsupportedSighash),
             };
-            let spend = if segwit {
-                UnifiedSpend::SegwitV0(script_code)
-            } else {
-                UnifiedSpend::Legacy(script_code)
+            let spend = match spend {
+                EcdsaSpend::SegwitV0 => UnifiedSpend::SegwitV0(script_code),
+                EcdsaSpend::Legacy => UnifiedSpend::Legacy(script_code),
             };
             return self.unified_digest(cache, n, hash_type, &spend);
         }
-        if segwit {
+        let bip143 = match (spend, sighash) {
+            (EcdsaSpend::Legacy, SIGHASH_ALL) => false,
+            (EcdsaSpend::SegwitV0, SIGHASH_ALL) | (EcdsaSpend::Legacy, SIGHASH_ALL_FORKID) => true,
+            _ => return Err(Error::UnsupportedSighash),
+        };
+        if bip143 {
             let mid = *cache
                 .segwit
                 .get_or_insert_with(|| self.segwit_v0_midstate());
@@ -341,23 +382,14 @@ impl BtcTx {
         sighash: u32,
     ) -> Result<(), Error> {
         let key = k.key.ok_or(Error::MissingKey)?;
-        let pubkey = if k.scheme == "p2pukh" {
-            signer_pubkey_script(key, "pubkey:uncomp")?
-        } else {
-            signer_pubkey_script(key, "pubkey:comp")?
-        };
+        let pubkey = signer_pubkey_script(key, "pubkey:comp")?;
         let pk_hash = hash160(&pubkey);
         let script_code = p2pkh_script_code(&pk_hash);
-        let digest = self.ecdsa_digest(cache, n, &script_code, true, sighash)?;
+        let digest = self.ecdsa_digest(cache, n, &script_code, EcdsaSpend::SegwitV0, sighash)?;
         let mut sig: Vec<u8> = key.sign_ecdsa_der(&digest)?.into();
         sig.push((sighash & 0xff) as u8);
 
         match k.scheme.as_str() {
-            "p2pkh" | "p2pukh" => {
-                let mut script = push_bytes(&sig);
-                script.extend_from_slice(&push_bytes(&pubkey));
-                self.inputs[n].script = script;
-            }
             "p2wpkh" => {
                 self.inputs[n].witnesses = vec![sig, pubkey];
                 self.inputs[n].script = Vec::new();
@@ -388,7 +420,7 @@ impl BtcTx {
             (inner, signer_pubkey_script(key, inner)?)
         };
 
-        let digest = self.ecdsa_digest(cache, n, &witness_script, true, sighash)?;
+        let digest = self.ecdsa_digest(cache, n, &witness_script, EcdsaSpend::SegwitV0, sighash)?;
         let mut sig: Vec<u8> = key.sign_ecdsa_der(&digest)?.into();
         sig.push((sighash & 0xff) as u8);
 
@@ -702,7 +734,7 @@ impl BtcTxInput {
         let p2puk_script = vec![0u8; 67];
         let p2pkh_script = vec![0u8; 25];
         match scheme {
-            "p2pk" => {
+            "p2pk" | "p2puk" => {
                 self.script = push_bytes(&empty_sig);
                 self.witnesses.clear();
             }
@@ -816,7 +848,7 @@ impl BtcTx {
 
     /// Pre-segwit legacy sighash: clear inputs, substitute `script_code` at
     /// input `n`, serialize without witness, append the sighash flag (u32 LE),
-    /// double-SHA256.
+    /// double-SHA256. Only `SIGHASH_ALL` (`flag` 1) is supported.
     pub(crate) fn legacy_sighash(
         &self,
         n: usize,

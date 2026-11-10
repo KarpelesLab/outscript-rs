@@ -10,7 +10,8 @@
 //!
 //! Legacy and segwit v0 sighashes support whole-transaction commitments only:
 //! `SIGHASH_ALL` (including the Bitcoin Cash `ALL|FORKID` flag, which shares
-//! the BIP-143 preimage). Taproot supports every BIP-341 hash type, the annex
+//! the BIP-143 preimage); [`RawTx::legacy_sighash`] and
+//! [`RawTx::segwit_v0_sighash`] refuse any other type. Taproot supports every BIP-341 hash type, the annex
 //! and script-path spends through [`RawTx::taproot_sighash`].
 //!
 //! The unified opt-in sighash ([`RawTx::unified_sighash`]), selected by
@@ -149,6 +150,12 @@ fn output_count<T: TxSource + ?Sized>(tx: &T) -> usize {
     n
 }
 
+/// `SIGHASH_ALL`: the signature commits to every input and output.
+const SIGHASH_ALL: u32 = 0x01;
+/// `SIGHASH_ALL|SIGHASH_FORKID` of the Bitcoin Cash style networks (fork id
+/// 0), signed over the BIP-143 preimage.
+const SIGHASH_ALL_FORKID: u32 = 0x41;
+
 /// The legacy sighash of input `index` of `tx` (see [`RawTx::legacy_sighash`]).
 pub(crate) fn legacy_sighash_of<T: TxSource + ?Sized>(
     tx: &T,
@@ -158,6 +165,10 @@ pub(crate) fn legacy_sighash_of<T: TxSource + ?Sized>(
 ) -> Result<[u8; 32], Error> {
     if index >= tx.input_count() {
         return Err(Error::InputIndex);
+    }
+    // the preimage below is the SIGHASH_ALL one
+    if sighash_type != SIGHASH_ALL {
+        return Err(Error::UnsupportedSighash);
     }
     Ok(dsha256_with(|s| {
         s.put(&tx.version().to_le_bytes());
@@ -297,6 +308,9 @@ impl<'a> RawTx<'a> {
     /// The pre-segwit sighash of input `index`: the transaction with every
     /// scriptSig emptied except `script_code` at `index`, followed by the
     /// 4-byte `sighash_type`, double SHA-256'd.
+    ///
+    /// That is the `SIGHASH_ALL` preimage: any `sighash_type` other than 1
+    /// fails with [`Error::UnsupportedSighash`].
     pub fn legacy_sighash(
         &self,
         index: usize,
@@ -314,6 +328,10 @@ impl<'a> RawTx<'a> {
     /// The BIP-143 (segwit v0) sighash of input `index`. Prefer
     /// [`segwit_v0_midstate`](Self::segwit_v0_midstate) when signing several
     /// inputs.
+    ///
+    /// Only the whole-transaction preimage is implemented: a `sighash_type`
+    /// other than `SIGHASH_ALL` (1) or the Bitcoin Cash `ALL|FORKID` (0x41)
+    /// fails with [`Error::UnsupportedSighash`].
     pub fn segwit_v0_sighash(
         &self,
         index: usize,
@@ -322,6 +340,9 @@ impl<'a> RawTx<'a> {
         sighash_type: u32,
     ) -> Result<[u8; 32], Error> {
         let input = self.inputs.get(index).ok_or(Error::InputIndex)?;
+        if !matches!(sighash_type, SIGHASH_ALL | SIGHASH_ALL_FORKID) {
+            return Err(Error::UnsupportedSighash);
+        }
         Ok(self
             .segwit_v0_midstate()
             .sighash(input, script_code, amount, sighash_type))
@@ -398,6 +419,10 @@ impl SegwitV0Midstate {
     /// this midstate was computed from), spending `amount` satoshis under
     /// `script_code` (for P2WPKH: the P2PKH script of the key hash; for P2WSH:
     /// the witness script).
+    ///
+    /// This is the `SIGHASH_ALL` preimage, so `sighash_type` must be 1 (or
+    /// the Bitcoin Cash `ALL|FORKID`, 0x41): the result for any other type is
+    /// not that type's sighash. [`RawTx::segwit_v0_sighash`] checks it.
     pub fn sighash(
         &self,
         input: &RawTxIn<'_>,
@@ -898,6 +923,27 @@ mod tests {
         );
         assert_eq!(tx.segwit_v0_sighash(2, &[], 0, 1), Err(Error::InputIndex));
         assert_eq!(tx.legacy_sighash(2, &[], 1), Err(Error::InputIndex));
+
+        // only the SIGHASH_ALL preimages are implemented
+        assert!(tx.legacy_sighash(1, &script_code, 1).is_ok());
+        for bad in [0u32, 0x02, 0x03, 0x41, 0x81, 0x82, 0x83, 0x101] {
+            assert_eq!(
+                tx.legacy_sighash(1, &script_code, bad),
+                Err(Error::UnsupportedSighash),
+                "{bad:#x}"
+            );
+        }
+        let fork_id = tx
+            .segwit_v0_sighash(1, &script_code, 600_000_000, 0x41)
+            .unwrap();
+        assert_ne!(fork_id, sighash);
+        for bad in [0u32, 0x02, 0x03, 0x40, 0x81, 0x82, 0x83, 0xc1, 0x101, 0x141] {
+            assert_eq!(
+                tx.segwit_v0_sighash(1, &script_code, 600_000_000, bad),
+                Err(Error::UnsupportedSighash),
+                "{bad:#x}"
+            );
+        }
         assert_eq!(tx.taproot_midstate(&outputs[..1]), Err(Error::PrevOutCount));
     }
 }
