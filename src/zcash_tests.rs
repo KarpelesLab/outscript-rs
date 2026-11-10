@@ -349,3 +349,260 @@ fn signs_p2pkh_inputs() {
     assert_eq!(tx.sign(&key_refs[..2], &prevouts), Err(Error::KeyCount));
     assert_eq!(tx.sign(&key_refs, &prevouts[..2]), Err(Error::PrevOutCount));
 }
+
+/// Where the compact sizes of a serialized transaction are, and where its
+/// bundles start, from its parsed form.
+struct Layout {
+    compact_sizes: Vec<usize>,
+    sapling: usize,
+    orchard: usize,
+}
+
+fn layout(raw: &[u8], tx: &ZcashTx<'_>) -> Layout {
+    let size = |n: usize| crate::BtcVarInt(n as u64).len();
+    let mut at = vec![20];
+    let mut pos = 20 + size(tx.inputs.len());
+    for input in tx.inputs {
+        at.push(pos + 36);
+        pos += 36 + size(input.script_sig.len()) + input.script_sig.len() + 4;
+    }
+    at.push(pos);
+    pos += size(tx.outputs.len());
+    for output in tx.outputs {
+        at.push(pos + 8);
+        pos += 8 + size(output.script.len()) + output.script.len();
+    }
+    let sapling = pos;
+    let orchard = raw.len() - tx.orchard.len().max(1);
+    assert_eq!(orchard - sapling, tx.sapling.len().max(2));
+    // nSpendsSapling, nOutputsSapling
+    at.push(sapling);
+    let n_spends = raw[sapling] as usize;
+    assert!(n_spends < 0xfd);
+    at.push(sapling + 1 + n_spends * 96);
+    // nActionsOrchard and the length of the proof
+    at.push(orchard);
+    let n_actions = raw[orchard] as usize;
+    assert!(n_actions < 0xfd);
+    if n_actions > 0 {
+        at.push(orchard + 1 + n_actions * 820 + 41);
+    }
+    Layout {
+        compact_sizes: at,
+        sapling,
+        orchard,
+    }
+}
+
+/// The transaction with the compact size at `at` in a longer form.
+fn widen(raw: &[u8], at: usize) -> Vec<u8> {
+    let mut out = raw[..at].to_vec();
+    match raw[at] {
+        0xfd => {
+            out.push(0xfe);
+            out.extend_from_slice(&raw[at + 1..at + 3]);
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(&raw[at + 3..]);
+        }
+        n => {
+            assert!(n < 0xfd);
+            out.extend_from_slice(&[0xfd, n, 0]);
+            out.extend_from_slice(&raw[at + 1..]);
+        }
+    }
+    out
+}
+
+/// Every compact size must be in its shortest form: a transaction would
+/// otherwise have several encodings with one id, and the typed bundle
+/// parsers, which are strict, would not find the bundles where this parser
+/// does.
+#[test]
+fn parse_rejects_non_canonical_compact_sizes() {
+    let mut checked = 0;
+    for (i, v) in vectors().iter().enumerate() {
+        let mut inputs = [ZcashTxIn::default(); 8];
+        let mut outputs = [ZcashTxOut::default(); 8];
+        let tx = ZcashTx::parse_into(&v.tx, &mut inputs, &mut outputs).unwrap();
+        for at in layout(&v.tx, &tx).compact_sizes {
+            let wide = widen(&v.tx, at);
+            // with lenient compact sizes this is the same transaction
+            let lenient = crate::BtcVarInt::decode(&wide[at..]).unwrap();
+            let strict = crate::BtcVarInt::decode(&v.tx[at..]).unwrap();
+            assert_eq!(lenient.0, strict.0);
+            let mut inputs = [ZcashTxIn::default(); 8];
+            let mut outputs = [ZcashTxOut::default(); 8];
+            assert_eq!(
+                ZcashTx::parse_into(&wide, &mut inputs, &mut outputs).map(|_| ()),
+                Err(Error::NonCanonical),
+                "vector {i}: compact size at {at}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 60);
+
+    // the digests read the bundles with the same rule
+    let tx = ZcashTx {
+        sapling: &[0xfd, 0, 0, 0],
+        ..Default::default()
+    };
+    assert_eq!(tx.txid(), Err(Error::NonCanonical));
+    assert_eq!(tx.sighash(None, SIGHASH_ALL, &[]), Err(Error::NonCanonical));
+    let tx = ZcashTx {
+        orchard: &[0xfe, 0, 0, 0, 0],
+        ..Default::default()
+    };
+    assert_eq!(tx.txid(), Err(Error::NonCanonical));
+    assert_eq!(tx.logical_actions(), Err(Error::NonCanonical));
+    // 2^32 and up takes nine bytes, less does not
+    let tx = ZcashTx {
+        orchard: &[0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0],
+        ..Default::default()
+    };
+    assert_eq!(tx.txid(), Err(Error::NonCanonical));
+}
+
+/// What consensus fixes of a bundle's fields is checked when parsing, as
+/// the typed parsers do.
+#[test]
+fn parse_rejects_invalid_bundle_fields() {
+    let vectors = vectors();
+    let mut seen = (false, false);
+    for v in &vectors {
+        let mut inputs = [ZcashTxIn::default(); 8];
+        let mut outputs = [ZcashTxOut::default(); 8];
+        let tx = ZcashTx::parse_into(&v.tx, &mut inputs, &mut outputs).unwrap();
+        let l = layout(&v.tx, &tx);
+        let parse = |data: &[u8]| {
+            let mut inputs = [ZcashTxIn::default(); 8];
+            let mut outputs = [ZcashTxOut::default(); 8];
+            ZcashTx::parse_into(data, &mut inputs, &mut outputs).map(|_| ())
+        };
+        if !tx.orchard.is_empty() {
+            // a reserved flag bit
+            let n = v.tx[l.orchard] as usize;
+            let mut bad = v.tx.clone();
+            bad[l.orchard + 1 + n * 820] |= 4;
+            assert_eq!(parse(&bad), Err(Error::InvalidData));
+            let cut = ZcashTx {
+                orchard: &bad[l.orchard..],
+                ..tx
+            };
+            assert_eq!(cut.txid(), Err(Error::InvalidData));
+            seen.0 = true;
+        }
+        if !tx.sapling.is_empty() {
+            // a value balance above the money supply
+            let (n_spends, n_outputs) = {
+                let n = v.tx[l.sapling] as usize;
+                (n, v.tx[l.sapling + 1 + n * 96] as usize)
+            };
+            let at = l.sapling + 2 + n_spends * 96 + n_outputs * 756;
+            let mut bad = v.tx.clone();
+            bad[at..at + 8].copy_from_slice(&(21_000_000i64 * 100_000_000 + 1).to_le_bytes());
+            assert_eq!(parse(&bad), Err(Error::InvalidAmount));
+            bad[at..at + 8].copy_from_slice(&(-21_000_000i64 * 100_000_000).to_le_bytes());
+            assert_eq!(parse(&bad), Ok(()));
+            seen.1 = true;
+        }
+    }
+    assert_eq!(seen, (true, true));
+}
+
+/// The typed views see the bundles exactly where the transaction parser
+/// put them.
+#[cfg(any(feature = "zcash-sapling", feature = "zcash-orchard"))]
+#[test]
+fn typed_bundle_views_agree() {
+    let mut seen = (0, 0);
+    for (i, v) in vectors().iter().enumerate() {
+        let mut inputs = [ZcashTxIn::default(); 8];
+        let mut outputs = [ZcashTxOut::default(); 8];
+        let tx = ZcashTx::parse_into(&v.tx, &mut inputs, &mut outputs).unwrap();
+        #[cfg(feature = "zcash-sapling")]
+        {
+            let bundle = tx.sapling_bundle().unwrap();
+            assert_eq!(bundle.is_empty(), tx.sapling.is_empty(), "vector {i}");
+            if !bundle.is_empty() {
+                assert_eq!(
+                    crate::sapling::bundle::bundle_len(bundle.n_spends(), bundle.n_outputs()),
+                    tx.sapling.len()
+                );
+                assert_eq!(bundle.to_bundle().serialize().unwrap(), tx.sapling);
+                seen.0 += 1;
+            }
+            // a view of anything else than the whole bundle is refused
+            if let Some((_, short)) = tx.sapling.split_last() {
+                let cut = ZcashTx {
+                    sapling: short,
+                    ..tx
+                };
+                assert!(cut.sapling_bundle().is_err());
+            }
+        }
+        #[cfg(feature = "zcash-orchard")]
+        {
+            let bundle = tx.orchard_bundle().unwrap();
+            assert_eq!(bundle.is_none(), tx.orchard.is_empty(), "vector {i}");
+            if let Some(bundle) = bundle {
+                assert_eq!(bundle.serialized_len(), tx.orchard.len());
+                assert_eq!(bundle.to_owned().to_bytes(), tx.orchard);
+                seen.1 += 1;
+                let cut = ZcashTx {
+                    orchard: &tx.orchard[..tx.orchard.len() - 1],
+                    ..tx
+                };
+                assert!(cut.orchard_bundle().is_err());
+            }
+        }
+    }
+    #[cfg(feature = "zcash-sapling")]
+    assert!(seen.0 > 0);
+    #[cfg(feature = "zcash-orchard")]
+    assert!(seen.1 > 0);
+    let _ = seen;
+
+    // no bundle at all
+    let tx = ZcashTx::default();
+    #[cfg(feature = "zcash-sapling")]
+    assert!(tx.sapling_bundle().unwrap().is_empty());
+    #[cfg(feature = "zcash-orchard")]
+    assert!(tx.orchard_bundle().unwrap().is_none());
+    let _ = tx;
+}
+
+/// ZIP-317: the conventional fee of given sizes and counts, and of parsed
+/// transactions.
+#[test]
+fn zip317_conventional_fee() {
+    use crate::zcashtx::zip317::{conventional_fee, logical_actions};
+    assert_eq!(conventional_fee(0), 10_000);
+    assert_eq!(conventional_fee(2), 10_000);
+    assert_eq!(conventional_fee(3), 15_000);
+    // one P2PKH input and two outputs: within the grace window
+    assert_eq!(logical_actions(148, 68, 0, 0, 0), 2);
+    // sizes round up, the larger side counts
+    assert_eq!(logical_actions(151, 34, 0, 0, 0), 2);
+    assert_eq!(logical_actions(150, 35, 0, 0, 0), 2);
+    assert_eq!(logical_actions(450, 34, 0, 0, 0), 3);
+    // Sapling counts its larger side, Orchard its actions
+    assert_eq!(logical_actions(0, 0, 1, 3, 2), 5);
+    assert_eq!(logical_actions(300, 34, 3, 1, 4), 9);
+    assert_eq!(conventional_fee(u64::MAX), u64::MAX);
+
+    assert_eq!(ZcashTx::default().conventional_fee(), Ok(10_000));
+    for v in vectors() {
+        let mut inputs = [ZcashTxIn::default(); 8];
+        let mut outputs = [ZcashTxOut::default(); 8];
+        let tx = ZcashTx::parse_into(&v.tx, &mut inputs, &mut outputs).unwrap();
+        let l = layout(&v.tx, &tx);
+        let n_spends = v.tx[l.sapling] as u64;
+        let n_outputs = v.tx[l.sapling + 1 + n_spends as usize * 96] as u64;
+        let n_actions = v.tx[l.orchard] as u64;
+        let actions = tx.logical_actions().unwrap();
+        assert!(actions >= n_spends.max(n_outputs) + n_actions);
+        assert!(actions >= tx.inputs.len().max(tx.outputs.len()) as u64);
+        assert_eq!(tx.conventional_fee().unwrap(), 5000 * actions.max(2));
+    }
+}

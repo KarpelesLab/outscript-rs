@@ -3,9 +3,16 @@
 //!
 //! A [`ZcashTx`] borrows its transparent inputs and outputs, and the Sapling
 //! and Orchard bundles as raw bytes: shielded proofs and signatures are not
-//! produced here, but a transaction that carries them, built elsewhere, can
-//! still have its transparent inputs signed and its id computed, as their
-//! digests only hash the bundles' fields.
+//! produced here, but a transaction that carries them can still have its
+//! transparent inputs signed and its id computed, as their digests only
+//! hash the bundles' fields. With the `zcash-sapling` and `zcash-orchard`
+//! features, `ZcashTx::sapling_bundle` and `ZcashTx::orchard_bundle` give
+//! the typed views of the bundles, and (with `alloc`) the `zcash_builder`
+//! module builds whole transactions, shielded parts included.
+//!
+//! Parsing is strict where consensus is: compact sizes must be in their
+//! shortest form, the reserved Orchard flag bits must be zero, and the
+//! Sapling value balance within the money supply.
 //!
 //! The transparent parts follow Bitcoin: P2PKH outputs, ECDSA signatures with
 //! a sighash type byte, and `push(sig) push(pubkey)` scriptSigs. What differs
@@ -61,6 +68,8 @@ pub mod branch {
     pub const NU6_1: u32 = 0x4dec_4df0;
     /// NU6.2 (2026).
     pub const NU6_2: u32 = 0x5437_f330;
+    /// NU6.3.
+    pub const NU6_3: u32 = 0x37a5_165b;
 }
 
 /// The version field of a v5 transaction: 5, with the overwintered bit.
@@ -76,6 +85,58 @@ pub const SIGHASH_NONE: u8 = 0x02;
 pub const SIGHASH_SINGLE: u8 = 0x03;
 /// Combined with the others: sign only this input.
 pub const SIGHASH_ANYONECANPAY: u8 = 0x80;
+
+/// The conventional fee of ZIP-317, which nodes require of the transactions
+/// they relay and mine without restriction: proportional to the number of
+/// *logical actions* of a transaction.
+pub mod zip317 {
+    /// The fee per logical action, in zatoshis.
+    pub const MARGINAL_FEE: u64 = 5000;
+    /// The number of logical actions every transaction pays for at least.
+    pub const GRACE_ACTIONS: u64 = 2;
+    /// The size in bytes that counts as one transparent input: that of a
+    /// signed P2PKH input.
+    pub const P2PKH_STANDARD_INPUT_SIZE: u64 = 150;
+    /// The size in bytes that counts as one transparent output: that of a
+    /// P2PKH output.
+    pub const P2PKH_STANDARD_OUTPUT_SIZE: u64 = 34;
+
+    /// The number of logical actions of a transaction whose serialized
+    /// transparent inputs (as signed) and outputs take `tx_in_total_size`
+    /// and `tx_out_total_size` bytes, the counts of entries not included,
+    /// with the given numbers of Sapling spends, Sapling outputs and
+    /// Orchard actions.
+    pub const fn logical_actions(
+        tx_in_total_size: u64,
+        tx_out_total_size: u64,
+        sapling_spends: u64,
+        sapling_outputs: u64,
+        orchard_actions: u64,
+    ) -> u64 {
+        let ins = tx_in_total_size.div_ceil(P2PKH_STANDARD_INPUT_SIZE);
+        let outs = tx_out_total_size.div_ceil(P2PKH_STANDARD_OUTPUT_SIZE);
+        let transparent = if ins > outs { ins } else { outs };
+        let sapling = if sapling_spends > sapling_outputs {
+            sapling_spends
+        } else {
+            sapling_outputs
+        };
+        transparent
+            .saturating_add(sapling)
+            .saturating_add(orchard_actions)
+    }
+
+    /// The conventional fee, in zatoshis, of a transaction of that many
+    /// [`logical_actions`].
+    pub const fn conventional_fee(logical_actions: u64) -> u64 {
+        let actions = if logical_actions > GRACE_ACTIONS {
+            logical_actions
+        } else {
+            GRACE_ACTIONS
+        };
+        MARGINAL_FEE.saturating_mul(actions)
+    }
+}
 
 /// A transparent input.
 #[derive(Debug, Clone, Copy, Default)]
@@ -169,10 +230,32 @@ fn put_output<S: Sink + ?Sized>(s: &mut S, output: &ZcashTxOut<'_>) {
     s.put(output.script);
 }
 
+/// Reads the compact size at the front of `data`, without consuming it: its
+/// value and the number of bytes it takes.
+///
+/// Only the shortest encoding of a value is accepted
+/// ([`Error::NonCanonical`] otherwise), as the consensus rules require of
+/// the v5 format and as the typed bundle parsers of the `sapling` and
+/// `orchard` modules do: another encoding of the same transaction would
+/// have the same id.
+fn peek_compact_size(data: &[u8]) -> Result<(u64, usize), Error> {
+    let (BtcVarInt(value), n) = BtcVarInt::decode(data).ok_or(Error::UnexpectedEof)?;
+    let shortest = match value {
+        0..=0xfc => 1,
+        0xfd..=0xffff => 3,
+        0x1_0000..=0xffff_ffff => 5,
+        _ => 9,
+    };
+    if n != shortest {
+        return Err(Error::NonCanonical);
+    }
+    Ok((value, n))
+}
+
 /// Reads a compact size and the fixed-size items it counts.
 fn take_items<'a>(data: &mut &'a [u8], item_len: usize) -> Result<(usize, &'a [u8]), Error> {
-    let (count, n) = BtcVarInt::decode(data).ok_or(Error::UnexpectedEof)?;
-    let count = usize::try_from(count.0).map_err(|_| Error::TooLarge)?;
+    let (count, n) = peek_compact_size(data)?;
+    let count = usize::try_from(count).map_err(|_| Error::TooLarge)?;
     let len = count.checked_mul(item_len).ok_or(Error::TooLarge)?;
     // the count is whatever the data claims: `n + len` may not fit a usize
     let end = n.checked_add(len).ok_or(Error::TooLarge)?;
@@ -200,6 +283,8 @@ const SAPLING_OUTPUT_LEN: usize = 756;
 const ORCHARD_ACTION_LEN: usize = 820;
 const PROOF_LEN: usize = 192;
 const SIG_LEN: usize = 64;
+/// The total supply in zatoshis, which bounds every amount and balance.
+const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
 
 /// Splits a serialized Sapling bundle into its fields, checking its length.
 fn parse_sapling(bundle: &[u8]) -> Result<Sapling<'_>, Error> {
@@ -209,6 +294,10 @@ fn parse_sapling(bundle: &[u8]) -> Result<Sapling<'_>, Error> {
     let (mut value_balance, mut anchor): (&[u8], &[u8]) = (&[], &[]);
     if n_spends + n_outputs > 0 {
         value_balance = take(data, 8)?;
+        let balance = i64::from_le_bytes(value_balance.try_into().expect("8 bytes"));
+        if !(-MAX_MONEY..=MAX_MONEY).contains(&balance) {
+            return Err(Error::InvalidAmount);
+        }
         if n_spends > 0 {
             anchor = take(data, 32)?;
         }
@@ -241,6 +330,10 @@ fn parse_orchard(bundle: &[u8]) -> Result<Orchard<'_>, Error> {
     let mut trailer: &[u8] = &[];
     if n_actions > 0 {
         trailer = take(data, 1 + 8 + 32)?;
+        // two flags: the other bits are reserved and must be zero
+        if trailer[0] & !0b11 != 0 {
+            return Err(Error::InvalidData);
+        }
         take_items(data, 1)?; // the proof
         take(data, n_actions * SIG_LEN + SIG_LEN)?;
     }
@@ -493,6 +586,15 @@ impl<'a> ZcashTx<'a> {
         }
         let sapling = &data[sapling_start..sapling_end];
         let orchard = &data[sapling_end..orchard_end];
+        // What the digests and the typed views require of the bundles is
+        // required here, so that a transaction that parses has an id and
+        // its bundles are where every parser of this crate finds them.
+        parse_sapling(sapling)?;
+        parse_orchard(orchard)?;
+        #[cfg(feature = "zcash-sapling")]
+        crate::sapling::bundle::BundleRef::parse(sapling)?;
+        #[cfg(feature = "zcash-orchard")]
+        crate::orchard::bundle::BundleRef::parse(orchard)?;
         Ok(ZcashTx {
             consensus_branch_id,
             lock_time,
@@ -502,6 +604,58 @@ impl<'a> ZcashTx<'a> {
             sapling: if sapling == NO_SAPLING { &[] } else { sapling },
             orchard: if orchard == NO_ORCHARD { &[] } else { orchard },
         })
+    }
+
+    /// The typed view of the Sapling bundle (empty when there is none): its
+    /// spends and outputs, and the verification of its signatures and
+    /// proofs.
+    ///
+    /// For a transaction given by [`parse_into`](Self::parse_into) this
+    /// cannot fail: the transaction parser and the typed one accept the
+    /// same bundles, of the same length.
+    #[cfg(feature = "zcash-sapling")]
+    pub fn sapling_bundle(&self) -> Result<crate::sapling::bundle::BundleRef<'a>, Error> {
+        Ok(crate::sapling::bundle::BundleRef::parse(self.sapling)?)
+    }
+
+    /// The typed view of the Orchard bundle, or `None` when there is none:
+    /// its actions, and the verification of its signatures and proof.
+    ///
+    /// For a transaction given by [`parse_into`](Self::parse_into) this
+    /// cannot fail: the transaction parser and the typed one accept the
+    /// same bundles, of the same length.
+    #[cfg(feature = "zcash-orchard")]
+    pub fn orchard_bundle(&self) -> Result<Option<crate::orchard::bundle::BundleRef<'a>>, Error> {
+        Ok(crate::orchard::bundle::BundleRef::parse(self.orchard)?)
+    }
+
+    /// The number of ZIP-317 logical actions of the transaction as it is
+    /// (the transparent inputs count by their size, scriptSigs included:
+    /// an unsigned transaction has fewer than it will once signed).
+    pub fn logical_actions(&self) -> Result<u64, Error> {
+        let mut ins = Counter::default();
+        for input in self.inputs {
+            Self::write_input(input, input.script_sig, &mut ins);
+        }
+        let mut outs = Counter::default();
+        for output in self.outputs {
+            put_output(&mut outs, output);
+        }
+        let sapling = parse_sapling(self.sapling())?;
+        let orchard = parse_orchard(self.orchard())?;
+        Ok(zip317::logical_actions(
+            ins.0 as u64,
+            outs.0 as u64,
+            (sapling.spends.len() / SAPLING_SPEND_LEN) as u64,
+            (sapling.outputs.len() / SAPLING_OUTPUT_LEN) as u64,
+            (orchard.actions.len() / ORCHARD_ACTION_LEN) as u64,
+        ))
+    }
+
+    /// The ZIP-317 conventional fee of the transaction as it is, in
+    /// zatoshis: see [`logical_actions`](Self::logical_actions).
+    pub fn conventional_fee(&self) -> Result<u64, Error> {
+        Ok(zip317::conventional_fee(self.logical_actions()?))
     }
 
     /// Whether this is a coinbase transaction: one input spending nothing.
