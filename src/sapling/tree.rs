@@ -5,7 +5,8 @@
 //! Nothing here allocates. A [`Frontier`] is the right edge of the tree,
 //! which is all that is needed to append leaves and compute roots (it is
 //! what `zcashd` and `lightwalletd` exchange as a "commitment tree"). A
-//! [`Witness`] follows the tree from the moment a note is appended and
+//! [`Witness`] follows the tree from the moment a note is appended (it can
+//! be stored and restored in `zcashd`'s `IncrementalWitness` format) and
 //! yields the [`MerklePath`] of that note against any later root, which is
 //! what a Spend proof takes.
 //!
@@ -327,15 +328,30 @@ impl<const D: usize> Frontier<D> {
 
     /// Appends a leaf and starts a [`Witness`] for it.
     pub fn append_witnessed(&mut self, leaf: &Node) -> Result<Witness<D>, Error> {
-        let position = self.append(leaf)?;
-        Ok(Witness {
+        self.append(leaf)?;
+        self.witness().ok_or(Error::TreeFull)
+    }
+
+    /// Starts a [`Witness`] for the last leaf appended; `None` for an empty
+    /// tree. This is `zcashd`'s `tree.witness()`: what a wallet does with
+    /// the tree state right after the commitment of a note it received.
+    pub fn witness(&self) -> Option<Witness<D>> {
+        let position = self.size.checked_sub(1)?;
+        // the ommers for the set bits of the position are the left
+        // siblings; the other levels are filled in as the tree grows
+        let mut path = [UNCOMMITTED; D];
+        for (level, (sibling, ommer)) in path.iter_mut().zip(&self.ommers).enumerate() {
+            if (position >> level) & 1 == 1 {
+                *sibling = *ommer;
+            }
+        }
+        Some(Witness {
             position,
-            leaf: *leaf,
-            // the entries for the set bits of the position are the left
-            // siblings; the others are filled in as the tree grows
-            path: self.ommers,
+            leaf: self.leaf,
+            path,
             filled: position as u32,
-            frontier: *self,
+            cursor: Frontier::new(),
+            size: self.size,
         })
     }
 
@@ -379,6 +395,16 @@ impl<const D: usize> Frontier<D> {
     /// which must fill `data` exactly.
     pub fn read(data: &[u8]) -> Result<Self, Error> {
         let mut data = data;
+        let frontier = Self::read_from(&mut data)?;
+        if !data.is_empty() {
+            return Err(Error::TrailingData);
+        }
+        Ok(frontier)
+    }
+
+    /// Parses a frontier from the start of `data`, leaving what follows.
+    fn read_from(input: &mut &[u8]) -> Result<Self, Error> {
+        let mut data = *input;
         fn optional(data: &mut &[u8]) -> Result<Option<Node>, Error> {
             let (&flag, rest) = data.split_first().ok_or(Error::UnexpectedEof)?;
             *data = rest;
@@ -406,9 +432,10 @@ impl<const D: usize> Frontier<D> {
         let mut position = 0u64;
         match (left, right) {
             (None, None) => {
-                if parents != 0 || !data.is_empty() {
+                if parents != 0 {
                     return Err(Error::InvalidLength);
                 }
+                *input = data;
                 return Ok(frontier);
             }
             (None, Some(_)) => return Err(Error::InvalidLength),
@@ -425,10 +452,8 @@ impl<const D: usize> Frontier<D> {
                 position |= 1 << level;
             }
         }
-        if !data.is_empty() {
-            return Err(Error::TrailingData);
-        }
         frontier.size = position + 1;
+        *input = data;
         Ok(frontier)
     }
 }
@@ -500,19 +525,35 @@ impl<const D: usize> MerklePath<D> {
 /// An incremental witness: the authentication path of one leaf, kept up to
 /// date as leaves are appended after it.
 ///
-/// Obtained from [`Frontier::append_witnessed`]; every leaf appended to the
-/// tree afterwards must be given to [`append`](Self::append) as well, in
-/// order.
+/// Obtained from [`Frontier::append_witnessed`] or [`Frontier::witness`];
+/// every leaf appended to the tree afterwards must be given to
+/// [`append`](Self::append) as well, in order. It can be stored and
+/// restored with [`write`](Self::write) and [`read`](Self::read), in the
+/// format of `zcashd`'s `IncrementalWitness` (which is also what
+/// `librustzcash`'s `write_incremental_witness` produces).
+///
+/// The structure is the one of `zcashd` and of `incrementalmerkletree`: the
+/// tree as of the witnessed leaf, the roots of the sibling subtrees that
+/// are complete, and the frontier of the one being filled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Witness<const D: usize = DEPTH> {
     position: u64,
     leaf: Node,
+    /// The siblings that are final: those to the left of the leaf, and the
+    /// roots of the subtrees to its right that are complete. The other
+    /// entries are [`UNCOMMITTED`].
     path: [Node; D],
     /// Bit `l` is set once `path[l]` is final.
     filled: u32,
-    /// The frontier of the tree as of the last leaf seen.
-    frontier: Frontier<D>,
+    /// The leaves seen so far of the sibling subtree at the lowest level
+    /// that is not final, as the frontier of that subtree alone.
+    cursor: Frontier<D>,
+    /// The number of leaves in the tree.
+    size: u64,
 }
+
+/// The longest serialization of a witness: of the deepest tree.
+const MAX_WITNESS_LEN: usize = 2 * (67 + 33 * DEPTH) + 2 + 32 * DEPTH;
 
 impl<const D: usize> Witness<D> {
     /// The position of the witnessed leaf.
@@ -527,61 +568,154 @@ impl<const D: usize> Witness<D> {
 
     /// The number of leaves in the tree this witness is current for.
     pub const fn tree_size(&self) -> u64 {
-        self.frontier.size
+        self.size
     }
 
-    /// The first leaf position of the sibling subtree at `level`, for a
-    /// level where the witnessed leaf is on the left.
-    fn sibling_start(&self, level: usize) -> u64 {
-        ((self.position >> level) + 1) << level
+    /// The lowest level whose sibling is not final: the height of the
+    /// subtree the next leaves go to. `D` once the tree is full.
+    fn cursor_level(&self) -> usize {
+        ((!self.filled).trailing_zeros() as usize).min(D)
     }
 
     /// Records the next leaf appended to the tree.
     pub fn append(&mut self, leaf: &Node) -> Result<(), Error> {
-        let tip = self.frontier.append(leaf)?;
-        for level in 0..D {
-            if (self.filled >> level) & 1 == 1 {
-                continue;
-            }
-            // the sibling subtree is complete once its last leaf arrives
-            if tip == self.sibling_start(level) + (1 << level) - 1 {
-                if let Some(root) = self.frontier.subtree_root(level) {
-                    self.path[level] = root;
-                    self.filled |= 1 << level;
-                }
-                break;
-            }
+        let level = self.cursor_level();
+        if level >= D {
+            return Err(Error::TreeFull);
         }
+        self.cursor.append(leaf)?;
+        // the sibling subtree is complete once its last leaf arrives
+        if self.cursor.size == 1 << level {
+            self.path[level] = self.cursor.subtree_root(level).ok_or(Error::TreeFull)?;
+            self.filled |= 1 << level;
+            self.cursor = Frontier::new();
+        }
+        self.size += 1;
         Ok(())
     }
 
     /// The root of the tree as of the last leaf seen.
     pub fn root(&self) -> Node {
-        self.frontier.root()
+        self.path().root(&self.leaf)
     }
 
     /// The authentication path of the witnessed leaf in the tree as of the
     /// last leaf seen; its root is [`root`](Self::root).
     pub fn path(&self) -> MerklePath<D> {
-        let tip = self.frontier.size - 1;
+        let cursor_level = self.cursor_level();
         let mut siblings = self.path;
         for (level, sibling) in siblings.iter_mut().enumerate() {
             if (self.filled >> level) & 1 == 1 {
                 continue;
             }
-            *sibling = if tip < self.sibling_start(level) {
-                EMPTY_ROOTS[level]
-            } else {
-                // partially filled: the tip is inside it
-                self.frontier
+            *sibling = if level == cursor_level {
+                // partially filled, or still empty
+                self.cursor
                     .subtree_root(level)
                     .unwrap_or(EMPTY_ROOTS[level])
+            } else {
+                EMPTY_ROOTS[level]
             };
         }
         MerklePath {
             position: self.position,
             siblings,
         }
+    }
+
+    /// The tree as of the witnessed leaf.
+    fn witnessed_tree(&self) -> Frontier<D> {
+        Frontier {
+            size: self.position + 1,
+            leaf: self.leaf,
+            ommers: self.path,
+        }
+    }
+
+    /// The length of [`write`](Self::write)'s output.
+    pub fn serialized_len(&self) -> usize {
+        let mut buf = [0u8; MAX_WITNESS_LEN];
+        self.write(&mut buf).unwrap_or(0)
+    }
+
+    /// Serializes the witness in the format of `zcashd`'s
+    /// `IncrementalWitness`: the tree as of the witnessed leaf (see
+    /// [`Frontier::write`]), the roots of the complete subtrees to the
+    /// right of the leaf from the bottom up, and the optional frontier of
+    /// the subtree being filled. Returns the number of bytes written (at
+    /// most 3274).
+    pub fn write(&self, out: &mut [u8]) -> Result<usize, Error> {
+        let mut pos = self.witnessed_tree().write(out)?;
+        let mut put = |bytes: &[u8]| -> Result<(), Error> {
+            out.get_mut(pos..pos + bytes.len())
+                .ok_or(Error::BufferTooSmall)?
+                .copy_from_slice(bytes);
+            pos += bytes.len();
+            Ok(())
+        };
+        // the subtrees completed since: the levels where the leaf is on
+        // the left; at most 32, so the count is a single byte
+        let completed = self.filled & !(self.position as u32);
+        put(&[completed.count_ones() as u8])?;
+        for (level, sibling) in self.path.iter().enumerate() {
+            if (completed >> level) & 1 == 1 {
+                put(sibling)?;
+            }
+        }
+        if self.cursor.is_empty() {
+            put(&[0])?;
+            return Ok(pos);
+        }
+        put(&[1])?;
+        let len = self
+            .cursor
+            .write(out.get_mut(pos..).ok_or(Error::BufferTooSmall)?)?;
+        Ok(pos + len)
+    }
+
+    /// Parses the `IncrementalWitness` format (see [`write`](Self::write)),
+    /// which must fill `data` exactly.
+    ///
+    /// The structure is checked, not the hashes: a witness read from an
+    /// untrusted source is validated by comparing its
+    /// [`root`](Self::root) with a known anchor.
+    pub fn read(data: &[u8]) -> Result<Self, Error> {
+        let mut data = data;
+        let tree = Frontier::<D>::read_from(&mut data)?;
+        let mut witness = tree.witness().ok_or(Error::InvalidLength)?;
+        let (&count, rest) = data.split_first().ok_or(Error::UnexpectedEof)?;
+        data = rest;
+        for _ in 0..count {
+            let level = witness.cursor_level();
+            if level >= D {
+                return Err(Error::InvalidLength);
+            }
+            let (node, rest) = data.split_first_chunk::<32>().ok_or(Error::UnexpectedEof)?;
+            data = rest;
+            witness.path[level] = *node;
+            witness.filled |= 1 << level;
+            witness.size += 1 << level;
+        }
+        let (&flag, rest) = data.split_first().ok_or(Error::UnexpectedEof)?;
+        data = rest;
+        match flag {
+            0 => {}
+            1 => {
+                let cursor = Frontier::<D>::read_from(&mut data)?;
+                // a cursor is a subtree that is neither empty nor complete
+                let level = witness.cursor_level();
+                if level >= D || cursor.size == 0 || cursor.size >= 1 << level {
+                    return Err(Error::InvalidLength);
+                }
+                witness.size += cursor.size;
+                witness.cursor = cursor;
+            }
+            _ => return Err(Error::InvalidLength),
+        }
+        if !data.is_empty() {
+            return Err(Error::TrailingData);
+        }
+        Ok(witness)
     }
 }
 
@@ -629,6 +763,11 @@ mod tests {
         let paths = strings(include_str!("testdata/merkle_path_sapling.json"));
         assert_eq!(commitments.len(), 16);
         let mut next_path = paths.iter();
+        let witness_serializations = strings(include_str!(
+            "testdata/merkle_witness_serialization_sapling.json"
+        ));
+        assert_eq!(witness_serializations.len(), 136);
+        let mut next_witness = witness_serializations.iter();
 
         let mut tree = Frontier::<4>::new();
         assert_eq!(tree.root(), EMPTY_ROOTS[4]);
@@ -673,6 +812,47 @@ mod tests {
                     path.position
                 );
             }
+            // zcashd serializes every witness at every step, the one of
+            // the empty tree (which this crate has no use for) first
+            let expect_empty = hex::decode(next_witness.next().unwrap()).unwrap();
+            assert_eq!(expect_empty[..3], [0, 0, 0]);
+            assert_eq!(Witness::<4>::read(&expect_empty), Err(Error::InvalidLength));
+            for witness in &witnesses[..i] {
+                let expect = hex::decode(next_witness.next().unwrap()).unwrap();
+                let mut buf = [0u8; MAX_WITNESS_LEN];
+                let n = witness.write(&mut buf).unwrap();
+                assert_eq!(buf[..n], expect[..], "step {i}");
+                assert_eq!(witness.serialized_len(), n);
+                assert_eq!(witness.write(&mut buf[..n - 1]), Err(Error::BufferTooSmall));
+                let mut read = Witness::<4>::read(&expect).unwrap();
+                assert_eq!(read.position(), witness.position());
+                assert_eq!(read.leaf(), witness.leaf());
+                assert_eq!(read.tree_size(), i as u64 + 1);
+                assert_eq!(read.path(), witness.path());
+                // a restored witness keeps following the tree
+                if (i + witness.position() as usize).is_multiple_of(5) {
+                    let mut copy = *witness;
+                    for extra in commitments.iter().skip(i + 1) {
+                        let extra = node(extra);
+                        read.append(&extra).unwrap();
+                        copy.append(&extra).unwrap();
+                        let n = copy.write(&mut buf).unwrap();
+                        let mut other = [0u8; MAX_WITNESS_LEN];
+                        assert_eq!(read.write(&mut other), Ok(n));
+                        assert_eq!(buf[..n], other[..n]);
+                    }
+                    assert_eq!(read.path(), copy.path());
+                    assert_eq!(read.append(&UNCOMMITTED), Err(Error::TreeFull));
+                    let n = witness.write(&mut buf).unwrap();
+                    assert_eq!(buf[..n], expect[..]);
+                }
+                // every truncation and extension is rejected
+                for cut in 0..n {
+                    assert!(Witness::<4>::read(&expect[..cut]).is_err());
+                }
+                buf[n] = 0;
+                assert_eq!(Witness::<4>::read(&buf[..n + 1]), Err(Error::TrailingData));
+            }
             // a few of the paths, checked against the root
             for witness in witnesses.iter().skip(i % 3).step_by(5) {
                 assert_eq!(witness.root(), tree.root());
@@ -681,6 +861,7 @@ mod tests {
             }
         }
         assert!(next_path.next().is_none());
+        assert!(next_witness.next().is_none());
         let path = witnesses[3].path();
         assert_eq!(
             path.verify(&UNCOMMITTED, &tree.root()),
@@ -747,5 +928,54 @@ mod tests {
         assert!(Frontier::<DEPTH>::read(&[2]).is_err());
         assert!(Frontier::<DEPTH>::read(&[0, 0, 1, 0]).is_err());
         assert!(Frontier::<4>::read(&[0, 0, 200]).is_err());
+
+        // witnesses of the full-depth tree: from the frontier, stored and
+        // restored, with and without a subtree being filled
+        assert_eq!(Frontier::<DEPTH>::new().witness(), None);
+        assert_eq!(tree.witness().unwrap().path(), witnesses[4].path());
+        let mut wbuf = [0u8; MAX_WITNESS_LEN];
+        for w in &witnesses {
+            let n = w.write(&mut wbuf).unwrap();
+            assert_eq!(w.serialized_len(), n);
+            let read = Witness::<DEPTH>::read(&wbuf[..n]).unwrap();
+            assert_eq!(read.path(), w.path());
+            assert_eq!(read.tree_size(), 5);
+            assert_eq!(read.root(), root);
+            for len in 0..n {
+                assert!(Witness::<DEPTH>::read(&wbuf[..len]).is_err());
+            }
+        }
+        // malformed: more completed subtrees than levels, a cursor that is
+        // empty, complete or too large, a bad flag
+        let leaf = [1u8; 33];
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&leaf);
+        bad.extend_from_slice(&[0, 0, 33]);
+        bad.extend_from_slice(&[7; 33 * 32]);
+        bad.push(0);
+        assert_eq!(Witness::<DEPTH>::read(&bad), Err(Error::InvalidLength));
+        let with_cursor = |cursor: &[u8]| {
+            let mut data = Vec::new();
+            data.extend_from_slice(&leaf);
+            // position 0 with its level-0 sibling: the cursor is at level 1
+            data.extend_from_slice(&[0, 0, 1]);
+            data.extend_from_slice(&[7; 32]);
+            data.extend_from_slice(cursor);
+            Witness::<DEPTH>::read(&data)
+        };
+        let mut one_leaf = vec![1];
+        one_leaf.extend_from_slice(&leaf);
+        one_leaf.extend_from_slice(&[0, 0]);
+        let ok = with_cursor(&one_leaf).unwrap();
+        assert_eq!((ok.position(), ok.tree_size()), (0, 3));
+        assert_eq!(with_cursor(&[0]).unwrap().tree_size(), 2);
+        assert_eq!(with_cursor(&[1, 0, 0, 0]), Err(Error::InvalidLength));
+        let mut two_leaves = vec![1];
+        two_leaves.extend_from_slice(&leaf);
+        two_leaves.extend_from_slice(&leaf);
+        two_leaves.push(0);
+        assert_eq!(with_cursor(&two_leaves), Err(Error::InvalidLength));
+        assert_eq!(with_cursor(&[2]), Err(Error::InvalidLength));
+        assert_eq!(with_cursor(&[]), Err(Error::UnexpectedEof));
     }
 }
