@@ -319,9 +319,61 @@ struct Shape {
 
 /// A part that still mixes several unknown fragments.
 struct Mixed {
-    /// In ascending order, two or more.
-    indexes: Vec<u32>,
+    /// Which fragments, a bit each: bit `index % 64` of word `index / 64`.
+    /// That is `seq_len / 8` bytes whatever the part mixes, where a list of
+    /// indexes takes up to `4 * seq_len`.
+    bits: Vec<u64>,
+    /// How many: two or more for a part on hold.
+    count: usize,
     data: Vec<u8>,
+}
+
+impl Mixed {
+    fn new(indexes: &[u32], seq_len: usize, data: Vec<u8>) -> Self {
+        let mut bits = vec![0u64; seq_len.div_ceil(64)];
+        for &index in indexes {
+            bits[index as usize / 64] |= 1 << (index % 64);
+        }
+        Mixed {
+            bits,
+            count: indexes.len(),
+            data,
+        }
+    }
+
+    fn has(&self, index: usize) -> bool {
+        self.bits[index / 64] & (1 << (index % 64)) != 0
+    }
+
+    /// The lowest fragment mixed in.
+    fn first(&self) -> Option<usize> {
+        let word = self.bits.iter().position(|&word| word != 0)?;
+        Some(word * 64 + self.bits[word].trailing_zeros() as usize)
+    }
+
+    /// Whether every fragment of `other` is in this part too.
+    fn covers(&self, other: &Mixed) -> bool {
+        self.bits
+            .iter()
+            .zip(&other.bits)
+            .all(|(mine, theirs)| theirs & !mine == 0)
+    }
+
+    /// XORs out one fragment that this part mixes.
+    fn remove_fragment(&mut self, index: usize, fragment: &[u8]) {
+        self.bits[index / 64] &= !(1 << (index % 64));
+        self.count -= 1;
+        xor_into(&mut self.data, fragment);
+    }
+
+    /// XORs out `other`, which this part [`covers`](Self::covers).
+    fn remove_part(&mut self, other: &Mixed) {
+        for (mine, theirs) in self.bits.iter_mut().zip(&other.bits) {
+            *mine &= !theirs;
+        }
+        self.count -= other.count;
+        xor_into(&mut self.data, &other.data);
+    }
 }
 
 /// Parts on hold are XORed out of those that cover them up to this many
@@ -330,13 +382,10 @@ struct Mixed {
 /// where looking for such parts is what takes ever longer.
 const MAX_FRAGMENTS_FOR_SUBSETS: usize = 256;
 
-/// Whether the sorted `inner` only has elements of the sorted `outer`.
-fn is_subset(inner: &[u32], outer: &[u32]) -> bool {
-    let mut outer = outer.iter();
-    inner
-        .iter()
-        .all(|i| outer.find(|&o| o >= i).is_some_and(|o| o == i))
-}
+/// What the parts on hold may take on top of twice the message: their sets
+/// of fragments, mostly. Up to the default limit on fragments, that is about
+/// what twice as many parts as fragments need.
+const HELD_ALLOWANCE: usize = 4 << 20;
 
 /// Puts the parts of a UR back together, in whatever order they come, however
 /// many times, and whichever got lost.
@@ -349,11 +398,34 @@ fn is_subset(inner: &[u32], outer: &[u32]) -> bool {
 /// What parts claim is not trusted: a message cannot be longer than
 /// [`DEFAULT_MAX_MESSAGE_LEN`](Self::DEFAULT_MAX_MESSAGE_LEN) nor have more
 /// than [`DEFAULT_MAX_FRAGMENTS`](Self::DEFAULT_MAX_FRAGMENTS) fragments
-/// unless [`with_limits`](Self::with_limits) says otherwise, which bounds the
-/// memory and time a part can cost.
+/// unless [`with_limits`](Self::with_limits) says otherwise.
+///
+/// # Memory and time
+///
+/// A decoder holds the message, padded to a whole number of fragments (less
+/// than one byte per fragment), and the parts it cannot make use of yet. Those
+/// are dropped past twice the number of fragments, and past what fits in
+/// twice the padded message plus 4 MiB: whatever is sent, a decoder allocates
+/// about three times the length of the message it was told of, plus 4 MiB,
+/// and no more than that. A dropped part costs nothing but the wait for
+/// another one. Only messages of thousands of fragments, more than the
+/// default limit allows unless they are of a few bytes each, have that budget
+/// hold fewer parts than twice their fragments.
+///
+/// A part takes the time to pick its fragments, which grows with the number
+/// of fragments squared, and to compare it with the parts on hold. A part
+/// that reveals a fragment is then XORed out of the parts on hold that mix
+/// it, each of which may reveal another: that is one fragment's worth of work
+/// for each fragment a part on hold mixes, once. All the parts of a message
+/// together thus cost at most the length of what is on hold times the number
+/// of fragments, most of it in the part that lets the bulk of the message
+/// unravel. That is what decoding takes, and why the limits are worth
+/// lowering to what the application expects.
 pub struct Decoder {
     max_message_len: usize,
     max_fragments: usize,
+    /// How many parts may be on hold, once the message is known.
+    max_held: usize,
     ur_type: Option<String>,
     shape: Option<Shape>,
     /// The fragments, each in its place once known.
@@ -375,9 +447,9 @@ impl Decoder {
     /// The longest message accepted by default: 8 MiB.
     pub const DEFAULT_MAX_MESSAGE_LEN: usize = 8 << 20;
     /// The most fragments accepted by default: far more than anyone would
-    /// sit through, and few enough for the worst part to take a millisecond.
-    /// Picking the fragments of a part the way the specification has it takes
-    /// a time that grows with their number, squared.
+    /// sit through, and few enough for picking the fragments of the worst
+    /// part to take milliseconds. The way the specification has it, that
+    /// takes a time that grows with their number, squared.
     pub const DEFAULT_MAX_FRAGMENTS: usize = 4096;
 
     /// Creates a decoder with the default limits.
@@ -386,11 +458,14 @@ impl Decoder {
     }
 
     /// Creates a decoder that refuses, with [`Error::TooLarge`], messages of
-    /// more than `max_message_len` bytes or `max_fragments` fragments.
+    /// more than `max_message_len` bytes or `max_fragments` fragments. The
+    /// memory and time a message can cost follow from both: see
+    /// [`Decoder`].
     pub fn with_limits(max_message_len: usize, max_fragments: usize) -> Self {
         Decoder {
             max_message_len,
             max_fragments,
+            max_held: 0,
             ur_type: None,
             shape: None,
             message: Vec::new(),
@@ -489,10 +564,7 @@ impl Decoder {
         }
 
         let indexes = choose_fragments(seq_num, seq_len, part.checksum, &mut self.sampler);
-        self.reduce(Mixed {
-            indexes,
-            data: part.data.to_vec(),
-        });
+        self.reduce(Mixed::new(&indexes, seq_len as usize, part.data.to_vec()));
         if self.known_count == self.known.len() {
             self.finish()?;
         }
@@ -502,22 +574,49 @@ impl Decoder {
     /// Checks the first part of a message, and makes room for the message.
     fn start(&mut self, shape: Shape) -> Result<(), Error> {
         let message_len = shape.message_len as usize;
+        let seq_len = shape.seq_len as usize;
         if message_len == 0 || shape.fragment_len == 0 {
             return Err(Error::InvalidPart);
         }
         // Fragments are of equal length and only the last one is padded, so
-        // their number follows from the lengths. Holding parts to it bounds
-        // what gets allocated by what is accepted as a message.
-        if message_len.div_ceil(shape.fragment_len) != shape.seq_len as usize {
+        // their number follows from the lengths.
+        if message_len.div_ceil(shape.fragment_len) != seq_len {
             return Err(Error::InvalidPart);
         }
-        if message_len > self.max_message_len || shape.seq_len as usize > self.max_fragments {
+        // And they are as short as that number allows, which is what encoders
+        // pick: told of a longest fragment, they make them all shorter rather
+        // than pad the last one more than it takes. That has the padding
+        // below one byte per fragment, when a lone fragment of any length
+        // could otherwise claim to hold a message of one byte.
+        if shape.fragment_len != message_len.div_ceil(seq_len) {
+            return Err(Error::InvalidPart);
+        }
+        if message_len > self.max_message_len || seq_len > self.max_fragments {
             return Err(Error::TooLarge);
         }
-        self.message = vec![0; shape.seq_len as usize * shape.fragment_len];
-        self.known = vec![false; shape.seq_len as usize];
+        let padded_len = seq_len
+            .checked_mul(shape.fragment_len)
+            .ok_or(Error::TooLarge)?;
+
+        // Parts on hold are only worth so much memory. Past twice the
+        // fragments, a sender that makes sense would have had the message
+        // through already. And each takes a fragment and a bit per fragment,
+        // which for a message in very many, very short fragments is far more
+        // than the message: no more of them than fit in twice the message
+        // and a fixed allowance, then.
+        let held_len = Self::held_len(seq_len, shape.fragment_len);
+        let budget = padded_len.saturating_mul(2).saturating_add(HELD_ALLOWANCE);
+        self.max_held = (budget / held_len).min(seq_len.saturating_mul(2).saturating_add(16));
+
+        self.message = vec![0; padded_len];
+        self.known = vec![false; seq_len];
         self.shape = Some(shape);
         Ok(())
+    }
+
+    /// The memory a part on hold takes.
+    fn held_len(seq_len: usize, fragment_len: usize) -> usize {
+        core::mem::size_of::<Mixed>() + seq_len.div_ceil(64) * 8 + fragment_len
     }
 
     fn fragment_len(&self) -> usize {
@@ -527,71 +626,74 @@ impl Decoder {
     /// Takes a part in: XORs out of it what is known, then either it is down
     /// to one fragment, which is now known and may in turn simplify the parts
     /// on hold, or it is put on hold.
+    ///
+    /// Parts on hold never mix a known fragment. Those that get simpler do
+    /// so where they are, and those the queue takes are moved to it: nothing
+    /// here copies a part, nor the parts on hold.
     fn reduce(&mut self, part: Mixed) {
         let fragment_len = self.fragment_len();
         let with_subsets = self.known.len() <= MAX_FRAGMENTS_FOR_SUBSETS;
         let mut queue = vec![part];
-        while let Some(Mixed {
-            mut indexes,
-            mut data,
-        }) = queue.pop()
-        {
-            indexes.retain(|&index| {
-                let known = self.known[index as usize];
-                if known {
-                    let start = index as usize * fragment_len;
-                    xor_into(&mut data, &self.message[start..start + fragment_len]);
+        while let Some(mut part) = queue.pop() {
+            for word in 0..part.bits.len() {
+                let mut left = part.bits[word];
+                while left != 0 {
+                    let index = word * 64 + left.trailing_zeros() as usize;
+                    left &= left - 1;
+                    if self.known[index] {
+                        let start = index * fragment_len;
+                        part.remove_fragment(index, &self.message[start..start + fragment_len]);
+                    }
                 }
-                !known
-            });
+            }
             // A part on hold that this one covers can be XORed out of it too.
             for held in self.mixed.iter().filter(|_| with_subsets) {
-                if held.indexes.len() < indexes.len() && is_subset(&held.indexes, &indexes) {
-                    indexes.retain(|index| held.indexes.binary_search(index).is_err());
-                    xor_into(&mut data, &held.data);
+                if held.count < part.count && part.covers(held) {
+                    part.remove_part(held);
                 }
             }
 
-            match indexes[..] {
-                [] => {}
-                [index] => {
-                    let start = index as usize * fragment_len;
-                    self.message[start..start + fragment_len].copy_from_slice(&data);
-                    self.known[index as usize] = true;
+            match (part.count, part.first()) {
+                (0, _) | (_, None) => {}
+                (1, Some(index)) => {
+                    let start = index * fragment_len;
+                    self.message[start..start + fragment_len].copy_from_slice(&part.data);
+                    self.known[index] = true;
                     self.known_count += 1;
-                    // Parts on hold that mix this fragment get simpler.
-                    self.requeue(&mut queue, |held| {
-                        held.indexes.binary_search(&index).is_ok()
-                    });
+                    // Parts on hold that mix this fragment get simpler. Those
+                    // down to one fragment are done with, and any of them may
+                    // now be covered by another, or cover one.
+                    queue.extend(self.mixed.extract_if(.., |held| {
+                        if !held.has(index) {
+                            return false;
+                        }
+                        held.remove_fragment(index, &part.data);
+                        held.count == 1 || with_subsets
+                    }));
                 }
                 _ => {
-                    if self.mixed.iter().any(|held| held.indexes == indexes) {
+                    if self
+                        .mixed
+                        .iter()
+                        .any(|held| held.count == part.count && held.bits == part.bits)
+                    {
                         continue;
                     }
-                    // Parts on hold that cover this one get simpler.
+                    // Parts on hold that cover this one get simpler, once it
+                    // is on hold itself: taking them out makes room for it.
                     if with_subsets {
-                        self.requeue(&mut queue, |held| {
-                            held.indexes.len() > indexes.len() && is_subset(&indexes, &held.indexes)
-                        });
+                        queue.extend(
+                            self.mixed.extract_if(.., |held| {
+                                held.count > part.count && held.covers(&part)
+                            }),
+                        );
                     }
-                    // Parts on hold are only worth so much memory: past twice
-                    // the message, a sender that makes sense would have had
-                    // the message through already.
-                    if self.mixed.len() < 2 * self.known.len() + 16 {
-                        self.mixed.push(Mixed { indexes, data });
+                    if self.mixed.len() < self.max_held {
+                        self.mixed.push(part);
                     }
                 }
             }
         }
-    }
-
-    /// Moves the parts on hold that `affected` picks to the queue.
-    fn requeue(&mut self, queue: &mut Vec<Mixed>, affected: impl Fn(&Mixed) -> bool) {
-        let (affected, held) = core::mem::take(&mut self.mixed)
-            .into_iter()
-            .partition(|held| affected(held));
-        self.mixed = held;
-        queue.extend::<Vec<Mixed>>(affected);
     }
 
     /// Checks the reassembled message.
@@ -990,5 +1092,234 @@ mod tests {
             Ok(true)
         );
         assert_eq!(decoder.message(), Some(&[1, 2, 3][..]));
+    }
+
+    /// Fragments are as short as their number allows: a part cannot have a
+    /// short message allocated as long fragments.
+    #[test]
+    fn rejects_oversized_fragments() {
+        // one byte, said to come in a fragment of 4 KiB: past the limit on
+        // the message, which it used to get around
+        let mut decoder = Decoder::with_limits(100, 10);
+        let checksum = crc32(&[7]);
+        let mut data = vec![0u8; 4096];
+        data[0] = 7;
+        for seq_num in [1, 2] {
+            assert_eq!(
+                decoder.receive(&forged_part(seq_num, 1, 1, checksum, &data)),
+                Err(Error::InvalidPart)
+            );
+        }
+        assert_eq!(decoder.fragment_count(), 0);
+        assert!(decoder.message.is_empty());
+        assert_eq!(
+            decoder.receive(&forged_part(1, 1, 1, checksum, &[7, 0])),
+            Err(Error::InvalidPart)
+        );
+        // 9 bytes in 3 fragments are 3 bytes each, not 4
+        assert_eq!(
+            decoder.receive(&forged_part(1, 3, 9, 0, &[0; 4])),
+            Err(Error::InvalidPart)
+        );
+        assert_eq!(
+            decoder.receive(&forged_part(1, 3, 9, 0, &[0; 3])),
+            Ok(false)
+        );
+        assert_eq!(decoder.message.len(), 9);
+
+        let mut decoder = Decoder::with_limits(100, 10);
+        assert_eq!(
+            decoder.receive(&forged_part(1, 1, 1, checksum, &[7])),
+            Ok(true)
+        );
+        assert_eq!(decoder.message(), Some(&[7][..]));
+
+        // what the encoder picks is always accepted, padding included
+        for message_len in 1..200usize {
+            for max_fragment_len in [1, 2, 3, 7, 16, 50, 199, 200, 1000] {
+                let message = make_message("Wolf", message_len);
+                let mut encoder = Encoder::new("bytes", &message, max_fragment_len).unwrap();
+                let mut decoder = Decoder::new();
+                let count = encoder.fragment_count();
+                for part in encoder.by_ref().take(count) {
+                    decoder.receive(&part).unwrap();
+                }
+                assert_eq!(
+                    decoder.message(),
+                    Some(&message[..]),
+                    "{message_len} bytes in fragments of {max_fragment_len}"
+                );
+            }
+        }
+    }
+
+    /// The memory the parts on hold take: what each allocates, and itself.
+    fn held_memory(decoder: &Decoder) -> usize {
+        decoder
+            .mixed
+            .iter()
+            .map(|held| {
+                core::mem::size_of::<Mixed>() + held.bits.capacity() * 8 + held.data.capacity()
+            })
+            .sum()
+    }
+
+    /// The parts past the first `seq_len` that mix two fragments or more.
+    fn mixed_parts<'a>(
+        encoder: &'a mut Encoder,
+        checksum: u32,
+    ) -> impl Iterator<Item = String> + 'a {
+        let seq_len = encoder.fragment_count() as u32;
+        let mut sampler = None;
+        encoder
+            .by_ref()
+            .skip(seq_len as usize)
+            .enumerate()
+            .filter_map(move |(i, part)| {
+                let seq_num = seq_len + 1 + i as u32;
+                (choose_fragments(seq_num, seq_len, checksum, &mut sampler).len() > 1)
+                    .then_some(part)
+            })
+    }
+
+    /// Nothing but mixed parts of a message in as many fragments as the
+    /// default limits allow, of one byte each: what is put on hold stays
+    /// within the budget, and what follows stays fast.
+    #[test]
+    fn bounds_parts_on_hold() {
+        let seq_len = Decoder::DEFAULT_MAX_FRAGMENTS;
+        let message = make_message("Wolf", seq_len);
+        let checksum = crc32(&message);
+        let budget = 2 * message.len() + HELD_ALLOWANCE;
+
+        let mut encoder = Encoder::new("bytes", &message, 1).unwrap();
+        assert_eq!(encoder.fragment_count(), seq_len);
+        let mut decoder = Decoder::new();
+        // Garbage for data: the parts never add up to anything, which is
+        // what keeps the most of them on hold.
+        let mut sent = 0;
+        for (i, part) in mixed_parts(&mut encoder, checksum)
+            .take(3 * seq_len)
+            .enumerate()
+        {
+            let seq_num: u32 = part
+                .split('/')
+                .nth(1)
+                .unwrap()
+                .split('-')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let forged = forged_part(
+                seq_num,
+                seq_len as u32,
+                seq_len as u32,
+                checksum,
+                &[i as u8],
+            );
+            assert_eq!(decoder.receive(&forged), Ok(false));
+            assert!(decoder.mixed.len() <= decoder.max_held);
+            assert!(held_memory(&decoder) <= budget);
+            sent += 1;
+        }
+        assert_eq!(sent, 3 * seq_len);
+        // full, and it used to be 115 MB
+        assert_eq!(decoder.mixed.len(), decoder.max_held);
+        assert!(decoder.max_held >= seq_len);
+        assert!(held_memory(&decoder) <= budget);
+        assert!(held_memory(&decoder) <= 5 << 20);
+        assert_eq!(decoder.received_fragment_count(), 0);
+
+        // Each fragment that now comes on its own is XORed out of the parts
+        // on hold, and those take whole cascades with them: it used to be
+        // more than half a second for each, for a minute and a half in all.
+        let start = std::time::Instant::now();
+        let mut slowest = core::time::Duration::ZERO;
+        for (i, &byte) in message.iter().enumerate() {
+            let part = forged_part(
+                i as u32 + 1,
+                seq_len as u32,
+                seq_len as u32,
+                checksum,
+                &[byte],
+            );
+            let before = std::time::Instant::now();
+            // the garbage may well have the message come out wrong
+            match decoder.receive(&part) {
+                Ok(_) | Err(Error::BadChecksum) => {}
+                Err(e) => panic!("part {}: {e:?}", i + 1),
+            }
+            slowest = slowest.max(before.elapsed());
+            assert!(held_memory(&decoder) <= budget);
+            if decoder.is_complete() || decoder.fragment_count() == 0 {
+                break;
+            }
+        }
+        // a tenth of a second and half a second, unoptimized
+        assert!(slowest < core::time::Duration::from_secs(2), "{slowest:?}");
+        assert!(start.elapsed() < core::time::Duration::from_secs(20));
+    }
+
+    /// The budget is the tighter bound past the default limits.
+    #[test]
+    fn budget_follows_the_message() {
+        let mut decoder = Decoder::with_limits(1 << 20, 1 << 20);
+        let seq_len = 1 << 18;
+        assert_eq!(
+            decoder.receive(&forged_part(seq_len + 1, seq_len, seq_len, 0, &[0])),
+            Ok(false)
+        );
+        let held_len = Decoder::held_len(seq_len as usize, 1);
+        assert!(decoder.max_held < seq_len as usize);
+        assert!(decoder.max_held * held_len <= 2 * seq_len as usize + HELD_ALLOWANCE);
+
+        // and never in the way of a message that makes sense
+        let mut decoder = Decoder::new();
+        let part = Encoder::new("bytes", &[1; 30000], 100).unwrap().next_part();
+        assert_eq!(decoder.receive(&part), Ok(false));
+        assert_eq!(decoder.max_held, 2 * 300 + 16);
+    }
+
+    /// The parts past the first `seq_len` alone get a message through,
+    /// whether or not parts on hold are XORed out of one another, and with no
+    /// more of them than it took when parts on hold were lists of indexes.
+    #[test]
+    fn decodes_mixed_only_streams() {
+        for (message_len, fragment_len, expected) in [
+            (600, 50, 13),
+            (3000, 20, 329),
+            (12000, 30, 1000),
+            (2000, 2, 3156),
+        ] {
+            let message = make_message("Wolf", message_len);
+            let mut encoder = Encoder::new("bytes", &message, fragment_len).unwrap();
+            let seq_len = encoder.fragment_count();
+            let mut decoder = Decoder::new();
+            let mut used = 0;
+            for part in encoder.by_ref().skip(seq_len) {
+                used += 1;
+                assert!(used <= expected, "{seq_len} fragments: no progress");
+                if decoder.receive(&part).unwrap() {
+                    break;
+                }
+                assert!(decoder.mixed.len() <= decoder.max_held);
+                if used % 50 != 0 {
+                    continue;
+                }
+                // no part on hold mixes a fragment that is known
+                assert!(decoder.mixed.iter().all(|held| {
+                    held.count >= 2
+                        && held.count
+                            == held
+                                .bits
+                                .iter()
+                                .map(|w| w.count_ones() as usize)
+                                .sum::<usize>()
+                        && (0..seq_len).all(|i| !(held.has(i) && decoder.known[i]))
+                }));
+            }
+            assert_eq!(decoder.message(), Some(&message[..]), "{seq_len} fragments");
+        }
     }
 }
