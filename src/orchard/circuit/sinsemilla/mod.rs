@@ -13,15 +13,17 @@
 //! the chip) and the private `from_bitstring` constructors, which only the
 //! tests of the reference call.
 //!
-//! [`HashDomain`] has no ECC chip, as the ECC gadget layer is not ported
-//! yet: `hash_to_point` returns the [`NonIdentityEccPoint`] of the chip
-//! (the `inner` of the reference's `ecc::NonIdentityPoint`) and `hash` the
-//! cell of its x-coordinate (the `inner` of `ecc::X`).
+//! [`HashDomain`] has no ECC chip: `hash_to_point` returns the
+//! [`NonIdentityEccPoint`] of the chip (the `inner` of the reference's
+//! `ecc::NonIdentityPoint`) and `hash` the cell of its x-coordinate (the
+//! `inner` of `ecc::X`). [`CommitDomain`] holds the ECC chip and returns the
+//! points of the ECC gadget, as the reference does.
 
 use alloc::vec::Vec;
 
 use self::chip::{RunningSum, SinsemillaChip};
-use crate::orchard::circuit::ecc::chip::NonIdentityEccPoint;
+use crate::orchard::circuit::ecc;
+use crate::orchard::circuit::ecc::chip::{EccChip, NonIdentityEccPoint, OrchardFixedBasesFull};
 use crate::orchard::circuit::utilities::{FieldValue, RangeConstrained};
 use crate::orchard::halo2::circuit::{AssignedCell, Layouter};
 use crate::orchard::halo2::{Error, Value};
@@ -56,10 +58,6 @@ impl OrchardHashDomains {
 }
 
 /// The commit domains of Orchard (`orchard::constants::OrchardCommitDomains`).
-///
-/// Only the hash domain is available for now: `r()` (the fixed base `R` of
-/// the blinding factor, `OrchardFixedBasesFull::{NoteCommitR, CommitIvkR}`)
-/// needs the fixed bases of the ECC chip.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum OrchardCommitDomains {
     /// `NoteCommit^Orchard`.
@@ -74,6 +72,14 @@ impl OrchardCommitDomains {
         match self {
             Self::NoteCommit => OrchardHashDomains::NoteCommit,
             Self::CommitIvk => OrchardHashDomains::CommitIvk,
+        }
+    }
+
+    /// The fixed base `R` of the blinding factor (`CommitDomains::r`).
+    pub(crate) fn r(&self) -> OrchardFixedBasesFull {
+        match self {
+            Self::NoteCommit => OrchardFixedBasesFull::NoteCommitR,
+            Self::CommitIvk => OrchardFixedBasesFull::CommitIvkR,
         }
     }
 }
@@ -207,24 +213,74 @@ impl HashDomain {
     }
 }
 
-// TODO(CommitDomain): port `halo2_gadgets::sinsemilla::CommitDomain`
-// (`halo2_gadgets-0.6.0/src/sinsemilla.rs`, after `HashDomain`) here once
-// the ECC gadget layer exists:
-//
-//   struct CommitDomain { M: HashDomain, R: ecc::FixedPoint }
-//   new(sinsemilla_chip, ecc_chip, &OrchardCommitDomains)
-//       M = HashDomain::new(sinsemilla_chip, &domain.hash_domain()),
-//       R = ecc::FixedPoint::from_inner(ecc_chip, domain.r())
-//   blinding_factor(layouter, r) = self.R.mul(layouter, r)?.0
-//   commit(layouter, message, r):
-//       let (blind, _) = self.R.mul(layouter, r)?;                 // "[r] R"
-//       let (p, zs) = self.M.hash_to_point(layouter, message)?;    // "M"
-//       let commitment = p.add(layouter, &blind)?;                 // "M + [r] R"
-//       Ok((commitment, zs))
-//   short_commit(layouter, message, r) = commit(..) then extract_p()
-//
-// in that order (the regions are laid out in call order). It also needs
-// `OrchardCommitDomains::r()`.
+/// Gadget representing a domain in which $\mathsf{SinsemillaCommit}$ and
+/// $\mathsf{SinsemillaShortCommit}$ can be used.
+#[derive(Debug)]
+#[allow(non_snake_case)]
+pub(crate) struct CommitDomain {
+    M: HashDomain,
+    ecc_chip: EccChip,
+    R: ecc::FixedPoint,
+}
+
+impl CommitDomain {
+    /// Constructs a new `CommitDomain` for the given domain.
+    pub(crate) fn new(
+        sinsemilla_chip: SinsemillaChip,
+        ecc_chip: EccChip,
+        domain: &OrchardCommitDomains,
+    ) -> Self {
+        CommitDomain {
+            M: HashDomain::new(sinsemilla_chip, &domain.hash_domain()),
+            ecc_chip,
+            R: ecc::FixedPoint::from_inner(ecc_chip, domain.r()),
+        }
+    }
+
+    /// Evaluates the blinding factor equal to $\[r\] R$ where `R` is the
+    /// fixed base of the `CommitDomain`.
+    pub(crate) fn blinding_factor(
+        &self,
+        layouter: &mut Layouter<'_>,
+        r: ecc::ScalarFixed,
+    ) -> Result<ecc::Point, Error> {
+        // [r] R
+        let (blind, _) = self.R.mul(layouter.namespace(), r)?;
+        Ok(blind)
+    }
+
+    /// $\mathsf{SinsemillaCommit}$ from
+    /// [§ 5.4.8.4](https://zips.z.cash/protocol/nu5.pdf#concretesinsemillacommit).
+    pub(crate) fn commit(
+        &self,
+        layouter: &mut Layouter<'_>,
+        message: Message,
+        r: ecc::ScalarFixed,
+    ) -> Result<(ecc::Point, Vec<RunningSum>), Error> {
+        assert_eq!(self.M.sinsemilla_chip, message.chip);
+        // [r] R
+        let (blind, _) = self.R.mul(layouter.namespace(), r)?;
+        // M
+        let (p, zs) = self.M.hash_to_point(layouter.namespace(), message)?;
+        let p = ecc::NonIdentityPoint::from_inner(self.ecc_chip, p);
+        // M + [r] R
+        let commitment = p.add(layouter.namespace(), &blind)?;
+        Ok((commitment, zs))
+    }
+
+    /// $\mathsf{SinsemillaShortCommit}$ from
+    /// [§ 5.4.8.4](https://zips.z.cash/protocol/nu5.pdf#concretesinsemillacommit).
+    pub(crate) fn short_commit(
+        &self,
+        layouter: &mut Layouter<'_>,
+        message: Message,
+        r: ecc::ScalarFixed,
+    ) -> Result<(ecc::X, Vec<RunningSum>), Error> {
+        assert_eq!(self.M.sinsemilla_chip, message.chip);
+        let (p, zs) = self.commit(layouter.namespace(), message, r)?;
+        Ok((p.extract_p(), zs))
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
