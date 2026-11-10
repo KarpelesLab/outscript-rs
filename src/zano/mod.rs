@@ -1,5 +1,111 @@
 //! Zano: addresses, keys and transactions, built on the primitives the
 //! CryptoNote family shares ([`cryptonote`](crate::cryptonote)).
+//!
+//! This is a port of the Go library `KarpelesLab/zanolib`, checked against
+//! it and against Zano's C++ sources. It covers what an offline signer and a
+//! deposit scanner need for confidential (Zarcanum, post-HF4) transactions:
+//!
+//! - **Addresses** ([`Address`], [`AddressType`]): standard, integrated,
+//!   auditable and auditable integrated, with flags and payment ids.
+//! - **Keys** ([`Wallet`]): the secret spend key and the view key derived
+//!   from it, view-only wallets, auditable accounts.
+//! - **Scanning**: [`Wallet::key_derivation`] and [`Wallet::scan_output`]
+//!   tell whether an output belongs to the wallet and decode its amount and
+//!   asset, with the view key only and without a heap; `Wallet::scan_tx`
+//!   does a whole `Transaction` and recovers the payment id.
+//! - **Signing**: `Wallet::parse_ftp` reads the unsigned transaction a
+//!   view-only `simplewallet` prepares (`FinalizeTxParam`),
+//!   `Wallet::sign` builds and signs it, and `FinalizedTx::encrypt` gives
+//!   the blob that wallet broadcasts. `Wallet::build_transfer` does without
+//!   the wallet, from scanned outputs and rings of decoys.
+//! - **Proofs**, each with its verifier: the CLSAG-GGX ring signature
+//!   (`generate_clsag_ggx`), Bulletproofs+ range proofs
+//!   (`generate_bpp`), the BGE one-out-of-many proof of asset surjection
+//!   (`generate_bge_proof`), the vector UG aggregation proof and the
+//!   double Schnorr proof of the balance
+//!   (`generate_vector_ug_aggregation_proof`,
+//!   `generate_double_schnorr_sig`); `Transaction::verify_proofs` and
+//!   `Transaction::verify_input` check a whole transaction.
+//! - **Wire formats**: `Transaction` and its `Variant`s, the wallet
+//!   blobs, ChaCha8 ([`chacha8`]) and epee portable storage (`epee`).
+//!
+//! The network client (`zanorpc`) and threshold signing (`zanompc`) of
+//! zanolib are not ported; `InputSigner` is the seam the latter plugs
+//! into.
+//!
+//! ```
+//! use outscript::zano::{Address, AddressType, Wallet};
+//!
+//! let secret: [u8; 32] = core::array::from_fn(|i| if i == 0 { 1 } else { 0 });
+//! let wallet = Wallet::from_spend_secret(&secret, 0)?;
+//! let address = wallet.address();
+//! assert_eq!(address.address_type(), AddressType::Standard);
+//!
+//! // The text form needs no heap: it goes into a caller buffer, or through
+//! // `Display`.
+//! let mut buf = [0u8; outscript::zano::MAX_ADDRESS_LEN];
+//! let n = address.encode_to_slice(&mut buf)?;
+//! let text = core::str::from_utf8(&buf[..n]).unwrap();
+//! assert!(text.starts_with("Zx"));
+//! assert_eq!(text.parse::<Address>()?, address);
+//! # Ok::<(), outscript::Error>(())
+//! ```
+//!
+//! # Features
+//!
+//! Addresses, keys, ChaCha8 and single-output scanning work without a heap.
+//! Everything else — serialization, proofs, signing, whole-transaction
+//! scanning, epee, the JSON view-wallet description — needs `alloc`.
+//!
+//! # Randomness
+//!
+//! The crate has no random number generator. Whatever draws random values
+//! takes an `rng: &mut dyn FnMut(&mut [u8])`, which must fill the buffer it
+//! is given from a cryptographically secure source (and never repeat its
+//! output: the nonces of the signatures come from it). Random scalars are 64
+//! bytes reduced modulo the group order, as in zanolib; given the same bytes
+//! in the same order, signing produces the same transaction as zanolib does.
+//!
+//! # Secrets
+//!
+//! Secret keys are reduced scalars, and are wiped when the values that hold
+//! them are dropped ([`Wallet`], `TxSource`, `FinalizedTx`,
+//! `TransferInput`, ...). Scalar arithmetic and every multiplication by a
+//! secret scalar are `purecrypto`'s constant-time ones; in the range proof
+//! the bits of the amounts select points without branching. Verification,
+//! and the operations on public values during signing (challenges, the
+//! decoys' side of a ring, hashing to points), are variable-time.
+//!
+//! # Untrusted input
+//!
+//! Parsing — addresses, transactions, wallet blobs, portable storage —
+//! never panics, and never reserves more memory than the input justifies: a
+//! count is checked against the bytes left before anything is allocated,
+//! and nesting is bounded. Points and scalars of a transaction are kept as
+//! the bytes on the wire and checked where they are used; verification
+//! returns `false` for anything malformed.
+//!
+//! # Compatibility
+//!
+//! The formats are those of Zano 2.1.x (transaction versions 2 and 3). The
+//! wallet blobs are not versioned and follow the wallet's C++ structures:
+//! they match Zano 2.1.0.382 to 2.1.19.477, like zanolib. Where zanolib and
+//! Zano disagree, this module follows Zano:
+//!
+//! - varints are the standard ones (zanolib writes 128 as the single byte
+//!   `0x80`);
+//! - the range proof is right for three and more outputs, and the
+//!   surjection proof for more than four inputs (zanolib's are not);
+//! - an output's mixing attribute comes from the unsigned transaction;
+//! - the concealing point of a scanned output is compared after the
+//!   multiplication by 8.
+//!
+//! Like zanolib, signing only handles confidential inputs and outputs,
+//! keeps the destinations in order (no shuffling), does not copy the
+//! unsigned transaction's extra entries and attachments into the
+//! transaction, and blinds every asset id (the
+//! `tdef_explicit_native_asset_id` destination flag is not acted on), all of
+//! which a verifier accepts.
 
 mod address;
 #[cfg(feature = "alloc")]

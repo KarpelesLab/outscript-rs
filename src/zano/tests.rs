@@ -5,10 +5,11 @@
 //! random source (see [`stream`]); the binary fixtures are zanolib's own:
 //! two mainnet transactions and a transaction signed by Zano's wallet.
 //!
-//! The generic CryptoNote vectors zanolib tests against (`hash_to_scalar`,
-//! `hash_to_ec`, `hash_to_point`, key derivation, key images, ...) are those
-//! of Monero's `tests/crypto/tests.txt`, which the `cryptonote` module's
-//! tests already run.
+//! `testdata/zanolib_crypto_vectors.txt` is a sample (every eighth line,
+//! plus every failure case and the edge cases) of the vector tables in
+//! zanolib's `zanocrypto/*_test.go` — themselves lines of the reference
+//! implementation's `tests/crypto/tests.txt`. The whole tables (1940
+//! vectors) pass too; they are not committed for their size.
 
 use super::*;
 use crate::cryptonote::{EdwardsPoint, Scalar, hash_to_ec, scalar_from_bytes};
@@ -17,6 +18,8 @@ use crate::cryptonote::{EdwardsPoint, Scalar, hash_to_ec, scalar_from_bytes};
 mod full;
 
 pub(super) const VECTORS: &str = include_str!("testdata/go_vectors.txt");
+
+const CRYPTO_VECTORS: &str = include_str!("testdata/zanolib_crypto_vectors.txt");
 
 /// The spend secret of the wallet of zanolib's fixtures.
 pub(super) const SPEND_SECRET: &str =
@@ -287,6 +290,10 @@ fn wallet_view_only_and_generate() {
     bad[0] = 2;
     assert!(Wallet::view_only(w.view_secret_key(), &bad, 0).is_err());
 
+    let generated = Wallet::generate(&mut stream(3), ADDRESS_FLAG_AUDITABLE).unwrap();
+    assert!(generated.is_auditable() && !generated.is_view_only());
+    assert_ne!(generated.address(), w.address());
+
     // A generated wallet takes 64 bytes and reduces them.
     let mut taken = 0;
     let mut rng = |buf: &mut [u8]| {
@@ -478,4 +485,59 @@ fn errors_display() {
         std::format!("{}", Error::UnsupportedVariant(99)),
         "unsupported variant tag 99"
     );
+}
+
+/// zanolib's `zanocrypto` vector tables: `TestHashToScalar`, `TestHashToEC`,
+/// `TestHashToPoint`, `TestKeyImage`, `TestGenerateKeyDerivation`,
+/// `TestDerivePublicKey` and `TestDeriveSecretKey`.
+#[test]
+fn zanolib_crypto_vectors() {
+    use crate::cryptonote as cn;
+
+    let mut count = 0;
+    for line in CRYPTO_VECTORS.lines() {
+        let f: std::vec::Vec<&str> = line.split_whitespace().collect();
+        count += 1;
+        match f[0] {
+            "hash_to_scalar" => {
+                let data = if f[1] == "x" {
+                    std::vec::Vec::new()
+                } else {
+                    hex::decode(f[1]).unwrap()
+                };
+                assert_eq!(cn::hash_to_scalar(&data), h32(f[2]), "{line}");
+            }
+            "hash_to_ec" => assert_eq!(cn::hash_to_ec(&h32(f[1])), h32(f[2]), "{line}"),
+            "hash_to_point" => assert_eq!(cn::hash_to_point(&h32(f[1])), h32(f[2]), "{line}"),
+            "generate_key_image" => {
+                let (public, secret) = (h32(f[1]), h32(f[2]));
+                assert_eq!(cn::generate_key_image(&public, &secret).unwrap(), h32(f[3]));
+                let image = key_image(
+                    &scalar_from_bytes(&secret).unwrap(),
+                    &cn::point_from_bytes(&public).unwrap(),
+                );
+                assert_eq!(image.compress(), h32(f[3]), "{line}");
+            }
+            "generate_key_derivation" => {
+                let derivation = cn::generate_key_derivation(&h32(f[1]), &h32(f[2]));
+                match f[3] {
+                    "true" => assert_eq!(derivation.unwrap(), h32(f[4]), "{line}"),
+                    _ => assert!(derivation.is_err(), "{line}"),
+                }
+            }
+            "derive_public_key" => {
+                let key = cn::derive_public_key(&h32(f[1]), f[2].parse().unwrap(), &h32(f[3]));
+                match f[4] {
+                    "true" => assert_eq!(key.unwrap(), h32(f[5]), "{line}"),
+                    _ => assert!(key.is_err(), "{line}"),
+                }
+            }
+            "derive_secret_key" => {
+                let key = cn::derive_secret_key(&h32(f[1]), f[2].parse().unwrap(), &h32(f[3]));
+                assert_eq!(*key.unwrap(), h32(f[4]), "{line}");
+            }
+            other => panic!("unknown vector {other}"),
+        }
+    }
+    assert!(count >= 280);
 }
