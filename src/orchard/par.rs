@@ -1,4 +1,5 @@
-//! Running independent pieces of work on several threads.
+//! Running independent pieces of work on several threads (feature
+//! `alloc`; the threads come with `std`).
 //!
 //! With the `std` feature the helpers here split their work over scoped
 //! threads ([`std::thread::scope`]); without it they run it in order on the
@@ -9,14 +10,16 @@
 
 use alloc::vec::Vec;
 
+#[cfg(feature = "zcash-orchard-prover")]
 use crate::orchard::{Fp, vesta};
 
 #[cfg(feature = "std")]
 static MAX_THREADS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// Limits the number of threads key generation, proving and verification
-/// use, for the whole process: `1` keeps everything on the calling thread,
-/// `0` (the default) uses as many threads as the machine has cores.
+/// Limits the number of threads this module uses (for key generation,
+/// proving, verification, and batched trial decryption), for the whole
+/// process: `1` keeps everything on the calling thread, `0` (the default)
+/// uses as many threads as the machine has cores.
 ///
 /// The number of threads never changes a result: keys and proofs are
 /// identical, for the same inputs, whatever it is.
@@ -35,7 +38,7 @@ pub fn max_threads() -> usize {
 }
 
 /// The number of threads work is split over: one, without `std`.
-#[cfg(not(feature = "std"))]
+#[cfg(all(not(feature = "std"), feature = "zcash-orchard-prover"))]
 pub(crate) fn max_threads() -> usize {
     1
 }
@@ -84,6 +87,7 @@ where
         .collect()
 }
 
+#[cfg(feature = "zcash-orchard-prover")]
 /// `f(i)` for every `i` below `count`, in order.
 pub(crate) fn map_range<R, F>(count: usize, f: F) -> Vec<R>
 where
@@ -121,6 +125,7 @@ where
     (0..count).map(f).collect()
 }
 
+#[cfg(feature = "zcash-orchard-prover")]
 /// Splits `data` into consecutive pieces of at least `min_len` elements (a
 /// multiple of `align`, but for the last) and runs `f(start, piece)` on
 /// each, where `start` is the index of the piece's first element.
@@ -154,9 +159,11 @@ where
     f(0, data);
 }
 
+#[cfg(feature = "zcash-orchard-prover")]
 /// The smallest multi-scalar multiplication worth a thread of its own.
 const MSM_MIN_LEN: usize = 256;
 
+#[cfg(feature = "zcash-orchard-prover")]
 /// [`vesta::Point::msm_vartime`], split over the threads. (The pieces add
 /// up to the same point; only its projective coordinates, which nothing
 /// depends on, may differ.)

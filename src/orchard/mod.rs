@@ -12,12 +12,14 @@
 //! - **Unified encodings** ([`unified`]): ZIP-316 unified addresses and
 //!   viewing keys.
 //! - **Notes** ([`note`], [`value`], [`tree`]): note commitments,
-//!   nullifiers, value commitments, the note commitment tree.
+//!   nullifiers, value commitments, the note commitment tree and
+//!   witnesses kept up to date as it grows.
 //! - **Note encryption** ([`note_encryption`]): encryption to an address,
-//!   trial decryption with an incoming viewing key (full or compact),
-//!   recovery with an outgoing viewing key.
+//!   trial decryption with an incoming viewing key (full or compact, one
+//!   action at a time or many actions and keys at once), recovery with an
+//!   outgoing viewing key.
 //! - **Signatures** ([`redpallas`]): spend authorization and binding
-//!   signatures.
+//!   signatures, verified singly or in batches.
 //! - **Bundles** ([`bundle`]): the Orchard part of a version 5 transaction.
 //! - **Proofs** (feature `zcash-orchard-prover`): `circuit` verifies and
 //!   creates the Halo 2 proofs of bundles, on the proving system of
@@ -54,6 +56,8 @@ pub mod halo2;
 pub mod keys;
 pub mod note;
 pub mod note_encryption;
+#[cfg(feature = "alloc")]
+mod par;
 pub mod poseidon;
 pub mod redpallas;
 pub mod sinsemilla;
@@ -73,6 +77,8 @@ pub use keys::{
     SpendingKey,
 };
 pub use note::{ExtractedNoteCommitment, Note, Nullifier};
+#[cfg(feature = "std")]
+pub use par::{max_threads, set_max_threads};
 pub use spec::prf_expand;
 pub use value::ValueCommitment;
 

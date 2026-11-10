@@ -2,7 +2,7 @@ use super::{arr, vectors};
 use crate::orchard::bundle::{ACTION_SIZE, Action, BundleRef, Flags};
 use crate::orchard::keys::*;
 use crate::orchard::note_encryption::*;
-use crate::orchard::tree::{self, Frontier, MerklePath};
+use crate::orchard::tree::{self, Frontier, IncrementalWitness, MerklePath};
 use crate::orchard::{Error, Fp, Fq, Note, Nullifier, ValueCommitment, constants, value};
 
 #[test]
@@ -496,4 +496,344 @@ fn mainnet_transaction_signatures() {
         bundle.verify_signatures(&wrong),
         Err(Error::InvalidSignature)
     );
+}
+
+/// Witnesses made as leaves are appended, and updated with the leaves that
+/// follow, give the paths of the official vectors at every size of the
+/// tree.
+#[test]
+fn incremental_witness_vectors() {
+    let tvs = vectors(include_str!("../testdata/orchard_merkle_tree.json"));
+    let field = |v: &serde_json::Value| Fp::from_bytes(&arr(v)).unwrap();
+    let mut frontier = Frontier::new();
+    let mut witnesses: Vec<IncrementalWitness> = Vec::new();
+    for (appended, tv) in tvs.iter().enumerate() {
+        let leaf = field(&tv[0].as_array().unwrap()[appended]);
+        for witness in witnesses.iter_mut() {
+            witness.append(leaf).unwrap();
+        }
+        witnesses.push(frontier.append_witnessed(leaf).unwrap());
+        assert_eq!(frontier.size(), appended as u64 + 1);
+        let root = frontier.root();
+        let paths = tv[1].as_array().unwrap();
+        for (position, witness) in witnesses.iter().enumerate() {
+            assert_eq!(witness.position(), position as u32);
+            assert_eq!(witness.tree_size(), appended as u64 + 1);
+            let expected: Vec<Fp> = paths[position]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(field)
+                .collect();
+            let path = witness.path();
+            assert_eq!(path.position(), position as u32);
+            for (level, sibling) in path.auth_path().iter().enumerate() {
+                match expected.get(level) {
+                    Some(e) => assert_eq!(sibling, e, "size {appended}+1 at {position}"),
+                    None => assert_eq!(*sibling, tree::empty_root(level)),
+                }
+            }
+            // (the root takes 32 hashes: for some of the witnesses)
+            if position % 5 == appended % 5 {
+                assert_eq!(witness.root(), root);
+                assert_eq!(path.root(witness.cmx()), root);
+            }
+        }
+    }
+}
+
+/// The leaves of the reference witnesses below.
+fn reference_leaf(i: u64) -> Fp {
+    let v = ((i + 1) as u128).pow(3) * 0x9E37_79B9_7F4A_7C15u128;
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(&v.to_le_bytes());
+    Fp::from_bytes(&bytes).unwrap()
+}
+
+/// Witnesses in the tree of depth 32 against `IncrementalWitness` of the
+/// `incrementalmerkletree` crate (0.9.0) with the node hash of the
+/// `orchard` crate (0.16.0): `testdata/orchard_incremental_witness.txt` is
+/// the output of a program (described in the file) appending 45 leaves and
+/// printing, at some sizes, the root and the first seven siblings of the
+/// witnesses made on the way (the others are roots of empty subtrees).
+#[test]
+fn incremental_witness_reference() {
+    let reference = include_str!("../testdata/orchard_incremental_witness.txt");
+    let field = |s: &str| Fp::from_bytes(&hex::decode(s).unwrap().try_into().unwrap()).unwrap();
+    let records: Vec<Vec<&str>> = reference
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| line.split(' ').collect())
+        .collect();
+    assert_eq!(records.len(), 24);
+    let positions = [0u32, 5, 7, 21, 32, 44];
+    let mut frontier = Frontier::new();
+    let mut witnesses: Vec<IncrementalWitness> = Vec::new();
+    let mut checked = 0;
+    for i in 0..45u64 {
+        let leaf = reference_leaf(i);
+        for witness in witnesses.iter_mut() {
+            witness.append(leaf).unwrap();
+        }
+        if positions.contains(&(i as u32)) {
+            witnesses.push(frontier.append_witnessed(leaf).unwrap());
+        } else {
+            assert_eq!(frontier.append(leaf), Ok(i as u32));
+        }
+        for record in records.iter().filter(|r| r[0].parse() == Ok(i + 1)) {
+            let position: u32 = record[1].parse().unwrap();
+            let witness = witnesses.iter().find(|w| w.position() == position).unwrap();
+            assert_eq!(witness.tree_size(), i + 1);
+            assert_eq!(witness.cmx(), reference_leaf(position as u64));
+            let root = field(record[2]);
+            assert_eq!(frontier.root(), root);
+            assert_eq!(witness.root(), root);
+            let path = witness.path();
+            for (level, sibling) in path.auth_path().iter().enumerate() {
+                match record.get(3 + level) {
+                    Some(expected) => assert_eq!(*sibling, field(expected)),
+                    None => assert_eq!(*sibling, tree::empty_root(level)),
+                }
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, records.len());
+    // the witness of the whole tree agrees
+    #[cfg(feature = "alloc")]
+    {
+        let leaves: Vec<Fp> = (0..45).map(reference_leaf).collect();
+        for witness in witnesses.iter() {
+            assert_eq!(
+                tree::witness(&leaves, witness.position()),
+                Some(witness.path())
+            );
+        }
+    }
+}
+
+/// The witness of the first leaf, whose siblings are all on the right and
+/// complete one level after the other.
+#[test]
+fn incremental_witness_bounds() {
+    // the first leaf: every sibling is on the right
+    let mut frontier = Frontier::new();
+    let leaf = Fp::from_u64(77);
+    let mut witness = frontier.append_witnessed(leaf).unwrap();
+    assert_eq!(witness.cmx(), leaf);
+    assert_eq!(witness.root(), frontier.root());
+    let copy = witness.clone();
+    assert_eq!(copy, witness);
+    // siblings complete in order of level: after 1, 2, 4 more leaves
+    for i in 0..7u64 {
+        let next = Fp::from_u64(100 + i);
+        frontier.append(next).unwrap();
+        witness.append(next).unwrap();
+        assert_eq!(witness.tree_size(), i + 2);
+        assert_eq!(witness.root(), frontier.root(), "{i}");
+    }
+    assert_ne!(copy, witness);
+    let path = witness.path();
+    assert_eq!(path.auth_path()[0], Fp::from_u64(100));
+    assert_eq!(
+        path.auth_path()[1],
+        tree::merkle_crh(0, &Fp::from_u64(101), &Fp::from_u64(102))
+    );
+    assert_eq!(path.auth_path()[3], tree::empty_root(3));
+}
+
+/// Many actions and keys decrypted at once give what one at a time does.
+#[cfg(feature = "alloc")]
+#[test]
+fn batch_note_decryption_matches() {
+    let fvks: Vec<FullViewingKey> = (0u8..3)
+        .map(|i| SpendingKey::from_bytes([60 + i; 32]).unwrap().to_fvk())
+        .collect();
+    let ivks: Vec<IncomingViewingKey> = fvks.iter().map(|f| f.to_ivk(Scope::External)).collect();
+    let stranger = SpendingKey::from_bytes([90; 32]).unwrap().to_fvk();
+
+    // notes to each of the keys and to a stranger, in some order
+    struct Sent {
+        nullifier: [u8; 32],
+        cmx: [u8; 32],
+        encrypted: EncryptedNote,
+        owner: Option<usize>,
+        note: Note,
+        memo: [u8; MEMO_SIZE],
+    }
+    let mut sent = Vec::new();
+    for i in 0u8..70 {
+        let owner = match i % 5 {
+            0 => Some(0),
+            1 | 2 => Some(2),
+            3 => Some(1),
+            _ => None,
+        };
+        let fvk = owner.map_or(&stranger, |o| &fvks[o]);
+        let recipient = fvk.address_at(i as u32, Scope::External);
+        let rho = Nullifier::from_fp(Fp::from_u64(1000 + i as u64));
+        let note = Note::from_parts(recipient, 5 * i as u64, rho, [i; 32]).unwrap();
+        let mut memo = [0u8; MEMO_SIZE];
+        memo[0] = i;
+        sent.push(Sent {
+            nullifier: rho.to_bytes(),
+            cmx: note.cmx().to_bytes(),
+            encrypted: encrypt_note(&note, &memo),
+            owner,
+            note,
+            memo,
+        });
+    }
+    // an ephemeral key that is not a point, one that is another note's,
+    // a ciphertext that is damaged
+    sent[7].encrypted.ephemeral_key = [0xff; 32];
+    sent[10].encrypted.ephemeral_key = sent[11].encrypted.ephemeral_key;
+    sent[15].encrypted.enc_ciphertext[30] ^= 1;
+    for i in [7, 10, 15] {
+        sent[i].owner = None;
+    }
+
+    let outputs: Vec<ActionOutput<'_>> = sent
+        .iter()
+        .map(|s| ActionOutput {
+            nullifier: &s.nullifier,
+            cmx: &s.cmx,
+            ephemeral_key: &s.encrypted.ephemeral_key,
+        })
+        .collect();
+    let full: Vec<(ActionOutput<'_>, &[u8; ENC_CIPHERTEXT_SIZE])> = outputs
+        .iter()
+        .zip(sent.iter())
+        .map(|(output, s)| (*output, &s.encrypted.enc_ciphertext))
+        .collect();
+    let compact_bytes: Vec<[u8; COMPACT_NOTE_SIZE]> = sent
+        .iter()
+        .map(|s| {
+            s.encrypted.enc_ciphertext[..COMPACT_NOTE_SIZE]
+                .try_into()
+                .unwrap()
+        })
+        .collect();
+    let compact: Vec<(ActionOutput<'_>, &[u8; COMPACT_NOTE_SIZE])> = outputs
+        .iter()
+        .zip(compact_bytes.iter())
+        .map(|(output, bytes)| (*output, bytes))
+        .collect();
+
+    let found = batch_note_decryption(&ivks, &full);
+    let found_compact = batch_compact_note_decryption(&ivks, &compact);
+    assert_eq!(found.len(), sent.len());
+    assert_eq!(found_compact.len(), sent.len());
+    let mut owned = 0;
+    for (i, s) in sent.iter().enumerate() {
+        // one key at a time
+        let single = ivks.iter().enumerate().find_map(|(k, ivk)| {
+            try_note_decryption(ivk, &outputs[i], &s.encrypted.enc_ciphertext)
+                .map(|(note, memo)| (k, note, memo))
+        });
+        assert_eq!(found[i], single, "action {i}");
+        assert_eq!(single.map(|(k, _, _)| k), s.owner, "action {i}");
+        if let Some((_, note, memo)) = &found[i] {
+            assert_eq!(note, &s.note);
+            assert_eq!(memo, &s.memo);
+            owned += 1;
+        }
+        let single = ivks.iter().enumerate().find_map(|(k, ivk)| {
+            try_compact_note_decryption(ivk, &outputs[i], &compact_bytes[i]).map(|note| (k, note))
+        });
+        assert_eq!(found_compact[i], single, "action {i}");
+        // (the compact form has no tag: the damaged byte is in the memo)
+        if i != 15 {
+            assert_eq!(single.map(|(k, _)| k), s.owner, "action {i}");
+        }
+    }
+    assert!(owned > 30);
+    // nothing to do
+    assert!(batch_note_decryption(&ivks, &[]).is_empty());
+    assert!(
+        batch_note_decryption(&[], &full)
+            .iter()
+            .all(|f| f.is_none())
+    );
+    assert_eq!(batch_compact_note_decryption(&[], &compact).len(), 70);
+    // a single key, a single action
+    let one = batch_note_decryption(&ivks[2..], &full[1..2]);
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].as_ref().map(|f| f.0), Some(0));
+}
+
+/// How long scanning takes, one action and key at a time and in batches
+/// (`cargo test --release -- --ignored --nocapture batch_note_decryption_timing`).
+#[cfg(feature = "std")]
+#[test]
+#[ignore = "a measurement"]
+fn batch_note_decryption_timing() {
+    let ivks: Vec<IncomingViewingKey> = (0u8..3)
+        .map(|i| {
+            SpendingKey::from_bytes([60 + i; 32])
+                .unwrap()
+                .to_fvk()
+                .to_ivk(Scope::External)
+        })
+        .collect();
+    let stranger = SpendingKey::from_bytes([90; 32]).unwrap().to_fvk();
+    let notes: Vec<([u8; 32], [u8; 32], EncryptedNote)> = (0u64..2000)
+        .map(|i| {
+            let recipient = match i % 100 {
+                0 => ivks[1].address_at(i),
+                _ => stranger.address_at(i, Scope::External),
+            };
+            let rho = Nullifier::from_fp(Fp::from_u64(1000 + i));
+            let note = Note::from_parts(recipient, i, rho, [i as u8; 32]).unwrap();
+            (
+                rho.to_bytes(),
+                note.cmx().to_bytes(),
+                encrypt_note(&note, &[0; MEMO_SIZE]),
+            )
+        })
+        .collect();
+    let compact_bytes: Vec<[u8; COMPACT_NOTE_SIZE]> = notes
+        .iter()
+        .map(|n| n.2.enc_ciphertext[..COMPACT_NOTE_SIZE].try_into().unwrap())
+        .collect();
+    let compact: Vec<(ActionOutput<'_>, &[u8; COMPACT_NOTE_SIZE])> = notes
+        .iter()
+        .zip(compact_bytes.iter())
+        .map(|((nullifier, cmx, encrypted), bytes)| {
+            (
+                ActionOutput {
+                    nullifier,
+                    cmx,
+                    ephemeral_key: &encrypted.ephemeral_key,
+                },
+                bytes,
+            )
+        })
+        .collect();
+
+    let t = std::time::Instant::now();
+    let single: Vec<Option<(usize, Note)>> = compact
+        .iter()
+        .map(|(output, bytes)| {
+            ivks.iter().enumerate().find_map(|(k, ivk)| {
+                try_compact_note_decryption(ivk, output, bytes).map(|note| (k, note))
+            })
+        })
+        .collect();
+    std::eprintln!(
+        "2000 compact actions, 3 keys, one at a time: {:?}",
+        t.elapsed()
+    );
+    for threads in [1, 0] {
+        crate::orchard::set_max_threads(threads);
+        let t = std::time::Instant::now();
+        let batch = batch_compact_note_decryption(&ivks, &compact);
+        std::eprintln!(
+            "in batches on {} thread(s): {:?}",
+            crate::orchard::max_threads(),
+            t.elapsed()
+        );
+        assert_eq!(batch, single);
+    }
+    assert_eq!(single.iter().flatten().count(), 20);
 }

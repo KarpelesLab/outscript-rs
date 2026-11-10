@@ -5,8 +5,8 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::par;
 use super::plonk::Rotation;
+use crate::orchard::par;
 use crate::orchard::{Fp, vesta};
 
 /// Something a radix-2 FFT with [`Fp`] twiddle factors can run over: field

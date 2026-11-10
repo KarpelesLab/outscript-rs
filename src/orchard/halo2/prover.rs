@@ -20,11 +20,11 @@ use super::circuit::{Assignment, Circuit, synthesize};
 use super::commitment::{Params, ProverRng};
 use super::keygen::ProvingKey;
 use super::multiopen::{self, ProverQuery};
-use super::par;
 use super::plonk::{Advice, Any, Column, ConstraintSystem, Expression, Fixed, Instance, Selector};
 use super::poly::{EvaluationDomain, eval_polynomial};
 use super::transcript::TranscriptWrite;
 use super::{Error, Value};
+use crate::orchard::par;
 use crate::orchard::{Fp, vesta};
 
 /// Columns of witness-derived values, wiped when dropped.

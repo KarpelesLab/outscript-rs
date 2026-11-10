@@ -10,13 +10,13 @@ use purecrypto::hash::Blake2bMac;
 
 use super::circuit::{Assignment, Circuit, synthesize};
 use super::commitment::Params;
-use super::par;
 use super::plonk::{
     Advice, Any, Column, ConstraintSystem, Fixed, Hex, Instance, PermutationArgument,
     PinnedConstraintSystem, Selector, SelectorPlan,
 };
 use super::poly::EvaluationDomain;
 use super::{Error, Value};
+use crate::orchard::par;
 use crate::orchard::{Fp, vesta};
 
 /// A verifying key: everything the verifier knows about a circuit.

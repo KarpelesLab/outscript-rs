@@ -288,3 +288,140 @@ pub fn try_output_recovery_with_ovk(
     esk.zeroize();
     result
 }
+
+/// How many actions are decrypted together by one thread.
+#[cfg(feature = "alloc")]
+const BATCH_CHUNK: usize = 32;
+
+/// The symmetric keys every incoming viewing key derives for every action
+/// (`keys[action * ivks.len() + ivk]`), or `None` for an action whose
+/// ephemeral key is not a valid non-identity point: as `recipient_key`,
+/// but all the shared secrets are brought to affine coordinates with a
+/// single inversion.
+#[cfg(feature = "alloc")]
+fn recipient_keys(
+    ivks: &[IncomingViewingKey],
+    ephemeral_keys: &[&[u8; 32]],
+) -> alloc::vec::Vec<Option<[u8; 32]>> {
+    use alloc::vec;
+    use alloc::vec::Vec;
+    let mut shared: Vec<Point> = Vec::with_capacity(ephemeral_keys.len() * ivks.len());
+    let mut valid: Vec<bool> = Vec::with_capacity(ephemeral_keys.len());
+    for ephemeral_key in ephemeral_keys {
+        let epk = Affine::from_bytes(ephemeral_key).filter(|epk| !bool::from(epk.is_identity()));
+        valid.push(epk.is_some());
+        let epk = epk.map_or(Point::IDENTITY, |epk| epk.to_point());
+        for ivk in ivks {
+            shared.push(epk.mul(&ivk.ivk_scalar()));
+        }
+    }
+    let mut affine = vec![Affine::IDENTITY; shared.len()];
+    Point::batch_normalize(&shared, &mut affine);
+    shared.zeroize();
+    let mut keys = Vec::with_capacity(affine.len());
+    for (i, point) in affine.iter().enumerate() {
+        let action = i / ivks.len();
+        keys.push(valid[action].then(|| {
+            let mut secret = point.to_bytes();
+            let mut key = [0u8; 32];
+            blake2b(
+                b"Zcash_OrchardKDF",
+                &[&secret, ephemeral_keys[action]],
+                &mut key,
+            );
+            secret.zeroize();
+            key
+        }));
+    }
+    affine.zeroize();
+    keys
+}
+
+/// Trial decryption of many actions with many incoming viewing keys at
+/// once: for each action (given with its ciphertext), the index of the
+/// first key of `ivks` its note is for, the note and its memo, exactly as
+/// [`try_note_decryption`] with each key in turn would find them.
+///
+/// This is faster than trying the keys one by one: the ephemeral key of an
+/// action is decoded once, the shared secrets are normalized together,
+/// and with the `std` feature the actions are spread over the threads of
+/// the machine (see `set_max_threads`).
+#[cfg(feature = "alloc")]
+pub fn batch_note_decryption(
+    ivks: &[IncomingViewingKey],
+    outputs: &[(ActionOutput<'_>, &[u8; ENC_CIPHERTEXT_SIZE])],
+) -> alloc::vec::Vec<Option<(usize, Note, [u8; MEMO_SIZE])>> {
+    batch_decrypt(ivks, outputs, |ivk, key, output, ciphertext| {
+        decrypt_and_check(key, output, ciphertext, None, |g_d| {
+            g_d.mul(&ivk.ivk_scalar()).to_affine()
+        })
+    })
+    .into_iter()
+    .map(|found| found.map(|(index, (note, memo))| (index, note, memo)))
+    .collect()
+}
+
+/// Trial decryption of the compact forms of many actions with many
+/// incoming viewing keys at once: for each action, the index of the first
+/// key of `ivks` its note is for and the note, exactly as
+/// [`try_compact_note_decryption`] with each key in turn would find them.
+/// See [`batch_note_decryption`].
+#[cfg(feature = "alloc")]
+pub fn batch_compact_note_decryption(
+    ivks: &[IncomingViewingKey],
+    outputs: &[(ActionOutput<'_>, &[u8; COMPACT_NOTE_SIZE])],
+) -> alloc::vec::Vec<Option<(usize, Note)>> {
+    batch_decrypt(ivks, outputs, |ivk, key, output, ciphertext| {
+        let mut plaintext = *ciphertext;
+        // the ciphertext is ChaCha20 from block 1 (block 0 keys the tag)
+        ChaCha20::new(key).apply_keystream(&[0; 12], 1, &mut plaintext);
+        let note = check_note(
+            &plaintext,
+            output,
+            |g_d| g_d.mul(&ivk.ivk_scalar()).to_affine(),
+            None,
+        );
+        plaintext.zeroize();
+        note
+    })
+}
+
+/// For each action, the first key that `decrypt` succeeds with, and what
+/// it returns.
+#[cfg(feature = "alloc")]
+fn batch_decrypt<C: Sync, R: Send>(
+    ivks: &[IncomingViewingKey],
+    outputs: &[(ActionOutput<'_>, &C)],
+    decrypt: impl Fn(&IncomingViewingKey, &[u8; 32], &ActionOutput<'_>, &C) -> Option<R> + Sync,
+) -> alloc::vec::Vec<Option<(usize, R)>> {
+    use alloc::vec::Vec;
+    if ivks.is_empty() {
+        return outputs.iter().map(|_| None).collect();
+    }
+    let chunks: Vec<&[(ActionOutput<'_>, &C)]> = outputs.chunks(BATCH_CHUNK).collect();
+    let found = super::par::map(&chunks, |_, chunk| {
+        let ephemeral_keys: Vec<&[u8; 32]> = chunk
+            .iter()
+            .map(|(output, _)| output.ephemeral_key)
+            .collect();
+        let mut keys = recipient_keys(ivks, &ephemeral_keys);
+        let found: Vec<Option<(usize, R)>> = chunk
+            .iter()
+            .zip(keys.chunks(ivks.len()))
+            .map(|((output, ciphertext), keys)| {
+                ivks.iter()
+                    .zip(keys)
+                    .enumerate()
+                    .find_map(|(index, (ivk, key))| {
+                        let result = decrypt(ivk, key.as_ref()?, output, ciphertext)?;
+                        Some((index, result))
+                    })
+            })
+            .collect();
+        for key in keys.iter_mut().flatten() {
+            key.zeroize();
+        }
+        found
+    });
+    found.into_iter().flatten().collect()
+}

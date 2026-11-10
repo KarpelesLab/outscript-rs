@@ -8,9 +8,9 @@ use alloc::vec::Vec;
 use purecrypto::hash::Blake2bMac;
 
 use super::Error;
-use super::par;
 use super::poly::{compute_inner_product, eval_polynomial, fft_par};
 use super::transcript::{TranscriptRead, TranscriptWrite};
+use crate::orchard::par;
 use crate::orchard::{Fp, vesta};
 
 /// The public parameters of the commitment scheme for polynomials of
