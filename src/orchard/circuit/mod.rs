@@ -10,7 +10,7 @@
 //! commits to.
 //!
 //! The circuit and the gadgets it is built from are ports of the `orchard`
-//! (0.16) and `halo2_gadgets` (0.6) crates onto [`halo2`](super::halo2),
+//! (0.16) and `halo2_gadgets` (0.6) crates onto [`halo2`],
 //! laid out exactly as the reference: the verifying keys are identical (see
 //! [`VerifyingKey::build`]) and proofs are interchangeable.
 //!
@@ -53,6 +53,11 @@ pub(crate) mod note_commit;
 pub(crate) mod poseidon;
 pub(crate) mod sinsemilla;
 pub(crate) mod utilities;
+
+#[cfg(test)]
+mod tests;
+#[cfg(all(test, feature = "std"))]
+mod tests_build;
 
 /// The size of the circuit: `2^11` rows.
 pub const K: u32 = 11;
@@ -324,8 +329,10 @@ struct EmbeddedKey {
 
 impl EmbeddedKey {
     fn from_vk(vk: &halo2::VerifyingKey, plan: &[halo2::plonk::SelectorPlan]) -> Self {
+        let mut plan = plan.to_vec();
+        plan.sort_by_key(|p| p.selector);
         EmbeddedKey {
-            plan: plan.to_vec(),
+            plan,
             fixed_commitments: vk.fixed_commitments().to_vec(),
             permutation_commitments: vk.permutation_commitments().to_vec(),
         }
@@ -336,7 +343,7 @@ impl EmbeddedKey {
         let mut out = Vec::new();
         out.push(self.plan.len() as u8);
         for (i, p) in self.plan.iter().enumerate() {
-            debug_assert_eq!(p.selector, i);
+            assert_eq!(p.selector, i);
             out.extend_from_slice(&[
                 p.combination_index as u8,
                 p.assigned_root as u8,
@@ -388,6 +395,23 @@ impl EmbeddedKey {
     }
 }
 
+/// The Lagrange basis generators of the rows of the public inputs, which
+/// are costly to derive (a test regenerates them).
+const G_LAGRANGE: &[u8; 32 * INSTANCE_ROWS] = include_bytes!("g_lagrange.bin");
+
+/// The parameters for verifying, from the embedded generators.
+fn verifier_params() -> Params {
+    let g_lagrange = G_LAGRANGE
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .map(|bytes| {
+            super::vesta::Affine::from_bytes(bytes).expect("the embedded generators are valid")
+        })
+        .collect();
+    Params::with_lagrange(K, g_lagrange)
+}
+
 impl VerifyingKey {
     /// Generates the verifying key of a circuit version from scratch, by
     /// synthesizing the circuit and committing to its fixed columns: slow
@@ -409,6 +433,11 @@ impl VerifyingKey {
     /// [`VerifyingKey::build`]), and parameters sufficient for verifying:
     /// takes a fraction of a second.
     pub fn embedded(version: CircuitVersion) -> Self {
+        Self::embedded_with(version, verifier_params())
+    }
+
+    /// [`VerifyingKey::embedded`] with parameters already at hand.
+    fn embedded_with(version: CircuitVersion, params: Params) -> Self {
         let key =
             EmbeddedKey::from_bytes(version.embedded()).expect("the embedded key is well-formed");
         let vk = halo2::vk_from_parts(
@@ -420,10 +449,18 @@ impl VerifyingKey {
         )
         .expect("the embedded key fits the circuit");
         VerifyingKey {
-            params: Params::for_verifier(K, INSTANCE_ROWS),
+            params,
             vk,
             version,
         }
+    }
+
+    /// The embedded verifying keys of all the circuit versions (in the
+    /// order of [`CircuitVersion::ALL`]), sharing the work they have in
+    /// common.
+    pub fn embedded_all() -> [Self; 3] {
+        let params = verifier_params();
+        CircuitVersion::ALL.map(|version| Self::embedded_with(version, params.clone()))
     }
 
     /// The version of the circuit.

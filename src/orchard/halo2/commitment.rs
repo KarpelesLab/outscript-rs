@@ -114,6 +114,14 @@ impl Params {
         params
     }
 
+    /// The parameters for verification only, given the first Lagrange
+    /// basis generators (as [`Params::for_verifier`] computes them).
+    pub(crate) fn with_lagrange(k: u32, g_lagrange: Vec<vesta::Affine>) -> Self {
+        let mut params = Self::generators(k);
+        params.g_lagrange = g_lagrange;
+        params
+    }
+
     /// The size parameter `k`.
     pub fn k(&self) -> u32 {
         self.k
