@@ -103,6 +103,21 @@ fn build_and_check(version: CircuitVersion, name: &str) {
         ..ZcashTx::default()
     };
     let sighash = tx.sighash(None, SIGHASH_ALL, &[]).unwrap();
+    // Signed elsewhere, the bundle is as good.
+    let requests = unauthorized.spend_auth_requests();
+    assert_eq!(requests.len(), 1);
+    let external = sk
+        .to_ask()
+        .randomize(&requests[0].alpha)
+        .sign(&seed(7), &sighash)
+        .to_bytes();
+    let signed = unauthorized
+        .authorize(&sighash, &[], &[(requests[0].index, external)], &seed(6))
+        .unwrap()
+        .to_bytes();
+    let signed = BundleRef::parse(&signed).unwrap().unwrap();
+    assert_eq!(signed.verify_signatures(&sighash), Ok(()));
+
     let bundle = unauthorized
         .apply_signatures(&sighash, &[sk.to_ask()], &seed(6))
         .unwrap();

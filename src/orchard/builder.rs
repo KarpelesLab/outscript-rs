@@ -11,11 +11,26 @@
 //! the ZIP-244 signature hash; [`UnauthorizedBundle::apply_signatures`]
 //! then signs every action and the bundle.
 //!
+//! # Signing elsewhere
+//!
+//! Building and proving take the full viewing key of the notes spent, not
+//! their spending key: a watch-only wallet can do both. The spend
+//! authorizing key is only needed for the signatures, which a hardware
+//! wallet (or any other signer) can make:
+//! [`UnauthorizedBundle::spend_auth_requests`] lists, for each action
+//! spending a real note, the randomizer `alpha` and the randomized key
+//! `rk` to sign for (the signer checks `rk = ak + [alpha] G` against its
+//! own key, and signs the signature hash with `ask + alpha`), and
+//! [`UnauthorizedBundle::authorize`] takes the signatures made, checks
+//! them, and adds what the builder signs itself (the dummy spends and the
+//! binding signature).
+//!
 //! The crate has no random number generator: each step takes fresh
 //! uniformly random bytes from the caller. They must never be reused, as
 //! they seed the note randomness, the key randomizers, the blinding of the
 //! proof and the signature nonces.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use purecrypto::hash::Blake2bMac;
@@ -30,6 +45,7 @@ use super::note::{Note, Nullifier};
 use super::note_encryption::{
     MEMO_SIZE, encrypt_note, encrypt_outgoing, encrypt_outgoing_unrecoverable,
 };
+use super::redpallas::{Signature, SpendAuth, VerificationKey};
 use super::tree::MerklePath;
 use super::value::{ValueCommitment, binding_signing_key};
 use super::{Fp, Fq, halo2};
@@ -61,6 +77,13 @@ pub enum BuildError {
     MissingSigningKey,
     /// The proof could not be created.
     Proof(halo2::Error),
+    /// A spend authorization signature made elsewhere does not verify for
+    /// the randomized key of its action and the signature hash.
+    InvalidSignature,
+    /// A spend authorization signature was given for an action that does
+    /// not exist, that the builder signs itself (a dummy spend), or that
+    /// has another signature already.
+    UnexpectedSignature,
 }
 
 impl core::fmt::Display for BuildError {
@@ -75,6 +98,8 @@ impl core::fmt::Display for BuildError {
             BuildError::WrongProvingKey => "proving key of another circuit version",
             BuildError::MissingSigningKey => "missing spend authorizing key",
             BuildError::Proof(e) => return write!(f, "proof creation failed: {e}"),
+            BuildError::InvalidSignature => "invalid spend authorization signature",
+            BuildError::UnexpectedSignature => "signature for an action that takes none",
         })
     }
 }
@@ -379,6 +404,17 @@ impl Builder {
         if pk.version() != self.version {
             return Err(BuildError::WrongProvingKey);
         }
+        self.build_with(random, |circuits, instances, random| {
+            circuit::create_proof(pk, circuits, instances, random).map_err(BuildError::Proof)
+        })
+    }
+
+    /// Builds the bundle, with the proof `prove` makes of its actions.
+    fn build_with(
+        self,
+        random: &[u8; 64],
+        prove: impl FnOnce(&[ActionCircuit], &[Instance], &[u8; 64]) -> Result<Vec<u8>, BuildError>,
+    ) -> Result<UnauthorizedBundle, BuildError> {
         let value_balance = self.value_balance()?;
         let (version, flags, anchor) = (self.version, self.flags, self.anchor);
         let mut rng = Random::new(random);
@@ -445,8 +481,7 @@ impl Builder {
             rcvs.push(rcv);
         }
 
-        let proof = circuit::create_proof(pk, &circuits, &instances, &rng.bytes())
-            .map_err(BuildError::Proof)?;
+        let proof = prove(&circuits, &instances, &rng.bytes())?;
         Ok(UnauthorizedBundle {
             bundle: Bundle {
                 actions,
@@ -478,6 +513,43 @@ impl Drop for SigningParts {
     }
 }
 
+/// What a signer needs to authorize the spend of one action: see
+/// [`UnauthorizedBundle::spend_auth_requests`].
+///
+/// `alpha` links the action to the key spending it: it is not a spending
+/// secret, but it is private, and wiped when the request is dropped.
+#[derive(Clone)]
+pub struct SpendAuthRequest {
+    /// The index of the action in the bundle.
+    pub index: usize,
+    /// The spend validating key `ak` of the note spent, which tells the
+    /// signer which of its keys is asked for.
+    pub ak: [u8; 32],
+    /// The randomizer of the action: the signature is made with the spend
+    /// authorizing key randomized by it
+    /// ([`SpendAuthorizingKey::randomize`]).
+    pub alpha: Fq,
+    /// The randomized spend validating key `rk = ak + [alpha] G` of the
+    /// action, which the signature must verify with.
+    pub rk: [u8; 32],
+}
+
+impl Drop for SpendAuthRequest {
+    fn drop(&mut self) {
+        self.alpha.zeroize();
+    }
+}
+
+impl core::fmt::Debug for SpendAuthRequest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SpendAuthRequest")
+            .field("index", &self.index)
+            .field("ak", &self.ak)
+            .field("rk", &self.rk)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A proven bundle that is not signed yet.
 pub struct UnauthorizedBundle {
     bundle: Bundle,
@@ -500,20 +572,89 @@ impl UnauthorizedBundle {
         &self.bundle
     }
 
+    /// What signing takes for each action that spends a real note (the
+    /// dummy spends the builder padded the bundle with are signed by the
+    /// builder itself): the randomizer and the randomized key, for a
+    /// signer that holds the spend authorizing key (see
+    /// [`UnauthorizedBundle::authorize`]).
+    pub fn spend_auth_requests(&self) -> Vec<SpendAuthRequest> {
+        self.bundle
+            .actions
+            .iter()
+            .zip(self.signing.iter())
+            .enumerate()
+            .filter(|(_, (_, parts))| parts.dummy_ask.is_none())
+            .map(|(index, (action, parts))| SpendAuthRequest {
+                index,
+                ak: parts.ak,
+                alpha: parts.alpha,
+                rk: action.rk,
+            })
+            .collect()
+    }
+
     /// Signs the bundle over `sighash`, the ZIP-244 signature hash of the
     /// transaction for shielded inputs: every action with the spend
     /// authorizing key of the note it spends (looked up in `asks`; dummy
     /// spends are signed with their own keys), and the bundle with its
     /// binding key. `random` must be 64 fresh uniformly random bytes.
     pub fn apply_signatures(
-        mut self,
+        self,
         sighash: &[u8; 32],
         asks: &[SpendAuthorizingKey],
         random: &[u8; 64],
     ) -> Result<Bundle, BuildError> {
+        self.authorize(sighash, asks, &[], random)
+    }
+
+    /// Completes the bundle over `sighash` (the ZIP-244 signature hash of
+    /// the transaction for shielded inputs) with spend authorization
+    /// signatures made elsewhere: `signatures` gives, by action index
+    /// ([`SpendAuthRequest::index`]), the signature of the hash with the
+    /// spend authorizing key randomized by the `alpha` of the action. Each
+    /// is verified with the `rk` of its action before it is accepted.
+    ///
+    /// The actions without a signature in `signatures` are signed here,
+    /// with the key of `asks` matching the note spent, as
+    /// [`UnauthorizedBundle::apply_signatures`] does; dummy spends and the
+    /// binding signature always are. `random` must be 64 fresh uniformly
+    /// random bytes.
+    pub fn authorize(
+        &self,
+        sighash: &[u8; 32],
+        asks: &[SpendAuthorizingKey],
+        signatures: &[(usize, [u8; 64])],
+        random: &[u8; 64],
+    ) -> Result<Bundle, BuildError> {
         let mut rng = Random::new(random);
+        let mut bundle = self.bundle.clone();
+        // The signatures made elsewhere, each for a distinct action that
+        // takes one.
+        let mut external: Vec<Option<&[u8; 64]>> = vec![None; bundle.actions.len()];
+        for (index, signature) in signatures {
+            let slot = external
+                .get_mut(*index)
+                .ok_or(BuildError::UnexpectedSignature)?;
+            if slot.is_some() || self.signing[*index].dummy_ask.is_some() {
+                return Err(BuildError::UnexpectedSignature);
+            }
+            *slot = Some(signature);
+        }
         let keys: Vec<[u8; 32]> = asks.iter().map(|ask| ask.to_ak().to_bytes()).collect();
-        for (action, parts) in self.bundle.actions.iter_mut().zip(self.signing.iter()) {
+        for ((action, parts), external) in bundle
+            .actions
+            .iter_mut()
+            .zip(self.signing.iter())
+            .zip(external)
+        {
+            if let Some(signature) = external {
+                VerificationKey::<SpendAuth>::from_bytes(&action.rk)
+                    .ok_or(BuildError::InvalidSignature)?
+                    .verify(sighash, &Signature::from_bytes(signature))
+                    .map_err(|_| BuildError::InvalidSignature)?;
+                action.spend_auth_sig = *signature;
+                continue;
+            }
             let ask = match &parts.dummy_ask {
                 Some(ask) => ask,
                 None => {
@@ -528,7 +669,155 @@ impl UnauthorizedBundle {
             action.spend_auth_sig = rsk.sign(&rng.bytes(), sighash).to_bytes();
         }
         let bsk = binding_signing_key(self.rcvs.iter());
-        self.bundle.binding_sig = bsk.sign(&rng.bytes(), sighash).to_bytes();
-        Ok(self.bundle.clone())
+        bundle.binding_sig = bsk.sign(&rng.bytes(), sighash).to_bytes();
+        Ok(bundle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchard::bundle::BundleRef;
+    use crate::orchard::note_encryption::try_note_decryption;
+    use crate::orchard::tree;
+
+    fn seed<const N: usize>(tag: u8) -> [u8; N] {
+        core::array::from_fn(|i| {
+            tag.wrapping_mul(59)
+                .wrapping_add((i as u8).wrapping_mul(131))
+        })
+    }
+
+    /// Everything about a bundle but its proof (which the slow tests of
+    /// `circuit` cover): pairing, padding, encryption, and signing, here or
+    /// elsewhere.
+    #[test]
+    fn build_and_sign_without_proof() {
+        let sk = SpendingKey::from_bytes(seed(1)).unwrap();
+        let fvk = sk.to_fvk();
+        let sender = fvk.address_at(0u32, Scope::External);
+        let other = SpendingKey::from_bytes(seed(2)).unwrap().to_fvk();
+        let recipient = other.address_at(3u32, Scope::External);
+        let rho = Nullifier::from_fp(Fp::from_uniform_bytes(&seed(3)));
+        let note = Note::from_parts(sender, 70_000, rho, seed(4)).unwrap();
+        let leaves = [Fp::from_u64(5), note.cmx().to_fp()];
+        let anchor = tree::root(&leaves).unwrap();
+        let path = tree::witness(&leaves, 1).unwrap();
+
+        for version in CircuitVersion::ALL {
+            let restricted = version.supports_cross_address_restriction();
+            let mut builder = Builder::new(version, Flags::ENABLED, anchor);
+            builder.add_spend(&fvk, note, path).unwrap();
+            let to = if restricted { sender } else { recipient };
+            builder.add_output(None, to, 60_000, NO_MEMO).unwrap();
+            assert_eq!(builder.value_balance(), Ok(10_000));
+            // only the full viewing key was needed so far
+            let unauthorized = builder
+                .build_with(&seed(5), |circuits, instances, _| {
+                    assert_eq!(circuits.len(), 2);
+                    assert_eq!(instances.len(), 2);
+                    assert!(
+                        instances
+                            .iter()
+                            .all(|i| i.disable_cross_address == restricted)
+                    );
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            let sighash = seed::<32>(6);
+
+            let requests = unauthorized.spend_auth_requests();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert_eq!(request.ak, fvk.ak().to_bytes());
+            assert_eq!(request.rk, fvk.ak().randomize(&request.alpha).to_bytes());
+            assert_eq!(unauthorized.bundle().actions[request.index].rk, request.rk);
+            assert!(!alloc::format!("{request:?}").contains("alpha"));
+
+            // signed elsewhere
+            let external = sk
+                .to_ask()
+                .randomize(&request.alpha)
+                .sign(&seed(7), &sighash)
+                .to_bytes();
+            let check = |bundle: &Bundle| {
+                let bytes = bundle.to_bytes();
+                let parsed = BundleRef::parse(&bytes).unwrap().unwrap();
+                assert_eq!(parsed.verify_signatures(&sighash), Ok(()));
+                assert!(parsed.verify_signatures(&seed(8)).is_err());
+                let found: u64 = parsed
+                    .actions()
+                    .filter_map(|action| {
+                        let ivk = if restricted { &fvk } else { &other }.to_ivk(Scope::External);
+                        try_note_decryption(&ivk, &action.output(), &action.enc_ciphertext)
+                    })
+                    .map(|(note, _)| note.value())
+                    .sum();
+                assert_eq!(found, 60_000);
+            };
+            let signed = unauthorized
+                .authorize(&sighash, &[], &[(request.index, external)], &seed(9))
+                .unwrap();
+            assert_eq!(signed.actions[request.index].spend_auth_sig, external);
+            check(&signed);
+
+            // a signature that does not verify, misplaced, or missing
+            let authorize = |asks: &[SpendAuthorizingKey], signatures: &[(usize, [u8; 64])]| {
+                unauthorized
+                    .authorize(&sighash, asks, signatures, &seed(9))
+                    .map(|_| ())
+            };
+            let mut bad = external;
+            bad[40] ^= 1;
+            assert_eq!(
+                authorize(&[], &[(request.index, bad)]),
+                Err(BuildError::InvalidSignature)
+            );
+            let wrong_hash = sk
+                .to_ask()
+                .randomize(&request.alpha)
+                .sign(&seed(7), &[0u8; 32])
+                .to_bytes();
+            assert_eq!(
+                authorize(&[], &[(request.index, wrong_hash)]),
+                Err(BuildError::InvalidSignature)
+            );
+            let unrandomized = sk.to_ask().randomize(&Fq::ZERO).sign(&seed(7), &sighash);
+            assert_eq!(
+                authorize(&[], &[(request.index, unrandomized.to_bytes())]),
+                Err(BuildError::InvalidSignature)
+            );
+            assert_eq!(
+                authorize(&[], &[(1 - request.index, external)]),
+                Err(BuildError::UnexpectedSignature)
+            );
+            assert_eq!(
+                authorize(&[], &[(2, external)]),
+                Err(BuildError::UnexpectedSignature)
+            );
+            assert_eq!(
+                authorize(&[], &[(request.index, external), (request.index, external)]),
+                Err(BuildError::UnexpectedSignature)
+            );
+            assert_eq!(authorize(&[], &[]), Err(BuildError::MissingSigningKey));
+            assert_eq!(
+                authorize(&[other_ask()], &[]),
+                Err(BuildError::MissingSigningKey)
+            );
+
+            // signed here: the same as before this was split
+            let local = unauthorized
+                .authorize(&sighash, &[other_ask(), sk.to_ask()], &[], &seed(9))
+                .unwrap();
+            check(&local);
+            let applied = unauthorized
+                .apply_signatures(&sighash, &[sk.to_ask()], &seed(9))
+                .unwrap();
+            assert_eq!(applied.to_bytes(), local.to_bytes());
+        }
+    }
+
+    fn other_ask() -> SpendAuthorizingKey {
+        SpendingKey::from_bytes(seed(2)).unwrap().to_ask()
     }
 }
