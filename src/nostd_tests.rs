@@ -82,11 +82,6 @@ fn secp256k1_addresses() {
             "electraproto",
             "ep1q0yy3juscd3zfavw76g4h3eqdqzda7qyf4r3klt",
         ),
-        (
-            "p2wsh:p2wpkh",
-            "bitcoin",
-            "bc1qwg7r0yn6t7ctfaplxuwvlu2yk8q6fd3xsvr3lkq5ud4ylsecczzqgq9ste",
-        ),
     ] {
         render(&pk, fmt, net, want, |a| {
             if a.starts_with("0x") {

@@ -101,7 +101,10 @@ pub fn generate_script(pubkey: &PubKey, name: &str) -> Result<ScriptBytes, Error
     }
     #[cfg(feature = "bitcoin")]
     if let Some(inner) = name.strip_prefix("p2wsh:") {
-        if !matches!(inner, "p2pkh" | "p2pukh" | "p2pk" | "p2puk" | "p2wpkh") {
+        // no `p2wpkh` here: a witness program is not a valid witness script
+        // (it leaves two stack items, failing the clean-stack rule), so such
+        // an output could never be spent. Nesting is `p2sh:p2wpkh`.
+        if !matches!(inner, "p2pkh" | "p2pukh" | "p2pk" | "p2puk") {
             return Err(Error::UnknownFormat);
         }
         let witness_script = generate_script(pubkey, inner)?;
@@ -222,11 +225,6 @@ pub fn format_def(name: &str) -> Option<Format> {
             b(&[0x00]),
             push(ihash(lookup("p2puk"), &[sha256_vec])),
         ]),
-        #[cfg(feature = "bitcoin")]
-        "p2wsh:p2wpkh" => Some(vec![
-            b(&[0x00]),
-            push(ihash(lookup("p2wpkh"), &[sha256_vec])),
-        ]),
         #[cfg(feature = "evm")]
         "eth" => Some(vec![ihash(lookup("pubkey:uncomp"), &[ether_hash_vec])]),
         #[cfg(feature = "tron")]
@@ -286,8 +284,6 @@ pub const ALL_FORMATS: &[&str] = &[
     "p2wsh:p2pk",
     #[cfg(feature = "bitcoin")]
     "p2wsh:p2puk",
-    #[cfg(feature = "bitcoin")]
-    "p2wsh:p2wpkh",
     #[cfg(feature = "evm")]
     "eth",
     #[cfg(feature = "tron")]
@@ -419,6 +415,30 @@ mod tests {
             Err(Error::UnknownFormat)
         );
         assert_eq!(generate_script(&secp, "nope"), Err(Error::UnknownFormat));
+    }
+
+    /// A P2WPKH program is not a spendable witness script, so `p2wsh:p2wpkh`
+    /// is not a format; the P2SH nesting still is.
+    #[test]
+    fn p2wsh_p2wpkh_is_not_a_format() {
+        let secp = PubKey::Secp256k1(key().public_key());
+        assert_eq!(
+            generate_script(&secp, "p2wsh:p2wpkh"),
+            Err(Error::UnknownFormat)
+        );
+        assert!(!ALL_FORMATS.contains(&"p2wsh:p2wpkh"));
+        #[cfg(feature = "alloc")]
+        assert!(format_def("p2wsh:p2wpkh").is_none());
+        assert!(generate_script(&secp, "p2sh:p2wpkh").is_ok());
+        assert!(ALL_FORMATS.contains(&"p2sh:p2wpkh"));
+        for inner in ["p2pkh", "p2pukh", "p2pk", "p2puk"] {
+            let mut name = [0u8; 12];
+            let n = 6 + inner.len();
+            name[..6].copy_from_slice(b"p2wsh:");
+            name[6..n].copy_from_slice(inner.as_bytes());
+            let name = core::str::from_utf8(&name[..n]).unwrap();
+            assert_eq!(generate_script(&secp, name).unwrap().len(), 34, "{name}");
+        }
     }
 
     /// The heap-free generator must agree with the `Insertable` format
