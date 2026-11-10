@@ -60,6 +60,12 @@ zcash-sapling = ["zcash", "purecrypto/cipher"]
 # Zcash Orchard shielded pool: Pallas/Vesta, ZIP-32 keys, unified addresses,
 # notes, note encryption and scanning, RedPallas, Orchard bundles.
 zcash-orchard = ["zcash", "purecrypto/cipher"]
+# Sapling Groth16 prover (spend and output proofs) and shielded builder.
+# Needs the Sapling proving parameters at run time. Not in the default set.
+zcash-sapling-prover = ["zcash-sapling", "alloc", "purecrypto/bls"]
+# Orchard Halo2 prover (action proofs) and shielded builder. Not in the
+# default set.
+zcash-orchard-prover = ["zcash-orchard", "alloc"]
 # Both shielded pools.
 zcash-shielded = ["zcash-sapling", "zcash-orchard"]
 # Tron: addresses and `trontx` (protobuf transactions: TRX, TRC-10 and
