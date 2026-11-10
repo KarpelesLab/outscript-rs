@@ -370,12 +370,15 @@ impl DerSignature {
     /// Wraps an already DER-encoded signature, e.g. one returned by an
     /// external signer or read back from a transaction.
     ///
-    /// The encoding is validated ([`parse_der_signature`]) and kept verbatim,
-    /// so a non-canonical but parsable encoding round-trips unchanged; encode
-    /// through [`from_rs`](Self::from_rs) for a canonical result. The sighash
-    /// byte, if any, must not be included.
+    /// The encoding must be strict DER ([`parse_der_signature`]) and both `r`
+    /// and `s` must be non-zero and below the group order, as for
+    /// [`from_rs`](Self::from_rs); the bytes are kept verbatim. `s` is not
+    /// required to be low. The sighash byte, if any, must not be included.
     pub fn from_der(sig: &[u8]) -> Result<Self, Error> {
-        parse_der_signature(sig)?;
+        let (r, s) = parse_der_signature(sig)?;
+        if !is_valid_scalar_be(&r) || !is_valid_scalar_be(&s) {
+            return Err(Error::Malformed);
+        }
         let mut buf = [0u8; 72];
         buf[..sig.len()].copy_from_slice(sig);
         Ok(DerSignature {
@@ -462,6 +465,15 @@ fn der_encode(r_be: &[u8; 32], s_be: &[u8; 32]) -> DerSignature {
 }
 
 /// Parses a DER-encoded ECDSA signature into 32-byte big-endian `(r, s)`.
+///
+/// The encoding must be strict DER as defined by BIP-66: each integer is at
+/// least one byte long, positive (the high bit of its first byte is clear) and
+/// minimal (no leading `0x00` unless the next byte has its high bit set), and
+/// nothing follows the second integer. The sighash byte, if any, must not be
+/// included.
+///
+/// Only the encoding is checked: `r` and `s` are not range-checked against the
+/// group order here ([`DerSignature::from_der`] does that).
 pub fn parse_der_signature(sig: &[u8]) -> Result<([u8; 32], [u8; 32]), Error> {
     if sig.len() < 8 || sig.len() > 72 {
         return Err(Error::Malformed);
@@ -490,12 +502,18 @@ pub fn parse_der_signature(sig: &[u8]) -> Result<([u8; 32], [u8; 32]), Error> {
     Ok((r, s))
 }
 
+/// Left-pads a strict-DER (BIP-66) positive integer to 32 bytes.
 fn normalize_32(b: &[u8]) -> Result<[u8; 32], Error> {
-    let mut start = 0;
-    while start < b.len() && b[start] == 0x00 {
-        start += 1;
-    }
-    let trimmed = &b[start..];
+    let trimmed = match b {
+        // an integer has at least one byte
+        [] => return Err(Error::Malformed),
+        // negative
+        [first, ..] if first & 0x80 != 0 => return Err(Error::Malformed),
+        // a leading zero is only allowed to keep the value positive
+        [0x00, next, ..] if next & 0x80 == 0 => return Err(Error::Malformed),
+        [0x00, rest @ ..] if !rest.is_empty() => rest,
+        _ => b,
+    };
     if trimmed.len() > 32 {
         return Err(Error::Malformed);
     }
@@ -800,6 +818,80 @@ mod tests {
         let mut with_hashtype = sk.sign_der(&[1u8; 32]).as_bytes().to_vec();
         with_hashtype.push(0x01);
         assert!(DerSignature::from_der(&with_hashtype).is_err());
+    }
+
+    /// Builds `30 len 02 len(r) r 02 len(s) s`.
+    fn der_of(r: &[u8], s: &[u8]) -> ([u8; 80], usize) {
+        let mut buf = [0u8; 80];
+        let total = 6 + r.len() + s.len();
+        buf[0] = 0x30;
+        buf[1] = (total - 2) as u8;
+        buf[2] = 0x02;
+        buf[3] = r.len() as u8;
+        buf[4..4 + r.len()].copy_from_slice(r);
+        buf[4 + r.len()] = 0x02;
+        buf[5 + r.len()] = s.len() as u8;
+        buf[6 + r.len()..total].copy_from_slice(s);
+        (buf, total)
+    }
+
+    #[test]
+    fn der_parsing_is_strict() {
+        let ok = [0x11u8; 32];
+        let check = |r: &[u8], s: &[u8]| {
+            let (buf, n) = der_of(r, s);
+            (
+                parse_der_signature(&buf[..n]).is_ok(),
+                DerSignature::from_der(&buf[..n]).is_ok(),
+            )
+        };
+        assert_eq!(check(&ok, &ok), (true, true));
+        // a value with its high bit set needs (exactly) one leading zero
+        let mut high = [0u8; 33];
+        high[1..].copy_from_slice(&[0x81; 32]);
+        assert_eq!(check(&high, &ok), (true, true));
+        assert_eq!(check(&ok, &high), (true, true));
+        let (buf, n) = der_of(&high, &[0x05]);
+        let mut five = [0u8; 32];
+        five[31] = 5;
+        assert_eq!(parse_der_signature(&buf[..n]), Ok(([0x81; 32], five)));
+
+        // empty integers
+        assert_eq!(check(&[], &ok), (false, false));
+        assert_eq!(check(&ok, &[]), (false, false));
+        // negative integers (high bit set, no leading zero)
+        assert_eq!(check(&[0x81; 32], &ok), (false, false));
+        assert_eq!(check(&ok, &[0x81; 32]), (false, false));
+        assert_eq!(check(&[0x80], &ok), (false, false));
+        // zero-padded integers
+        let mut padded = [0u8; 33];
+        padded[1..].copy_from_slice(&ok);
+        assert_eq!(check(&padded, &ok), (false, false));
+        assert_eq!(check(&ok, &padded), (false, false));
+        assert_eq!(check(&[0x00, 0x00, 0x81], &ok), (false, false));
+        assert_eq!(check(&ok, &[0x00, 0x01]), (false, false));
+        // too long for a 256-bit value
+        assert_eq!(check(&[0x01; 33], &ok), (false, false));
+
+        // well-encoded but out of range: zero, n and above
+        assert_eq!(check(&[0x00], &ok), (true, false));
+        assert_eq!(check(&ok, &[0x00]), (true, false));
+        let mut n_der = [0u8; 33];
+        n_der[1..].copy_from_slice(&ORDER);
+        assert_eq!(check(&n_der, &ok), (true, false));
+        assert_eq!(check(&ok, &n_der), (true, false));
+        let mut max = [0u8; 33];
+        max[1..].copy_from_slice(&[0xff; 32]);
+        assert_eq!(check(&max, &ok), (true, false));
+        // n - 1 is the largest valid value
+        n_der[32] -= 1;
+        assert_eq!(check(&n_der, &n_der), (true, true));
+
+        // trailing data and a wrong outer length
+        let (mut buf, n) = der_of(&ok, &ok);
+        assert!(parse_der_signature(&buf[..n + 1]).is_err());
+        buf[1] += 1;
+        assert!(parse_der_signature(&buf[..n]).is_err());
     }
 
     fn h(s: &str) -> Vec<u8> {
