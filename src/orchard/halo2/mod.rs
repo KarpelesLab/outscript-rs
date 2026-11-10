@@ -36,6 +36,8 @@ mod verifier;
 
 pub use commitment::Params;
 pub use keygen::{PinnedVerificationKey, ProvingKey, VerifyingKey, keygen_pk, keygen_vk};
+#[allow(unused_imports)]
+pub(crate) use keygen::{keygen_vk_with_plan, vk_from_parts};
 pub use prover::create_proof;
 pub use value::Value;
 pub use verifier::{BatchVerifier, verify_proof};
