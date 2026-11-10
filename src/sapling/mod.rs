@@ -36,14 +36,14 @@ pub mod field;
 pub mod generators;
 pub mod group_hash;
 pub mod jubjub;
-// TMP pub mod keys;
+pub mod keys;
 // TMP pub mod note;
 // TMP pub mod note_encryption;
 pub mod pedersen;
 pub mod prf;
 // TMP pub mod redjubjub;
 pub mod tree;
-// TMP pub mod zip32;
+pub mod zip32;
 
 #[cfg(test)]
 mod test_vectors;
