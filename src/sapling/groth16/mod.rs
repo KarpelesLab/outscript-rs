@@ -206,7 +206,9 @@ impl VerifyingKey {
         let delta_g2 = r.g2()?;
         let ic = r
             .vector(96)?
-            .chunks_exact(96)
+            .as_chunks::<96>()
+            .0
+            .iter()
             .map(|bytes| {
                 let p = G1::from_uncompressed(bytes).map_err(|_| Error::InvalidPoint)?;
                 if bool::from(p.is_identity()) {
@@ -392,6 +394,10 @@ impl Parameters {
     /// parameters whose integrity is established otherwise, such as by
     /// their hash. No point may be the identity.
     ///
+    /// Bytes after the last vector are ignored, as `bellman` does: the
+    /// Sapling parameter files end with the transcript of the ceremony
+    /// that produced them.
+    ///
     /// Malformed input gives an error, never a panic, and nothing is
     /// allocated for more elements than the data holds.
     pub fn read(data: &[u8], checked: bool) -> Result<Self, Error> {
@@ -399,7 +405,9 @@ impl Parameters {
         let vk = VerifyingKey::read_from(&mut r)?;
         let g1s = |r: &mut Reader<'_>| {
             r.vector(96)?
-                .chunks_exact(96)
+                .as_chunks::<96>()
+                .0
+                .iter()
                 .map(|bytes| g1_affine(bytes, checked))
                 .collect::<Result<Vec<_>, _>>()
         };
@@ -409,12 +417,11 @@ impl Parameters {
         let b_g1 = g1s(&mut r)?;
         let b_g2 = r
             .vector(192)?
-            .chunks_exact(192)
+            .as_chunks::<192>()
+            .0
+            .iter()
             .map(|bytes| g2_affine(bytes, checked))
             .collect::<Result<Vec<_>, _>>()?;
-        if !r.0.is_empty() {
-            return Err(Error::TrailingData);
-        }
         Ok(Parameters {
             vk,
             h,

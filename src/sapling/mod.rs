@@ -33,6 +33,8 @@
 //! [`note::note_commitment_bits`]).
 
 pub mod bundle;
+#[cfg(feature = "zcash-sapling-prover")]
+pub mod circuit;
 pub mod field;
 pub mod generators;
 #[cfg(feature = "zcash-sapling-prover")]
@@ -44,6 +46,8 @@ pub mod note;
 pub mod note_encryption;
 pub mod pedersen;
 pub mod prf;
+#[cfg(feature = "zcash-sapling-prover")]
+pub mod prover;
 pub mod redjubjub;
 pub mod tree;
 pub mod zip32;

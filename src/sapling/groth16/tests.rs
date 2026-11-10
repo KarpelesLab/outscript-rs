@@ -183,12 +183,10 @@ fn malformed_parameters_are_rejected() {
     {
         assert!(Parameters::read(&PARAMS[..len], false).is_err(), "{len}");
     }
+    // what follows the vectors is not part of the parameters
     let mut extra = PARAMS.to_vec();
-    extra.push(0);
-    assert_eq!(
-        Parameters::read(&extra, false).unwrap_err(),
-        Error::TrailingData
-    );
+    extra.extend_from_slice(&[0xff; 100]);
+    assert!(Parameters::read(&extra, false).is_ok());
 
     let vk_len = Parameters::read(PARAMS, false).unwrap().vk.write().len();
     // a huge element count does not allocate
