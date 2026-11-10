@@ -21,10 +21,11 @@
 //! | `e39eab2b` | 3 428 147 | NU6.3   | v6     | `PostNu6_3`        |
 //! | `2be7cf25` | 3 550 069 | NU7     | v6     | `PostNu6_3`        |
 //!
-//! From NU6.3 wallets use version 6 transactions, which this crate does
-//! not parse: the tests below locate the Orchard bundle (which has the
-//! layout it has in version 5) in them, and the Ironwood bundle that
-//! follows it. None of these transactions has transparent inputs, so their
+//! From NU6.3 wallets use version 6 transactions: the tests below locate
+//! the Orchard bundle (which has the layout it has in version 5) in them
+//! by hand, and the Ironwood bundle that follows it (the tests of
+//! `zcashtx` parse these same transactions whole, and others). None of
+//! these transactions has transparent inputs, so their
 //! signature hash for shielded inputs is their id (ZIP 244). The reference
 //! (`zcash_primitives` 0.31.0 and `orchard` 0.16.0: the scratch program
 //! `checktx`) computes the same ids from these files and accepts the
@@ -472,9 +473,9 @@ fn mainnet_nu6_3_and_nu7_orchard_bundles_verify() {
 }
 
 /// The Ironwood bundle of a transaction mined under NU7 (one action): the
-/// same circuit, without the cross-address restriction. The Ironwood pool
-/// is not otherwise handled by this crate: the bundle is read as an
-/// Orchard one, but for the `enableCrossAddress` bit of its flags.
+/// same circuit, without the cross-address restriction. Read as an
+/// Orchard bundle, which it is but for the `enableCrossAddress` bit of its
+/// flags, it is restricted, and its proof is not valid.
 #[test]
 fn mainnet_ironwood_proof_verifies() {
     let (_, mut ironwood, sighash) = v6_bundles(TX_2BE7CF25, 0x7719_0ad9);

@@ -66,29 +66,108 @@ impl ExtractedNoteCommitment {
     }
 }
 
+/// The version of a note plaintext, which its lead byte states and which
+/// decides how the note commitment randomness `rcm` derives from `rseed`.
+///
+/// The version goes with the value pool (ZIP 2005, protocol specification
+/// section 3.2.1): every note of the Orchard pool is a [`V2`](Self::V2)
+/// note, every note of the Ironwood pool (from NU6.3, in version 6
+/// transactions) a [`V3`](Self::V3) note.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoteVersion {
+    /// The ZIP 212 format, lead byte `0x02`: the notes of the Orchard pool.
+    /// `rcm = ToScalar(PRF^expand(rseed, [5] || rho))`.
+    #[default]
+    V2,
+    /// The quantum-recoverable format of ZIP 2005, lead byte `0x03`: the
+    /// notes of the Ironwood pool. `rcm` commits to every field of the
+    /// note: `ToScalar(PRF^expand(rseed, [0x0B] || g_d || pk_d || v || rho
+    /// || psi))`.
+    V3,
+}
+
+impl NoteVersion {
+    /// The lead byte of the note plaintexts of this version.
+    pub const fn lead_byte(self) -> u8 {
+        match self {
+            NoteVersion::V2 => 0x02,
+            NoteVersion::V3 => 0x03,
+        }
+    }
+
+    /// The version a lead byte states, or `None` for an unknown one.
+    pub const fn from_lead_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0x02 => Some(NoteVersion::V2),
+            0x03 => Some(NoteVersion::V3),
+            _ => None,
+        }
+    }
+}
+
+/// `rcm` of a note, by version (`Derive_rcm^Orchard` of ZIP 2005).
+fn derive_rcm(
+    version: NoteVersion,
+    rseed: &[u8; 32],
+    recipient: &Address,
+    value: u64,
+    rho: &[u8; 32],
+    psi: &Fp,
+) -> Fq {
+    match version {
+        NoteVersion::V2 => prf_expand_scalar(rseed, &[&[0x05], rho]),
+        NoteVersion::V3 => prf_expand_scalar(
+            rseed,
+            &[
+                &[0x0b],
+                &recipient.g_d().to_bytes(),
+                &recipient.pk_d().to_bytes(),
+                &value.to_le_bytes(),
+                rho,
+                &psi.to_bytes(),
+            ],
+        ),
+    }
+}
+
 /// An Orchard note: a value held by an address, made unique by `rho` (the
 /// nullifier of the note spent in the action that created this one) and by
 /// the random seed `rseed`, from which `psi`, `rcm` and the ephemeral key
-/// `esk` are derived (ZIP-212).
+/// `esk` are derived (ZIP-212; ZIP 2005 for the notes of the Ironwood
+/// pool, see [`NoteVersion`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Note {
     recipient: Address,
     value: u64,
     rho: Nullifier,
     rseed: [u8; 32],
+    version: NoteVersion,
     /// The note commitment, computed once.
     cm: Affine,
 }
 
 impl Note {
-    /// Builds a note, or fails for the (negligibly rare) `rseed` the
-    /// protocol does not allow with this `rho`: one whose `esk` is zero or
-    /// whose note commitment is undefined.
+    /// Builds a note of the Orchard pool ([`NoteVersion::V2`]), or fails
+    /// for the (negligibly rare) `rseed` the protocol does not allow with
+    /// this `rho`: one whose `esk` is zero or whose note commitment is
+    /// undefined.
     pub fn from_parts(
         recipient: Address,
         value: u64,
         rho: Nullifier,
         rseed: [u8; 32],
+    ) -> Result<Self, Error> {
+        Self::from_parts_versioned(recipient, value, rho, rseed, NoteVersion::V2)
+    }
+
+    /// Builds a note of the given version ([`NoteVersion::V3`] for the
+    /// Ironwood pool), as [`from_parts`](Self::from_parts).
+    pub fn from_parts_versioned(
+        recipient: Address,
+        value: u64,
+        rho: Nullifier,
+        rseed: [u8; 32],
+        version: NoteVersion,
     ) -> Result<Self, Error> {
         let rho_bytes = rho.to_bytes();
         let mut esk = prf_expand_scalar(&rseed, &[&[0x04], &rho_bytes]);
@@ -98,7 +177,7 @@ impl Note {
             return Err(Error::InvalidNote);
         }
         let psi = prf_expand_base(&rseed, &[&[0x09], &rho_bytes]);
-        let mut rcm = prf_expand_scalar(&rseed, &[&[0x05], &rho_bytes]);
+        let mut rcm = derive_rcm(version, &rseed, &recipient, value, &rho_bytes, &psi);
         let g_d = recipient.g_d().to_bytes();
         let pk_d = recipient.pk_d().to_bytes();
         let psi_bytes = psi.to_bytes();
@@ -116,6 +195,7 @@ impl Note {
             value,
             rho,
             rseed,
+            version,
             cm: cm.ok_or(Error::InvalidNote)?.to_affine(),
         })
     }
@@ -146,10 +226,25 @@ impl Note {
         prf_expand_scalar(&self.rseed, &[&[0x04], &self.rho.to_bytes()])
     }
 
-    /// The note commitment randomness
-    /// `rcm = ToScalar(PRF^expand(rseed, [5] || rho))`.
+    /// The version of the note plaintext: [`NoteVersion::V2`] for a note
+    /// of the Orchard pool, [`NoteVersion::V3`] for one of the Ironwood
+    /// pool.
+    pub fn version(&self) -> NoteVersion {
+        self.version
+    }
+
+    /// The note commitment randomness: for a note of the Orchard pool,
+    /// `rcm = ToScalar(PRF^expand(rseed, [5] || rho))`; for one of the
+    /// Ironwood pool, see [`NoteVersion::V3`].
     pub fn rcm(&self) -> Fq {
-        prf_expand_scalar(&self.rseed, &[&[0x05], &self.rho.to_bytes()])
+        derive_rcm(
+            self.version,
+            &self.rseed,
+            &self.recipient,
+            self.value,
+            &self.rho.to_bytes(),
+            &self.psi(),
+        )
     }
 
     /// `psi = ToBase(PRF^expand(rseed, [9] || rho))`.

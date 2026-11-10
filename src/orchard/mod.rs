@@ -21,7 +21,8 @@
 //!   outgoing viewing key.
 //! - **Signatures** ([`redpallas`]): spend authorization and binding
 //!   signatures, verified singly or in batches.
-//! - **Bundles** ([`bundle`]): the Orchard part of a version 5 transaction.
+//! - **Bundles** ([`bundle`]): the Orchard part of a version 5 or version 6
+//!   transaction, and the Ironwood part of a version 6 one.
 //! - **Proofs** (feature `zcash-orchard-prover`): `circuit` verifies and
 //!   creates the Halo 2 proofs of bundles, on the proving system of
 //!   `halo2`; `builder` builds, proves and signs whole bundles.
@@ -29,6 +30,28 @@
 //! Keys, addresses, signatures and trial decryption work on fixed-size arrays
 //! and never allocate, so they run on `no_std` targets without a heap; the
 //! owned bundle and the unified containers need `alloc`.
+//!
+//! # The Ironwood pool
+//!
+//! From NU6.3 (ZIPs 229, 258, 2005 and 2006) the Orchard protocol serves
+//! two value pools: the Orchard pool, which then only empties, and the
+//! Ironwood pool. They share everything here (keys, addresses, the Action
+//! circuit of NU6.3, signatures, the encoding of bundles, the shape of the
+//! note commitment tree) but for three things: the notes of the Ironwood
+//! pool are of another plaintext version
+//! ([`NoteVersion::V3`](note::NoteVersion), whose commitment randomness
+//! binds every field of the note; the `*_versioned` functions of
+//! [`note_encryption`] read them), the flags of its bundles have an
+//! `enableCrossAddress` bit ([`bundle::Flags::CROSS_ADDRESS_ENABLED`],
+//! [`bundle::BundleRef::parse_ironwood`]), and its bundles are built with
+//! `builder::Builder::new_ironwood`. Each pool has its own tree: an anchor
+//! or a Merkle path of one means nothing in the other.
+//!
+//! ZIP 2005 also defines keys derived with a quantum spending key
+//! (`use_qsk`), which are optional and which this module does not
+//! implement, as `orchard` 0.16.0 does not: the keys here are the ones
+//! that read and spend the notes of both pools at the addresses in use
+//! before NU6.3.
 //!
 //! # For a prover
 //!

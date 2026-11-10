@@ -129,9 +129,10 @@ impl CircuitVersion {
     /// 257 (NU6.2: "This changes the Orchard verifying key"), 258 (NU6.3)
     /// and 259 (NU7).
     ///
-    /// This is about the Orchard pool only: the Ironwood pool NU6.3
-    /// introduces, which shares the NU6.3 circuit, is not handled by this
-    /// module.
+    /// This is the version for the Orchard pool. The Ironwood pool NU6.3
+    /// introduces has no earlier circuit: its bundles are always proven
+    /// for [`CircuitVersion::PostNu6_3`], with the cross-address
+    /// restriction off unless their flags ask for it.
     pub const fn for_branch_id(consensus_branch_id: u32) -> Option<Self> {
         match consensus_branch_id {
             // NU5, NU6, NU6.1
@@ -215,7 +216,8 @@ pub struct Instance {
     pub enable_output: bool,
     /// Whether the note created must go to the address of the note spent
     /// (only circuits from NU6.3 enforce it; always set for the Orchard
-    /// pool from NU6.3, never before).
+    /// pool from NU6.3, never before; for the Ironwood pool, set when the
+    /// flags of the bundle lack `enableCrossAddress`).
     pub disable_cross_address: bool,
 }
 

@@ -7,6 +7,14 @@
 //! without a heap can scan for its notes. [`try_compact_note_decryption`]
 //! only needs the first 52 bytes of a ciphertext, as light clients receive
 //! them.
+//!
+//! The functions without a version are for the actions of an Orchard
+//! bundle, whose notes are [`NoteVersion::V2`] ones. The actions of an
+//! Ironwood bundle carry [`NoteVersion::V3`] notes (ZIP 2005), which the
+//! `*_versioned` functions read when given that version: a pool only
+//! accepts the note plaintexts of its version, so a note encrypted for one
+//! is not found in the other. Encryption is the same for both, the note
+//! stating its version.
 
 use purecrypto::cipher::{ChaCha20, ChaCha20Poly1305};
 use purecrypto::ct::ConstantTimeEq;
@@ -14,7 +22,7 @@ use purecrypto::zeroize::Zeroize;
 
 use super::fields::Fq;
 use super::keys::{Address, Diversifier, IncomingViewingKey, OutgoingViewingKey};
-use super::note::{Note, Nullifier};
+use super::note::{Note, NoteVersion, Nullifier};
 use super::pallas::{Affine, Point};
 use super::spec::blake2b;
 use super::value::ValueCommitment;
@@ -31,9 +39,6 @@ pub const COMPACT_NOTE_SIZE: usize = 1 + 11 + 8 + 32;
 pub const ENC_CIPHERTEXT_SIZE: usize = NOTE_PLAINTEXT_SIZE + 16;
 /// The size of an encrypted outgoing plaintext (`outCiphertext`).
 pub const OUT_CIPHERTEXT_SIZE: usize = 32 + 32 + 16;
-
-/// The lead byte of an Orchard note plaintext.
-const LEAD_BYTE: u8 = 0x02;
 
 /// The public fields of an action that the decryption of its note needs.
 #[derive(Clone, Copy, Debug)]
@@ -99,7 +104,7 @@ pub fn encrypt_note(note: &Note, memo: &[u8; MEMO_SIZE]) -> EncryptedNote {
 
     let mut enc_ciphertext = [0u8; ENC_CIPHERTEXT_SIZE];
     let (plaintext, tag) = enc_ciphertext.split_at_mut(NOTE_PLAINTEXT_SIZE);
-    plaintext[0] = LEAD_BYTE;
+    plaintext[0] = note.version().lead_byte();
     plaintext[1..12].copy_from_slice(recipient.diversifier().to_bytes());
     plaintext[12..20].copy_from_slice(&note.value().to_le_bytes());
     plaintext[20..52].copy_from_slice(note.rseed());
@@ -159,8 +164,9 @@ fn check_note(
     output: &ActionOutput<'_>,
     pk_d: impl FnOnce(&Point) -> Affine,
     expected_esk: Option<&Fq>,
+    version: NoteVersion,
 ) -> Option<Note> {
-    if plaintext[0] != LEAD_BYTE {
+    if plaintext[0] != version.lead_byte() {
         return None;
     }
     let d = Diversifier::from_bytes(plaintext[1..12].try_into().expect("11 bytes"));
@@ -172,7 +178,8 @@ fn check_note(
     if bool::from(pk_d.is_identity()) {
         return None;
     }
-    let note = Note::from_parts(Address::from_parts(d, pk_d), value, rho, rseed).ok()?;
+    let note = Note::from_parts_versioned(Address::from_parts(d, pk_d), value, rho, rseed, version)
+        .ok()?;
     let mut esk = note.esk();
     let esk_ok = match expected_esk {
         Some(expected) => esk.ct_eq(expected),
@@ -199,13 +206,14 @@ fn recipient_key(ivk: &IncomingViewingKey, ephemeral_key: &[u8; 32]) -> Option<[
 /// returning the note and its memo when the action pays an address of that
 /// key. The note returned has passed every check of the protocol: it is
 /// the one the action commits to.
-pub fn try_note_decryption(
+pub fn try_note_decryption_versioned(
+    version: NoteVersion,
     ivk: &IncomingViewingKey,
     output: &ActionOutput<'_>,
     enc_ciphertext: &[u8; ENC_CIPHERTEXT_SIZE],
 ) -> Option<(Note, [u8; MEMO_SIZE])> {
     let mut key = recipient_key(ivk, output.ephemeral_key)?;
-    let result = decrypt_and_check(&key, output, enc_ciphertext, None, |g_d| {
+    let result = decrypt_and_check(&key, output, enc_ciphertext, None, version, |g_d| {
         g_d.mul(&ivk.ivk_scalar()).to_affine()
     });
     key.zeroize();
@@ -217,6 +225,7 @@ fn decrypt_and_check(
     output: &ActionOutput<'_>,
     enc_ciphertext: &[u8; ENC_CIPHERTEXT_SIZE],
     expected_esk: Option<&Fq>,
+    version: NoteVersion,
     pk_d: impl FnOnce(&Point) -> Affine,
 ) -> Option<(Note, [u8; MEMO_SIZE])> {
     let (mut plaintext, tag) =
@@ -225,7 +234,7 @@ fn decrypt_and_check(
         .decrypt(&[0; 12], &[], &mut plaintext, &tag)
         .ok()?;
     let compact = plaintext[..COMPACT_NOTE_SIZE].try_into().expect("52 bytes");
-    let note = check_note(&compact, output, pk_d, expected_esk);
+    let note = check_note(&compact, output, pk_d, expected_esk, version);
     let memo = plaintext[COMPACT_NOTE_SIZE..]
         .try_into()
         .expect("512 bytes");
@@ -239,7 +248,8 @@ fn decrypt_and_check(
 ///
 /// There is no tag to check, so detection relies on the ZIP-212 checks
 /// alone, which only the right key passes.
-pub fn try_compact_note_decryption(
+pub fn try_compact_note_decryption_versioned(
+    version: NoteVersion,
     ivk: &IncomingViewingKey,
     output: &ActionOutput<'_>,
     compact_ciphertext: &[u8; COMPACT_NOTE_SIZE],
@@ -254,6 +264,7 @@ pub fn try_compact_note_decryption(
         output,
         |g_d| g_d.mul(&ivk.ivk_scalar()).to_affine(),
         None,
+        version,
     );
     plaintext.zeroize();
     note
@@ -262,7 +273,8 @@ pub fn try_compact_note_decryption(
 /// Tries to recover the note of an action with an outgoing viewing key,
 /// returning the note and its memo when the action was built with that key.
 /// `cv` is the value commitment of the action.
-pub fn try_output_recovery_with_ovk(
+pub fn try_output_recovery_with_ovk_versioned(
+    version: NoteVersion,
     ovk: &OutgoingViewingKey,
     cv: &[u8; 32],
     output: &ActionOutput<'_>,
@@ -283,10 +295,69 @@ pub fn try_output_recovery_with_ovk(
     }
     let shared = pk_d.to_point().mul(&esk);
     let mut key = kdf(shared, output.ephemeral_key);
-    let result = decrypt_and_check(&key, output, enc_ciphertext, Some(&esk), |_| pk_d);
+    let result = decrypt_and_check(&key, output, enc_ciphertext, Some(&esk), version, |_| pk_d);
     key.zeroize();
     esk.zeroize();
     result
+}
+
+/// [`try_note_decryption_versioned`] for the notes of the Orchard pool
+/// ([`NoteVersion::V2`]).
+pub fn try_note_decryption(
+    ivk: &IncomingViewingKey,
+    output: &ActionOutput<'_>,
+    enc_ciphertext: &[u8; ENC_CIPHERTEXT_SIZE],
+) -> Option<(Note, [u8; MEMO_SIZE])> {
+    try_note_decryption_versioned(NoteVersion::V2, ivk, output, enc_ciphertext)
+}
+
+/// [`try_compact_note_decryption_versioned`] for the notes of the Orchard pool
+/// ([`NoteVersion::V2`]).
+pub fn try_compact_note_decryption(
+    ivk: &IncomingViewingKey,
+    output: &ActionOutput<'_>,
+    compact_ciphertext: &[u8; COMPACT_NOTE_SIZE],
+) -> Option<Note> {
+    try_compact_note_decryption_versioned(NoteVersion::V2, ivk, output, compact_ciphertext)
+}
+
+/// [`try_output_recovery_with_ovk_versioned`] for the notes of the Orchard pool
+/// ([`NoteVersion::V2`]).
+pub fn try_output_recovery_with_ovk(
+    ovk: &OutgoingViewingKey,
+    cv: &[u8; 32],
+    output: &ActionOutput<'_>,
+    enc_ciphertext: &[u8; ENC_CIPHERTEXT_SIZE],
+    out_ciphertext: &[u8; OUT_CIPHERTEXT_SIZE],
+) -> Option<(Note, [u8; MEMO_SIZE])> {
+    try_output_recovery_with_ovk_versioned(
+        NoteVersion::V2,
+        ovk,
+        cv,
+        output,
+        enc_ciphertext,
+        out_ciphertext,
+    )
+}
+
+/// [`batch_note_decryption_versioned`] for the notes of the Orchard pool
+/// ([`NoteVersion::V2`]).
+#[cfg(feature = "alloc")]
+pub fn batch_note_decryption(
+    ivks: &[IncomingViewingKey],
+    outputs: &[(ActionOutput<'_>, &[u8; ENC_CIPHERTEXT_SIZE])],
+) -> alloc::vec::Vec<Option<(usize, Note, [u8; MEMO_SIZE])>> {
+    batch_note_decryption_versioned(NoteVersion::V2, ivks, outputs)
+}
+
+/// [`batch_compact_note_decryption_versioned`] for the notes of the Orchard pool
+/// ([`NoteVersion::V2`]).
+#[cfg(feature = "alloc")]
+pub fn batch_compact_note_decryption(
+    ivks: &[IncomingViewingKey],
+    outputs: &[(ActionOutput<'_>, &[u8; COMPACT_NOTE_SIZE])],
+) -> alloc::vec::Vec<Option<(usize, Note)>> {
+    batch_compact_note_decryption_versioned(NoteVersion::V2, ivks, outputs)
 }
 
 /// How many actions are decrypted together by one thread.
@@ -347,12 +418,13 @@ fn recipient_keys(
 /// and with the `std` feature the actions are spread over the threads of
 /// the machine (see `set_max_threads`).
 #[cfg(feature = "alloc")]
-pub fn batch_note_decryption(
+pub fn batch_note_decryption_versioned(
+    version: NoteVersion,
     ivks: &[IncomingViewingKey],
     outputs: &[(ActionOutput<'_>, &[u8; ENC_CIPHERTEXT_SIZE])],
 ) -> alloc::vec::Vec<Option<(usize, Note, [u8; MEMO_SIZE])>> {
     batch_decrypt(ivks, outputs, |ivk, key, output, ciphertext| {
-        decrypt_and_check(key, output, ciphertext, None, |g_d| {
+        decrypt_and_check(key, output, ciphertext, None, version, |g_d| {
             g_d.mul(&ivk.ivk_scalar()).to_affine()
         })
     })
@@ -367,7 +439,8 @@ pub fn batch_note_decryption(
 /// [`try_compact_note_decryption`] with each key in turn would find them.
 /// See [`batch_note_decryption`].
 #[cfg(feature = "alloc")]
-pub fn batch_compact_note_decryption(
+pub fn batch_compact_note_decryption_versioned(
+    version: NoteVersion,
     ivks: &[IncomingViewingKey],
     outputs: &[(ActionOutput<'_>, &[u8; COMPACT_NOTE_SIZE])],
 ) -> alloc::vec::Vec<Option<(usize, Note)>> {
@@ -380,6 +453,7 @@ pub fn batch_compact_note_decryption(
             output,
             |g_d| g_d.mul(&ivk.ivk_scalar()).to_affine(),
             None,
+            version,
         );
         plaintext.zeroize();
         note

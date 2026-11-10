@@ -6,6 +6,7 @@ use serde_json::Value;
 mod curves;
 mod gen_tables;
 mod hashes;
+mod ironwood;
 mod keys;
 mod notes;
 mod unified;

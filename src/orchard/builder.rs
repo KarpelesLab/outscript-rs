@@ -41,7 +41,7 @@ use super::circuit::{self, ActionCircuit, CircuitVersion, Instance, ProvingKey};
 use super::keys::{
     Address, FullViewingKey, OutgoingViewingKey, Scope, SpendAuthorizingKey, SpendingKey,
 };
-use super::note::{Note, Nullifier};
+use super::note::{Note, NoteVersion, Nullifier};
 use super::note_encryption::{
     MEMO_SIZE, encrypt_note, encrypt_outgoing, encrypt_outgoing_unrecoverable,
 };
@@ -65,7 +65,8 @@ pub enum BuildError {
     WrongKey,
     /// The Merkle path of a note does not lead to the anchor.
     AnchorMismatch,
-    /// From NU6.3 a note of the Orchard pool can only be created at the
+    /// From NU6.3 a note of the Orchard pool (or of an Ironwood bundle
+    /// without the `enableCrossAddress` flag) can only be created at the
     /// address of the note spent by the same action: an output has no spend
     /// to be paired with.
     CrossAddressDisabled,
@@ -73,6 +74,9 @@ pub enum BuildError {
     ValueOverflow,
     /// The proving key is for another circuit version than the builder.
     WrongProvingKey,
+    /// The note to spend is not one of the pool of the bundle: a note of
+    /// the Ironwood pool in an Orchard bundle, or the reverse.
+    WrongNoteVersion,
     /// No spend authorizing key was given for one of the notes spent.
     MissingSigningKey,
     /// The proof could not be created.
@@ -96,6 +100,7 @@ impl core::fmt::Display for BuildError {
             BuildError::CrossAddressDisabled => "an output needs a spend from the same address",
             BuildError::ValueOverflow => "value balance overflow",
             BuildError::WrongProvingKey => "proving key of another circuit version",
+            BuildError::WrongNoteVersion => "the note is of the other pool",
             BuildError::MissingSigningKey => "missing spend authorizing key",
             BuildError::Proof(e) => return write!(f, "proof creation failed: {e}"),
             BuildError::InvalidSignature => "invalid spend authorization signature",
@@ -178,9 +183,17 @@ impl Random {
 
     /// A note with fresh randomness (retrying the negligibly rare seeds
     /// the protocol does not allow).
-    fn note(&mut self, recipient: Address, value: u64, rho: Nullifier) -> Note {
+    fn note(
+        &mut self,
+        recipient: Address,
+        value: u64,
+        rho: Nullifier,
+        version: NoteVersion,
+    ) -> Note {
         loop {
-            if let Ok(note) = Note::from_parts(recipient, value, rho, self.bytes()) {
+            if let Ok(note) =
+                Note::from_parts_versioned(recipient, value, rho, self.bytes(), version)
+            {
                 return note;
             }
         }
@@ -206,12 +219,12 @@ struct SpendInfo {
 
 impl SpendInfo {
     /// A note of value zero owned by a random key, at a random position.
-    fn dummy(rng: &mut Random) -> Self {
+    fn dummy(rng: &mut Random, note_version: NoteVersion) -> Self {
         let sk = rng.spending_key();
         let fvk = sk.to_fvk();
         let recipient = fvk.address_at(0u32, Scope::External);
         let rho = Nullifier::from_fp(rng.base());
-        let note = rng.note(recipient, 0, rho);
+        let note = rng.note(recipient, 0, rho, note_version);
         let position = u32::from_le_bytes(rng.bytes());
         let mut auth_path = [Fp::ZERO; 32];
         for node in auth_path.iter_mut() {
@@ -263,28 +276,67 @@ pub const NO_MEMO: [u8; MEMO_SIZE] = {
     memo
 };
 
-/// Collects the spends and outputs of an Orchard bundle.
+/// Collects the spends and outputs of a bundle of the Orchard pool
+/// ([`Builder::new`]) or of the Ironwood pool ([`Builder::new_ironwood`]).
 #[derive(Clone)]
 pub struct Builder {
     version: CircuitVersion,
     flags: Flags,
     anchor: Fp,
+    /// The version of the notes of the pool.
+    note_version: NoteVersion,
     spends: Vec<SpendInfo>,
     outputs: Vec<OutputInfo>,
 }
 
 impl Builder {
-    /// A builder of bundles for the circuit `version` in force at the
-    /// height the transaction is for, with the given `flags`, spending
-    /// notes of the note commitment tree of root `anchor`.
+    /// A builder of bundles of the Orchard pool for the circuit `version`
+    /// in force at the height the transaction is for, with the given
+    /// `flags`, spending notes of the Orchard note commitment tree of root
+    /// `anchor`.
+    ///
+    /// The `enableCrossAddress` flag does not exist in the Orchard pool
+    /// and is dropped from `flags`: from NU6.3 every output of the pool
+    /// must go to the address of a note spent by the bundle
+    /// ([`BuildError::CrossAddressDisabled`]).
     pub fn new(version: CircuitVersion, flags: Flags, anchor: Fp) -> Self {
         Builder {
             version,
-            flags,
+            flags: flags.with_cross_address(false),
             anchor,
+            note_version: NoteVersion::V2,
             spends: Vec::new(),
             outputs: Vec::new(),
         }
+    }
+
+    /// A builder of bundles of the Ironwood pool (NU6.3 and later, in
+    /// version 6 transactions), with the given `flags`
+    /// ([`Flags::IRONWOOD_ENABLED`] ordinarily), spending notes of the
+    /// Ironwood note commitment tree of root `anchor`.
+    ///
+    /// The circuit is that of NU6.3
+    /// ([`CircuitVersion::PostNu6_3`]), shared with the Orchard pool; the
+    /// notes created are quantum-recoverable ones
+    /// ([`NoteVersion::V3`]), and the notes spent must be notes of the
+    /// Ironwood pool ([`BuildError::WrongNoteVersion`]). Without the
+    /// `enableCrossAddress` flag the bundle is restricted as one of the
+    /// Orchard pool is.
+    pub fn new_ironwood(flags: Flags, anchor: Fp) -> Self {
+        Builder {
+            version: CircuitVersion::PostNu6_3,
+            flags,
+            anchor,
+            note_version: NoteVersion::V3,
+            spends: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+
+    /// Whether every action must create its note at the address of the
+    /// note it spends.
+    fn restricted(&self) -> bool {
+        self.version.supports_cross_address_restriction() && !self.flags.cross_address_enabled()
     }
 
     /// Adds a note to spend: `note`, owned by `fvk`, at `merkle_path` in
@@ -297,6 +349,9 @@ impl Builder {
     ) -> Result<(), BuildError> {
         if !self.flags.spends_enabled() {
             return Err(BuildError::SpendsDisabled);
+        }
+        if note.version() != self.note_version {
+            return Err(BuildError::WrongNoteVersion);
         }
         // Consistency check: all anchors must be equal.
         if note.value() != 0 && merkle_path.root(note.cmx().to_fp()) != self.anchor {
@@ -338,7 +393,7 @@ impl Builder {
     }
 
     /// The value balance of the bundle: what it spends minus what it
-    /// outputs, in zatoshi (positive when value leaves the Orchard pool).
+    /// outputs, in zatoshi (positive when value leaves the pool).
     pub fn value_balance(&self) -> Result<i64, BuildError> {
         let spent: i128 = self.spends.iter().map(|s| s.note.value() as i128).sum();
         let output: i128 = self.outputs.iter().map(|o| o.value as i128).sum();
@@ -347,13 +402,14 @@ impl Builder {
 
     /// Pairs the spends and outputs into actions, padding with dummies.
     fn pair(self, rng: &mut Random) -> Result<Vec<(SpendInfo, OutputInfo)>, BuildError> {
+        let restricted = self.restricted();
         let Builder {
-            version,
+            note_version,
             mut spends,
             mut outputs,
             ..
         } = self;
-        if version.supports_cross_address_restriction() {
+        if restricted {
             // Each output goes with a spend from its address; a spend
             // without one gets an output of value zero to its own address.
             let mut actions = Vec::with_capacity(spends.len().max(MIN_ACTIONS));
@@ -369,7 +425,7 @@ impl Builder {
                 return Err(BuildError::CrossAddressDisabled);
             }
             while actions.len() < MIN_ACTIONS {
-                let spend = SpendInfo::dummy(rng);
+                let spend = SpendInfo::dummy(rng, note_version);
                 let output = OutputInfo::zero(spend.note.recipient());
                 actions.push((spend, output));
             }
@@ -380,7 +436,7 @@ impl Builder {
             // Pair up the spends and outputs, extending with dummy values
             // as necessary, in an order that reveals nothing.
             while spends.len() < num_actions {
-                spends.push(SpendInfo::dummy(rng));
+                spends.push(SpendInfo::dummy(rng, note_version));
             }
             while outputs.len() < num_actions {
                 outputs.push(OutputInfo::dummy(rng));
@@ -420,6 +476,7 @@ impl Builder {
     ) -> Result<UnauthorizedBundle, BuildError> {
         let value_balance = self.value_balance()?;
         let (version, flags, anchor) = (self.version, self.flags, self.anchor);
+        let (note_version, restricted) = (self.note_version, self.restricted());
         let mut rng = Random::new(random);
 
         let pairs = self.pair(&mut rng)?;
@@ -436,7 +493,7 @@ impl Builder {
             let nf_old = spend.note.nullifier(&spend.fvk);
             let rk = spend.fvk.ak().randomize(&alpha);
 
-            let note = rng.note(output.recipient, output.value, nf_old);
+            let note = rng.note(output.recipient, output.value, nf_old, note_version);
             let cmx = note.cmx();
             let encrypted = encrypt_note(&note, &output.memo);
             let out_ciphertext = match &output.ovk {
@@ -463,7 +520,7 @@ impl Builder {
                 cmx: cmx.to_fp(),
                 enable_spend: flags.spends_enabled(),
                 enable_output: flags.outputs_enabled(),
-                disable_cross_address: version.supports_cross_address_restriction(),
+                disable_cross_address: restricted,
             });
             circuits.push(circuit);
             actions.push(Action {
@@ -817,6 +874,111 @@ mod tests {
                 .apply_signatures(&sighash, &[sk.to_ask()], &seed(9))
                 .unwrap();
             assert_eq!(applied.to_bytes(), local.to_bytes());
+        }
+    }
+
+    /// A bundle of the Ironwood pool, without its proof: notes of the
+    /// Ironwood version, to any address unless the flags restrict it.
+    #[test]
+    fn ironwood_bundle_without_proof() {
+        use crate::orchard::note_encryption::try_note_decryption_versioned;
+        let sk = SpendingKey::from_bytes(seed(1)).unwrap();
+        let fvk = sk.to_fvk();
+        let sender = fvk.address_at(0u32, Scope::External);
+        let other = SpendingKey::from_bytes(seed(2)).unwrap().to_fvk();
+        let recipient = other.address_at(3u32, Scope::External);
+        let rho = Nullifier::from_fp(Fp::from_uniform_bytes(&seed(3)));
+        let note =
+            Note::from_parts_versioned(sender, 70_000, rho, seed(4), NoteVersion::V3).unwrap();
+        let orchard_note = Note::from_parts(sender, 70_000, rho, seed(4)).unwrap();
+        assert_ne!(note.cmx(), orchard_note.cmx());
+        let leaves = [Fp::from_u64(5), note.cmx().to_fp()];
+        let anchor = tree::root(&leaves).unwrap();
+        let path = tree::witness(&leaves, 1).unwrap();
+        let orchard_leaves = [Fp::from_u64(5), orchard_note.cmx().to_fp()];
+        let orchard_anchor = tree::root(&orchard_leaves).unwrap();
+
+        // each pool spends its own notes
+        let mut builder = Builder::new_ironwood(Flags::IRONWOOD_ENABLED, orchard_anchor);
+        assert_eq!(
+            builder.add_spend(&fvk, orchard_note, path),
+            Err(BuildError::WrongNoteVersion)
+        );
+        let mut builder = Builder::new(CircuitVersion::PostNu6_3, Flags::ENABLED, anchor);
+        assert_eq!(
+            builder.add_spend(&fvk, note, path),
+            Err(BuildError::WrongNoteVersion)
+        );
+        // the Orchard pool has no cross-address flag to set
+        let orchard = Builder::new(
+            CircuitVersion::PostNu6_3,
+            Flags::IRONWOOD_ENABLED,
+            orchard_anchor,
+        );
+        assert_eq!(orchard.flags, Flags::ENABLED);
+        assert!(orchard.restricted());
+
+        for (flags, restricted) in [
+            (Flags::IRONWOOD_ENABLED, false),
+            (Flags::IRONWOOD_ENABLED.with_cross_address(false), true),
+        ] {
+            let mut builder = Builder::new_ironwood(flags, anchor);
+            builder.add_spend(&fvk, note, path).unwrap();
+            builder
+                .add_output(None, recipient, 60_000, NO_MEMO)
+                .unwrap();
+            if restricted {
+                // as in the Orchard pool from NU6.3
+                assert_eq!(
+                    builder.build_with(&seed(5), |_, _, _| Ok(Vec::new())).err(),
+                    Some(BuildError::CrossAddressDisabled)
+                );
+                continue;
+            }
+            assert_eq!(builder.value_balance(), Ok(10_000));
+            let unauthorized = builder
+                .build_with(&seed(5), |circuits, instances, _| {
+                    assert_eq!(circuits.len(), 2);
+                    assert!(instances.iter().all(|i| !i.disable_cross_address));
+                    assert!(instances.iter().all(|i| i.enable_spend && i.enable_output));
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            let sighash = seed::<32>(6);
+            let signed = unauthorized
+                .apply_signatures(&sighash, &[sk.to_ask()], &seed(9))
+                .unwrap();
+            assert_eq!(signed.flags, Flags::IRONWOOD_ENABLED);
+            let bytes = signed.to_bytes();
+            // an Ironwood bundle, by its flags
+            assert_eq!(
+                BundleRef::parse(&bytes),
+                Err(crate::orchard::Error::InvalidFlags)
+            );
+            assert_eq!(Bundle::parse_ironwood(&bytes), Ok(Some(signed.clone())));
+            let parsed = BundleRef::parse_ironwood(&bytes).unwrap().unwrap();
+            assert_eq!(parsed.verify_signatures(&sighash), Ok(()));
+            assert!(parsed.flags().cross_address_enabled());
+            let mut rest = &bytes[..];
+            assert_eq!(BundleRef::read_ironwood(&mut rest), Ok(Some(parsed)));
+            assert!(rest.is_empty());
+            // its notes are of the Ironwood version
+            let ivk = other.to_ivk(Scope::External);
+            let mut found = 0;
+            for action in parsed.actions() {
+                let output = action.output();
+                assert!(try_note_decryption(&ivk, &output, &action.enc_ciphertext).is_none());
+                if let Some((note, _)) = try_note_decryption_versioned(
+                    NoteVersion::V3,
+                    &ivk,
+                    &output,
+                    &action.enc_ciphertext,
+                ) {
+                    assert_eq!(note.version(), NoteVersion::V3);
+                    found += note.value();
+                }
+            }
+            assert_eq!(found, 60_000);
         }
     }
 

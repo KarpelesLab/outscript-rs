@@ -1,8 +1,20 @@
-//! The Orchard bundle of a version 5 transaction (ZIP-225): its actions,
-//! flags, value balance, anchor, proof and signatures.
+//! The Orchard bundle of a version 5 (ZIP-225) or version 6 (ZIP 229)
+//! transaction, and the Ironwood bundle of a version 6 transaction: the
+//! actions, flags, value balance, anchor, proof and signatures.
+//!
+//! The Ironwood pool (NU6.3) is a second value pool of the Orchard
+//! protocol: its bundle has the encoding of the Orchard one and comes
+//! right after it in a version 6 transaction. What tells them apart is
+//! their place, the third bit of the flags
+//! ([`Flags::CROSS_ADDRESS_ENABLED`], which only an Ironwood bundle may
+//! set: [`BundleRef::parse_ironwood`]), and the version of the notes
+//! ([`NoteVersion`](super::note::NoteVersion)). The serialization of a
+//! bundle is the same in both transaction versions; what differs is how
+//! the transaction digests cover it, which is the business of
+//! [`zcashtx`](crate::zcashtx).
 //!
 //! The layout is the one [`ZcashTx`](crate::zcashtx::ZcashTx) carries as
-//! raw bytes in its `orchard` field:
+//! raw bytes in its `orchard` and `ironwood` fields:
 //!
 //! ```text
 //! compactsize nActionsOrchard
@@ -46,17 +58,57 @@ impl Flags {
     pub const SPENDS_ENABLED: u8 = 0b01;
     /// Outputs of new notes are enabled.
     pub const OUTPUTS_ENABLED: u8 = 0b10;
-    /// Both spends and outputs enabled, as in every ordinary bundle.
+    /// `enableCrossAddress` (ZIP 229, ZIP 2006): the notes created may go
+    /// to other addresses than those of the notes spent. Only the flags
+    /// of an Ironwood bundle can have this bit: in the Orchard bundle it
+    /// is reserved and zero in every transaction version (before NU6.3
+    /// there was no such restriction; from NU6.3 the Orchard pool is
+    /// always restricted).
+    pub const CROSS_ADDRESS_ENABLED: u8 = 0b100;
+    /// Both spends and outputs enabled, as in every ordinary bundle of
+    /// the Orchard pool.
     pub const ENABLED: Flags = Flags(Self::SPENDS_ENABLED | Self::OUTPUTS_ENABLED);
+    /// Spends, outputs and cross-address transfers enabled, as in an
+    /// ordinary bundle of the Ironwood pool.
+    pub const IRONWOOD_ENABLED: Flags =
+        Flags(Self::SPENDS_ENABLED | Self::OUTPUTS_ENABLED | Self::CROSS_ADDRESS_ENABLED);
 
-    /// The flags for a byte, or `None` if an unknown bit is set (which
-    /// consensus rejects).
+    /// The flags of an Orchard bundle for a byte, or `None` if a bit
+    /// other than the first two is set (which consensus rejects, in
+    /// version 5 and version 6 transactions alike).
     pub fn from_byte(byte: u8) -> Option<Self> {
         if byte & !(Self::SPENDS_ENABLED | Self::OUTPUTS_ENABLED) != 0 {
             None
         } else {
             Some(Flags(byte))
         }
+    }
+
+    /// The flags of an Ironwood bundle for a byte, or `None` if a bit
+    /// other than the first three is set (which consensus rejects).
+    pub fn from_byte_ironwood(byte: u8) -> Option<Self> {
+        if byte & !Self::IRONWOOD_ENABLED.0 != 0 {
+            None
+        } else {
+            Some(Flags(byte))
+        }
+    }
+
+    /// These flags with `enableCrossAddress` set or cleared (to be set
+    /// for an Ironwood bundle only).
+    pub fn with_cross_address(self, enabled: bool) -> Self {
+        if enabled {
+            Flags(self.0 | Self::CROSS_ADDRESS_ENABLED)
+        } else {
+            Flags(self.0 & !Self::CROSS_ADDRESS_ENABLED)
+        }
+    }
+
+    /// Whether the `enableCrossAddress` bit is set. When it is not, and
+    /// the circuit is that of NU6.3, every action must create its note at
+    /// the address of the note it spends.
+    pub fn cross_address_enabled(self) -> bool {
+        self.0 & Self::CROSS_ADDRESS_ENABLED != 0
     }
 
     /// The flags from their two bits.
@@ -198,19 +250,44 @@ impl<'a> BundleRef<'a> {
     /// Only the structure is checked: counts, lengths and flags. Points and
     /// field elements are decoded by the accessors that need them.
     pub fn parse(data: &'a [u8]) -> Result<Option<Self>, Error> {
+        Self::parse_with(data, Flags::from_byte)
+    }
+
+    /// Parses the Ironwood bundle of a version 6 transaction, as
+    /// [`parse`](Self::parse) does the Orchard one: the encoding is the
+    /// same, but for the `enableCrossAddress` flag, which this accepts.
+    pub fn parse_ironwood(data: &'a [u8]) -> Result<Option<Self>, Error> {
+        Self::parse_with(data, Flags::from_byte_ironwood)
+    }
+
+    fn parse_with(data: &'a [u8], flags: fn(u8) -> Option<Flags>) -> Result<Option<Self>, Error> {
         if data.is_empty() {
             return Ok(None);
         }
         let mut rest = data;
-        let bundle = Self::read(&mut rest)?;
+        let bundle = Self::read_with(&mut rest, flags)?;
         if !rest.is_empty() {
             return Err(Error::TrailingData);
         }
         Ok(bundle)
     }
 
-    /// Reads a bundle off the front of `data`, leaving what follows it.
+    /// Reads an Orchard bundle off the front of `data`, leaving what
+    /// follows it.
     pub fn read(data: &mut &'a [u8]) -> Result<Option<Self>, Error> {
+        Self::read_with(data, Flags::from_byte)
+    }
+
+    /// Reads an Ironwood bundle off the front of `data`, leaving what
+    /// follows it (see [`parse_ironwood`](Self::parse_ironwood)).
+    pub fn read_ironwood(data: &mut &'a [u8]) -> Result<Option<Self>, Error> {
+        Self::read_with(data, Flags::from_byte_ironwood)
+    }
+
+    fn read_with(
+        data: &mut &'a [u8],
+        flags: fn(u8) -> Option<Flags>,
+    ) -> Result<Option<Self>, Error> {
         let mut rest = *data;
         let count = usize::try_from(read_compact_size(&mut rest)?).map_err(|_| Error::TooLarge)?;
         if count == 0 {
@@ -219,7 +296,7 @@ impl<'a> BundleRef<'a> {
         }
         let len = count.checked_mul(ACTION_SIZE).ok_or(Error::TooLarge)?;
         let (actions, _) = take(&mut rest, len)?.as_chunks::<ACTION_SIZE>();
-        let flags = Flags::from_byte(take_array::<1>(&mut rest)?[0]).ok_or(Error::InvalidFlags)?;
+        let flags = flags(take_array::<1>(&mut rest)?[0]).ok_or(Error::InvalidFlags)?;
         let value_balance = i64::from_le_bytes(take_array(&mut rest)?);
         let anchor = take_array(&mut rest)?;
         let proof_len =
@@ -266,8 +343,8 @@ impl<'a> BundleRef<'a> {
         self.flags
     }
 
-    /// The value balance: the value leaving the Orchard pool (negative
-    /// when the bundle takes value in), in zatoshi.
+    /// The value balance: the value leaving the pool of the bundle
+    /// (negative when the bundle takes value in), in zatoshi.
     pub fn value_balance(&self) -> i64 {
         self.value_balance
     }
@@ -388,7 +465,10 @@ impl<'a> BundleRef<'a> {
         use super::Fp;
         use super::pallas::Affine;
         let anchor = Fp::from_bytes(&self.anchor).ok_or(Error::InvalidEncoding)?;
-        let disable_cross_address = version.supports_cross_address_restriction();
+        // the public input of the NU6.3 circuit is the negation of the
+        // `enableCrossAddress` flag, which an Orchard bundle never has
+        let disable_cross_address =
+            version.supports_cross_address_restriction() && !self.flags.cross_address_enabled();
         let mut instances = alloc::vec::Vec::with_capacity(self.action_count());
         for action in self.actions() {
             let point = |bytes: &[u8; 32]| {
@@ -487,7 +567,14 @@ impl Bundle {
         Ok(BundleRef::parse(data)?.map(|b| b.to_owned()))
     }
 
-    /// The serialization of the bundle, as the `orchard` field of a
+    /// Parses the Ironwood bundle of a version 6 transaction, see
+    /// [`BundleRef::parse_ironwood`].
+    pub fn parse_ironwood(data: &[u8]) -> Result<Option<Self>, Error> {
+        Ok(BundleRef::parse_ironwood(data)?.map(|b| b.to_owned()))
+    }
+
+    /// The serialization of the bundle, as the `orchard` field (or, for a
+    /// bundle of the Ironwood pool, the `ironwood` field) of a
     /// [`ZcashTx`](crate::zcashtx::ZcashTx) takes it. A bundle without
     /// actions serializes to the empty bundle (a single zero byte), its
     /// other fields being dropped.
