@@ -236,16 +236,18 @@ psbt.add_tap_leaf_script(0, &control_block[..n], &leaf_b, &mut out)?;
 use outscript::{EvmTx, EvmTxType, AbiValue};
 use num_bigint::BigInt;
 
-// `EvmTx` is `#[non_exhaustive]`: start from the default and set fields
-let mut tx = EvmTx::default();
-tx.tx_type = EvmTxType::Eip1559;
-tx.chain_id = 1;
-tx.nonce = 0;
-tx.gas_tip_cap = BigInt::from(1_000_000_000u64);
-tx.gas_fee_cap = BigInt::from(20_000_000_000u64);
-tx.gas = 21000;
-tx.to = "0x...".into();
-tx.value = BigInt::from(10u64).pow(18);
+// chain id, nonce, to, value, gas limit, max fee, max priority fee
+let mut tx = EvmTx::eip1559(
+    1,
+    0,
+    "0x...",
+    BigInt::from(10u64).pow(18),
+    21000,
+    20_000_000_000u64,
+    1_000_000_000u64,
+);
+// also: EvmTx::legacy / EvmTx::eip2930, .with_data(..), .with_access_list(..);
+// EvmTx is #[non_exhaustive], so other fields are set by assignment
 tx.call("transfer(address,uint256)", &[/* AbiValue... */]).unwrap();
 tx.sign(&key).unwrap();
 let data = tx.to_bytes().unwrap();
@@ -293,16 +295,12 @@ use outscript::{CardanoTx, CardanoInput, CardanoOutput, parse_cardano_address};
 
 let to = parse_cardano_address("addr1vx2fxv2umyhttkxyxp8...").unwrap();
 
-// `CardanoTx` is `#[non_exhaustive]`: start from the default and set fields
-let mut tx = CardanoTx::default();
-tx.inputs = vec![CardanoInput { txid: prev_txid /* 32 bytes */, index: 0 }];
-tx.outputs = vec![CardanoOutput {
-    address: to.bytes().to_vec(),
-    amount: 1_000_000, // lovelace
-    assets: vec![],
-}];
-tx.fee = 170_000;
-tx.ttl = 41_000_000; // optional (slot); 0 omits it
+let mut tx = CardanoTx::new(
+    vec![CardanoInput::new(prev_txid /* 32 bytes */, 0)],
+    vec![CardanoOutput::new(to.bytes(), 1_000_000)], // lovelace; set `assets` for tokens
+    170_000,                                         // fee
+)
+.with_ttl(41_000_000); // optional (slot)
 
 // Sign with one or more 32-byte standard Ed25519 seeds (a vkey witness per seed)
 tx.sign(&[seed]).unwrap();

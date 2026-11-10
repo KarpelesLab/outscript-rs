@@ -189,10 +189,22 @@ impl CardanoParsed {
 
 /// A Cardano transaction.
 ///
-/// Build one by setting fields on [`CardanoTx::default`], or parse one with
-/// [`CardanoTx::from_bytes`]. The struct is `#[non_exhaustive]`, so it cannot
-/// be written as a struct literal outside this crate and new fields can be
-/// added without breaking callers.
+/// Build one with [`CardanoTx::new`] (and [`CardanoTx::with_ttl`]), or parse
+/// one with [`CardanoTx::from_bytes`]. The struct is `#[non_exhaustive]`, so
+/// it cannot be written as a struct literal outside this crate and new fields
+/// can be added without breaking callers.
+///
+/// ```
+/// use outscript::{CardanoInput, CardanoOutput, CardanoTx};
+///
+/// let tx = CardanoTx::new(
+///     vec![CardanoInput::new([0x11; 32], 0)],              // txid, output index
+///     vec![CardanoOutput::new(vec![0x61; 29], 1_000_000)], // address bytes, lovelace
+///     170_000,                                             // fee
+/// )
+/// .with_ttl(41_000_000);
+/// assert_eq!(tx.hash().unwrap().len(), 32);
+/// ```
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct CardanoTx {
@@ -210,6 +222,50 @@ pub struct CardanoTx {
     /// built from its fields. When set, the body is these bytes and not an
     /// encoding of the fields above: see [`CardanoParsed`].
     pub parsed: Option<CardanoParsed>,
+}
+
+impl CardanoInput {
+    /// The output `index` of transaction `txid` (32 bytes).
+    pub fn new(txid: impl Into<Vec<u8>>, index: u64) -> CardanoInput {
+        CardanoInput {
+            txid: txid.into(),
+            index,
+        }
+    }
+}
+
+impl CardanoOutput {
+    /// An ADA-only output: `amount` lovelace to `address` (the raw address
+    /// bytes, as [`parse_cardano_address`](crate::parse_cardano_address)
+    /// returns them).
+    pub fn new(address: impl Into<Vec<u8>>, amount: u64) -> CardanoOutput {
+        CardanoOutput {
+            address: address.into(),
+            amount,
+            assets: Vec::new(),
+        }
+    }
+}
+
+impl CardanoTx {
+    /// An unsigned transaction spending `inputs` into `outputs` for `fee`
+    /// lovelace, without a time-to-live.
+    pub fn new(inputs: Vec<CardanoInput>, outputs: Vec<CardanoOutput>, fee: u64) -> CardanoTx {
+        CardanoTx {
+            inputs,
+            outputs,
+            fee,
+            ..CardanoTx::default()
+        }
+    }
+
+    /// Sets the time-to-live: the last slot in which the transaction is
+    /// valid (0 omits it).
+    #[must_use]
+    pub fn with_ttl(mut self, ttl: u64) -> CardanoTx {
+        self.ttl = ttl;
+        self
+    }
 }
 
 /// Groups assets by policy id then asset name, summing amounts of duplicates,

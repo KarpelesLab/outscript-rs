@@ -18,9 +18,26 @@ use crate::rlp::{self, RlpItem};
 
 /// An EVM transaction.
 ///
-/// The struct is `#[non_exhaustive]`: outside this crate, start from
-/// [`EvmTx::default`] and set the fields you need, so new fields can be added
-/// without breaking callers.
+/// The struct is `#[non_exhaustive]`, so new fields can be added without
+/// breaking callers: outside this crate, build one with [`EvmTx::eip1559`],
+/// [`EvmTx::legacy`] or [`EvmTx::eip2930`] (plus the `with_*` methods), or
+/// start from [`EvmTx::default`] and set the fields you need.
+///
+/// ```
+/// use outscript::EvmTx;
+///
+/// // 1 ether to an address, on mainnet
+/// let tx = EvmTx::eip1559(
+///     1,                                            // chain id
+///     7,                                            // nonce
+///     "0x2AeB8ADD8337360E088B7D9ce4e857b9BE60f3a7", // to
+///     1_000_000_000_000_000_000u64,                 // value, in wei
+///     21_000,                                       // gas limit
+///     20_000_000_000u64,                            // max fee per gas
+///     1_000_000_000u64,                             // max priority fee per gas
+/// );
+/// assert_eq!(tx.sign_bytes().unwrap()[0], 0x02);
+/// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct EvmTx {
@@ -74,6 +91,90 @@ impl Default for EvmTx {
             s: BigInt::from(0),
             access_list: Vec::new(),
         }
+    }
+}
+
+impl EvmTx {
+    /// An unsigned EIP-1559 (type 2) transaction: `value` wei to `to` (a
+    /// `0x` address, or `"0x"` to create a contract), paying at most
+    /// `max_fee_per_gas` per gas of which at most `max_priority_fee_per_gas`
+    /// goes to the block producer. Add calldata with [`EvmTx::with_data`] or
+    /// [`EvmTx::call`].
+    pub fn eip1559(
+        chain_id: u64,
+        nonce: u64,
+        to: &str,
+        value: impl Into<BigInt>,
+        gas: u64,
+        max_fee_per_gas: impl Into<BigInt>,
+        max_priority_fee_per_gas: impl Into<BigInt>,
+    ) -> EvmTx {
+        EvmTx {
+            tx_type: EvmTxType::Eip1559,
+            chain_id,
+            nonce,
+            to: to.into(),
+            value: value.into(),
+            gas,
+            gas_fee_cap: max_fee_per_gas.into(),
+            gas_tip_cap: max_priority_fee_per_gas.into(),
+            ..EvmTx::default()
+        }
+    }
+
+    /// An unsigned legacy transaction with EIP-155 replay protection:
+    /// `value` wei to `to` at `gas_price` per gas. A `chain_id` of 0 gives a
+    /// pre-EIP-155 transaction, which is valid on every chain: avoid it.
+    pub fn legacy(
+        chain_id: u64,
+        nonce: u64,
+        to: &str,
+        value: impl Into<BigInt>,
+        gas: u64,
+        gas_price: impl Into<BigInt>,
+    ) -> EvmTx {
+        EvmTx {
+            tx_type: EvmTxType::Legacy,
+            chain_id,
+            nonce,
+            to: to.into(),
+            value: value.into(),
+            gas,
+            gas_fee_cap: gas_price.into(),
+            ..EvmTx::default()
+        }
+    }
+
+    /// An unsigned EIP-2930 (type 1) transaction: as [`EvmTx::legacy`], with
+    /// an access list (see [`EvmTx::with_access_list`]).
+    pub fn eip2930(
+        chain_id: u64,
+        nonce: u64,
+        to: &str,
+        value: impl Into<BigInt>,
+        gas: u64,
+        gas_price: impl Into<BigInt>,
+    ) -> EvmTx {
+        EvmTx {
+            tx_type: EvmTxType::Eip2930,
+            ..EvmTx::legacy(chain_id, nonce, to, value, gas, gas_price)
+        }
+    }
+
+    /// Sets the calldata.
+    #[must_use]
+    pub fn with_data(mut self, data: impl Into<Vec<u8>>) -> EvmTx {
+        self.data = data.into();
+        self
+    }
+
+    /// Sets the access list, as its RLP entries (see
+    /// [`EvmTx::access_list`]). Its shape is checked when the transaction is
+    /// encoded.
+    #[must_use]
+    pub fn with_access_list(mut self, access_list: Vec<RlpItem>) -> EvmTx {
+        self.access_list = access_list;
+        self
     }
 }
 
@@ -425,6 +526,34 @@ fn bigint_to_32(v: &BigInt) -> Result<[u8; 32], Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constructors() {
+        let to = "0x2AeB8ADD8337360E088B7D9ce4e857b9BE60f3a7";
+        let tx = EvmTx::eip1559(1, 7, to, 5u64, 21_000, 30u64, 2u64).with_data([1, 2]);
+        let by_hand = EvmTx {
+            tx_type: EvmTxType::Eip1559,
+            chain_id: 1,
+            nonce: 7,
+            to: to.into(),
+            value: BigInt::from(5),
+            gas: 21_000,
+            gas_fee_cap: BigInt::from(30),
+            gas_tip_cap: BigInt::from(2),
+            data: vec![1, 2],
+            ..Default::default()
+        };
+        assert_eq!(tx.sign_bytes().unwrap(), by_hand.sign_bytes().unwrap());
+
+        let legacy = EvmTx::legacy(5, 1, to, 9u64, 21_000, 3u64);
+        assert_eq!(
+            (legacy.tx_type, legacy.chain_id, &legacy.gas_fee_cap),
+            (EvmTxType::Legacy, 5, &BigInt::from(3))
+        );
+        legacy.sign_bytes().unwrap();
+        let t1 = EvmTx::eip2930(5, 1, to, 9u64, 21_000, 3u64).with_access_list(Vec::new());
+        assert_eq!(t1.sign_bytes().unwrap()[0], 0x01);
+    }
 
     fn key() -> SecpPrivateKey {
         let mut s = [0u8; 32];
