@@ -795,6 +795,80 @@ impl Transaction {
         Ok(tx)
     }
 
+    /// Decodes a pruned transaction — the prefix and, for version 2, the
+    /// non-prunable RingCT data — as daemons serve them for scanning (the
+    /// `pruned_as_hex` of `get_transactions`). It must take up all of
+    /// `data`.
+    ///
+    /// The signatures, the proofs and (for RingCT types 3 and up) the
+    /// pseudo-outputs are left empty, so the result can be scanned but not
+    /// verified, and its id takes
+    /// [`hash_with_prunable_hash`](Self::hash_with_prunable_hash). Fails as
+    /// [`parse`](Self::parse) does.
+    pub fn parse_pruned(data: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader { data };
+        let prefix = TransactionPrefix::read(&mut r)?;
+        let mut tx = Transaction {
+            prefix,
+            ..Default::default()
+        };
+        if tx.prefix.version != 1 {
+            let inputs = tx.prefix.inputs.len();
+            let outputs = tx.prefix.outputs.len();
+            tx.rct = RctSignatures::read_base(&mut r, inputs, outputs)?;
+        }
+        if !r.data.is_empty() {
+            return Err(Error::TrailingData);
+        }
+        Ok(tx)
+    }
+
+    /// The serialized transaction without its prunable part: what
+    /// [`parse_pruned`](Self::parse_pruned) reads.
+    pub fn serialize_pruned(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.prefix.write(&mut out);
+        if self.prefix.version != 1 {
+            self.rct.write_base(&mut out);
+        }
+        out
+    }
+
+    /// The hash of the prunable RingCT data, the third of the hashes the id
+    /// of a version 2 transaction is made of: `None` for a version 1
+    /// transaction, zero for a coinbase transaction.
+    pub fn prunable_hash(&self) -> Option<[u8; 32]> {
+        if self.prefix.version == 1 {
+            return None;
+        }
+        if self.rct.rct_type == RCT_TYPE_NULL {
+            return Some([0u8; 32]);
+        }
+        let mut prunable = Vec::new();
+        self.rct.write_prunable(&mut prunable);
+        Some(cn_fast_hash(&prunable))
+    }
+
+    /// The id of a version 2 transaction from its pruned form and the hash
+    /// of its prunable data (the `prunable_hash` a daemon returns next to a
+    /// pruned transaction). `None` for a version 1 transaction, whose id is
+    /// the hash of the whole transaction.
+    pub fn hash_with_prunable_hash(&self, prunable_hash: &[u8; 32]) -> Option<[u8; 32]> {
+        if self.prefix.version == 1 {
+            return None;
+        }
+        let prunable_hash = if self.rct.rct_type == RCT_TYPE_NULL {
+            &[0u8; 32]
+        } else {
+            prunable_hash
+        };
+        let mut h = Hasher::new();
+        h.update(&self.prefix.hash());
+        h.update(&self.base_hash());
+        h.update(prunable_hash);
+        Some(h.finalize())
+    }
+
     /// The serialized transaction.
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -824,21 +898,12 @@ impl Transaction {
     /// prefix, of the non-prunable RingCT data, and of the prunable RingCT
     /// data (zero for a coinbase transaction, which has none).
     pub fn hash(&self) -> [u8; 32] {
-        if self.prefix.version == 1 {
-            return cn_fast_hash(&self.serialize());
+        match self.prunable_hash() {
+            Some(prunable_hash) => self
+                .hash_with_prunable_hash(&prunable_hash)
+                .unwrap_or_default(),
+            None => cn_fast_hash(&self.serialize()),
         }
-        let prunable_hash = if self.rct.rct_type == RCT_TYPE_NULL {
-            [0u8; 32]
-        } else {
-            let mut prunable = Vec::new();
-            self.rct.write_prunable(&mut prunable);
-            cn_fast_hash(&prunable)
-        };
-        let mut h = Hasher::new();
-        h.update(&self.prefix.hash());
-        h.update(&self.base_hash());
-        h.update(&prunable_hash);
-        h.finalize()
     }
 
     /// The message the ring signatures of a RingCT transaction sign

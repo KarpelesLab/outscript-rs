@@ -8,8 +8,6 @@
 //! output. The key image ties the signature to the output, so that it cannot
 //! be spent twice.
 
-use purecrypto::zeroize::Zeroizing;
-
 use super::ringct::{Table, inv_eight, multiexp};
 use super::{Error, random_scalar};
 use crate::cryptonote::{
@@ -293,8 +291,7 @@ pub fn clsag_sign(
     // challenge of index 0 is the one it ends with.
     let c1 = c1.unwrap_or_else(|| c_real.clone());
     // s = alpha - c * (mu_P * p + mu_C * z)
-    let secret = Zeroizing::new(mu_p.mul(&p).add(&mu_c.mul(&z)).to_bytes());
-    let s = alpha.sub(&c_real.mul(&scalar_from_bytes(&secret)?));
+    let s = alpha.sub(&c_real.mul(&mu_p.mul(&p).add(&mu_c.mul(&z))));
     *responses.get_mut(real_index).ok_or(Error::InvalidRing)? = s.to_bytes();
     Ok((
         ClsagParts {

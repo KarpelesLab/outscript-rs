@@ -68,6 +68,35 @@ fn mainnet_round_trip_and_txid() {
         assert_eq!(TransactionPrefix::parse(&prefix_bytes).unwrap(), tx.prefix);
         assert_eq!(tx.prefix.hash(), cn_fast_hash(&prefix_bytes));
 
+        // The pruned form, as a daemon serves it for scanning.
+        let pruned_bytes = tx.serialize_pruned();
+        assert_eq!(pruned_bytes, real.bytes[..pruned_bytes.len()]);
+        let pruned = Transaction::parse_pruned(&pruned_bytes).unwrap();
+        assert_eq!(pruned.prefix, tx.prefix);
+        assert_eq!(pruned.rct.out_pk, tx.rct.out_pk);
+        assert_eq!(pruned.rct.ecdh_info, tx.rct.ecdh_info);
+        assert_eq!(pruned.serialize_pruned(), pruned_bytes);
+        match tx.prunable_hash() {
+            Some(prunable_hash) => {
+                assert_eq!(
+                    pruned.hash_with_prunable_hash(&prunable_hash),
+                    Some(real.txid)
+                );
+                let prunable = &real.bytes[pruned_bytes.len()..];
+                if tx.rct.rct_type != RCT_TYPE_NULL {
+                    assert_eq!(prunable_hash, cn_fast_hash(prunable));
+                    assert!(Transaction::parse_pruned(&real.bytes).is_err());
+                } else {
+                    assert!(prunable.is_empty());
+                    assert_eq!(prunable_hash, [0u8; 32]);
+                }
+            }
+            None => {
+                assert_eq!(tx.prefix.version, 1);
+                assert_eq!(pruned.hash_with_prunable_hash(&[0u8; 32]), None);
+            }
+        }
+
         // Shape.
         let inputs = tx.prefix.inputs.len();
         let outputs = tx.prefix.outputs.len();

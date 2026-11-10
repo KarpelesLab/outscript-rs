@@ -1,7 +1,123 @@
 //! Monero: addresses, keys and transactions, built on the primitives the
 //! CryptoNote family shares ([`cryptonote`](crate::cryptonote)).
 //!
-//! Keys and points go in and out as `[u8; 32]`, as in `cryptonote`.
+//! Keys, scalars and points go in and out as `[u8; 32]`, as in `cryptonote`
+//! (scalars little-endian and reduced, points compressed). Amounts are in
+//! atomic units (piconero, 10^-12 XMR).
+//!
+//! # What is here
+//!
+//! - **Addresses**: [`Address`] — standard, integrated (with an 8-byte
+//!   payment id) and subaddress, on mainnet, testnet and stagenet — parsed
+//!   and printed as base58 without a heap.
+//! - **Keys**: [`AccountKeys`] (spend and view secrets, from a seed or a
+//!   spend key), the view-only [`ViewKeys`], subaddresses by
+//!   [`SubaddressIndex`], and the 25-word English mnemonic
+//!   ([`seed_from_mnemonic`], [`seed_to_mnemonic_words`]).
+//! - **Scanning**: [`ViewKeys::key_derivation`] and
+//!   [`ViewKeys::check_output`] recognise an output (view tag first, then the
+//!   main address or a subaddress from the caller's table);
+//!   [`decode_amount`] opens its amount and mask against the commitment;
+//!   [`AccountKeys::output_key_image`] gives the one-time secret key and the
+//!   key image. With `alloc`, `ViewKeys::scan_transaction` does all of it
+//!   for a parsed transaction.
+//! - **The extra field**: [`parse_extra`] and the lookups on top of it
+//!   ([`tx_public_key`], [`additional_public_key`], [`payment_id`]).
+//! - **RingCT**: Pedersen commitments ([`commit`], [`zero_commit`],
+//!   [`verify_balance`]) and CLSAG ring signatures ([`clsag_sign`],
+//!   [`clsag_verify`]) without a heap; with `alloc`, the Bulletproofs+ range
+//!   proof (`BulletproofPlus`).
+//! - **Transactions** (with `alloc`): `Transaction` parses and serializes
+//!   every format the chain has seen — version 1, and RingCT types 0 to 6 —
+//!   and computes the transaction id and the hash the signatures sign;
+//!   for the current format (version 2, RingCT type 6: CLSAG and
+//!   Bulletproofs+) it also verifies the ring signatures, the range proof
+//!   and the balance. `TransactionBuilder` builds and signs such a
+//!   transaction from the caller's inputs, rings and destinations.
+//!
+//! Not here: decoy selection, fee estimation, the daemon RPC, verification
+//! of the proofs of the older formats (MLSAG, Borromean, the original
+//! Bulletproofs), and multisignature.
+//!
+//! # Randomness
+//!
+//! The crate has no random number generator. Whatever needs randomness —
+//! [`clsag_sign`], `BulletproofPlus::prove`, `TransactionBuilder::build` —
+//! takes `rng: &mut dyn FnMut(&mut [u8])`, which must fill the slice it is
+//! given with cryptographically secure random bytes on every call. Transaction
+//! keys, commitment masks and signature nonces come from it: a predictable or
+//! repeating source reveals amounts and secret keys. A source that leaves its
+//! buffer zeroed is detected ([`Error::BadRandomness`]); nothing else about
+//! its quality can be.
+//!
+//! # Secrets and timing
+//!
+//! Secret keys are held in [`Zeroizing`] buffers
+//! and wiped on drop, as are the secret-derived intermediates. Scalar
+//! multiplications by a secret use `purecrypto`'s constant-time ones, and the
+//! multi-scalar multiplications of the Bulletproofs+ prover pick their table
+//! entries without branching or indexing on the scalars. Verification is
+//! variable-time and only sees public data. The position of the real output
+//! in a ring is not hidden from an observer of the local machine's timing:
+//! signing walks the ring starting from it.
+//!
+//! # Untrusted input
+//!
+//! Parsing addresses, extra fields and transactions never panics, and a
+//! count read from the data never causes an allocation larger than the data
+//! itself. Parsing checks the structure only; verifying is a separate step.
+//!
+//! # Example
+//!
+//! Keys and addresses, then recognising and opening an output the way a
+//! wallet does (here the sender's side is played with the shared
+//! primitives):
+//!
+//! ```
+//! use outscript::cryptonote::{derivation_to_scalar, derive_public_key, generate_key_derivation};
+//! use outscript::monero::{
+//!     AccountKeys, Address, Network, SubaddressIndex, commit, commitment_mask, decode_amount,
+//!     derive_view_tag, encrypt_amount, seed_from_mnemonic,
+//! };
+//!
+//! let seed = seed_from_mnemonic(
+//!     "washing thirsty occur lectures tuesday fainted toxic adapt \
+//!      abnormal memoir nylon mostly building shrugged online ember northern \
+//!      ruby woes dauntless boil family illness inroads northern",
+//! )?;
+//! let account = AccountKeys::from_seed(&seed)?;
+//! let address = account.address(Network::Mainnet);
+//! let mut text = [0u8; outscript::monero::MAX_ADDRESS_LEN];
+//! let n = address.encode_to_slice(&mut text)?;
+//! let text = core::str::from_utf8(&text[..n]).unwrap();
+//! assert_eq!(Address::decode(text)?, address);
+//!
+//! // A sender with the transaction secret key `r` pays output 0 to the address.
+//! let mut r = [0u8; 32];
+//! r[0] = 42;
+//! let tx_public = outscript::cryptonote::secret_key_to_public_key(&r)?;
+//! let derivation = generate_key_derivation(&address.view_public, &r)?;
+//! let output_key = derive_public_key(&derivation, 0, &address.spend_public)?;
+//! let view_tag = derive_view_tag(&derivation, 0);
+//! let shared = derivation_to_scalar(&derivation, 0);
+//! let encrypted_amount = encrypt_amount(&shared, 1_500_000_000_000);
+//! let commitment = commit(1_500_000_000_000, &commitment_mask(&shared))?;
+//!
+//! // The recipient, with the view key only, finds and opens it.
+//! let view = account.view_keys();
+//! let derivation = view.key_derivation(&tx_public)?;
+//! let found = view.check_output(&derivation, 0, &output_key, Some(view_tag), &mut |_| None)?;
+//! assert_eq!(found, Some(SubaddressIndex::MAIN));
+//! let opened = decode_amount(&derivation, 0, &encrypted_amount, &commitment)?;
+//! assert_eq!(opened.amount, 1_500_000_000_000);
+//!
+//! // With the spend key: the one-time secret key and the key image.
+//! let (_secret, _key_image) =
+//!     account.output_key_image(&derivation, 0, SubaddressIndex::MAIN, &output_key)?;
+//! # Ok::<(), outscript::monero::Error>(())
+//! ```
+//!
+//! Building a transaction is shown with `TransactionBuilder`.
 
 mod address;
 #[cfg(feature = "alloc")]
@@ -11,6 +127,8 @@ mod bulletproofs_plus;
 mod clsag;
 mod extra;
 mod keys;
+mod mnemonic;
+mod mnemonic_words;
 mod ringct;
 mod scan;
 #[cfg(feature = "alloc")]
@@ -41,6 +159,9 @@ pub use extra::{
 #[cfg(feature = "alloc")]
 pub use extra::{push_additional_public_keys, push_nonce, push_payment_id, push_tx_public_key};
 pub use keys::{AccountKeys, SubaddressIndex, ViewKeys, subaddress_secret_key};
+#[cfg(feature = "alloc")]
+pub use mnemonic::seed_to_mnemonic;
+pub use mnemonic::{MNEMONIC_WORDS, seed_from_mnemonic, seed_to_mnemonic_words};
 pub use ringct::{H, commit, verify_balance, zero_commit};
 #[cfg(feature = "alloc")]
 pub use scan::OwnedOutput;

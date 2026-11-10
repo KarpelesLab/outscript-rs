@@ -268,6 +268,103 @@ fn account_keys() {
     assert!(!debug.contains("view_secret") && !debug.contains("spend_secret"));
 }
 
+// --- the mnemonic ---
+
+/// The English vectors of `monero-wallet-util`'s seed tests.
+#[test]
+fn mnemonic_vectors() {
+    let vectors = [
+        (
+            "washing thirsty occur lectures tuesday fainted toxic adapt \
+             abnormal memoir nylon mostly building shrugged online ember northern \
+             ruby woes dauntless boil family illness inroads northern",
+            "c0af65c0dd837e666b9d0dfed62745f4df35aed7ea619b2798a709f0fe545403",
+            "513ba91c538a5a9069e0094de90e927c0cd147fa10428ce3ac1afd49f63e3b01",
+        ),
+        (
+            "plus plus plus plus plus plus plus plus \
+             plus plus plus plus plus plus plus plus \
+             plus plus plus plus plus plus plus plus plus",
+            "3b0400003b0400003b0400003b0400003b0400003b0400003b0400003b040000",
+            "43a8a7715eed11eff145a2024ddcc39740255156da7bbd736ee66a0838053a02",
+        ),
+        (
+            "audio audio audio audio audio audio audio audio \
+             audio audio audio audio audio audio audio audio \
+             audio audio audio audio audio audio audio audio audio",
+            "7900000079000000790000007900000079000000790000007900000079000000",
+            "20bec797ab96780ae6a045dd816676ca7ed1d7c6773f7022d03ad234b581d600",
+        ),
+    ];
+    for (mnemonic, spend, view) in vectors {
+        let seed = seed_from_mnemonic(mnemonic).unwrap();
+        let account = AccountKeys::from_seed(&seed).unwrap();
+        assert_eq!(*account.spend_secret(), h32(spend));
+        assert_eq!(*account.view_secret(), h32(view));
+
+        let words = seed_to_mnemonic_words(&seed);
+        let want: std::vec::Vec<&str> = mnemonic.split_whitespace().collect();
+        assert_eq!(words.as_slice(), want.as_slice());
+        #[cfg(feature = "alloc")]
+        assert_eq!(*seed_to_mnemonic(&seed), want.join(" "));
+
+        // Three letters identify a word; case does not matter.
+        let short: std::vec::Vec<std::string::String> = want
+            .iter()
+            .map(|word| word[..3].to_ascii_uppercase())
+            .collect();
+        assert_eq!(*seed_from_mnemonic(&short.join("\t")).unwrap(), *seed);
+    }
+
+    // Every seed comes back.
+    let mut rng = test_rng(5);
+    for _ in 0..20 {
+        let mut seed = [0u8; 32];
+        rng(&mut seed);
+        let words = seed_to_mnemonic_words(&seed);
+        assert_eq!(*seed_from_mnemonic(&words.join(" ")).unwrap(), seed);
+    }
+    for seed in [[0u8; 32], [0xff; 32]] {
+        let words = seed_to_mnemonic_words(&seed);
+        assert_eq!(*seed_from_mnemonic(&words.join(" ")).unwrap(), seed);
+    }
+
+    // Rejections: the count, an unknown word, the checksum.
+    let good: std::vec::Vec<&str> = vectors[0].0.split_whitespace().collect();
+    let bad = |words: &[&str]| {
+        assert_eq!(
+            seed_from_mnemonic(&words.join(" ")).unwrap_err(),
+            Error::InvalidMnemonic,
+            "{words:?}"
+        );
+    };
+    bad(&good[..24]);
+    bad(&[&good[..], &["northern"]].concat());
+    bad(&[]);
+    let mut words = good.clone();
+    words[3] = "xyzzy";
+    bad(&words);
+    words[3] = "ab";
+    bad(&words);
+    let mut words = good.clone();
+    words[24] = "washing";
+    bad(&words);
+    let mut words = good.clone();
+    words.swap(0, 1);
+    bad(&words);
+    // Three words hold a little more than 32 bits: the first word, then the
+    // last, then the one before it, stand for
+    // 0 + 1625 * 1626 + 1625 * 1626^2, which does not fit. The value check
+    // must fail whatever the checksum word is.
+    let overflow = ["abbey", "zoom", "zones"];
+    let mut words: std::vec::Vec<&str> = overflow.iter().cycle().take(24).copied().collect();
+    for candidate in overflow {
+        words.truncate(24);
+        words.push(candidate);
+        bad(&words);
+    }
+}
+
 // --- scanning primitives ---
 
 /// The `derive_view_tag` vectors of Monero's `tests/crypto/tests.txt`.

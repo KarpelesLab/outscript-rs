@@ -302,6 +302,10 @@ impl ViewKeys {
     /// table described there. An output whose encrypted amount does not open
     /// its commitment is skipped: it cannot be spent.
     ///
+    /// A wallet must also ignore an output whose one-time key it has seen
+    /// before: only one output per key can ever be spent, so a second one,
+    /// whatever amount it claims, is worthless (the "burning bug").
+    ///
     /// Fails with [`Error::Unsupported`] for a transaction whose amounts
     /// this cannot read (the pre-2019 32-byte encrypted amounts).
     pub fn scan_transaction(
