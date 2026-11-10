@@ -187,7 +187,17 @@ pub fn borromean_verify(proof: &[u8], commitment: &[u8; 32]) -> bool {
     let Ok(ee) = scalar_from_bytes(ee_bytes) else {
         return false;
     };
+    // The commitments to the bits add up to the commitment.
     let mut sum = EdwardsPoint::identity();
+    for bit in bits {
+        let Ok(bit) = point_from_bytes(bit) else {
+            return false;
+        };
+        sum = sum.add(&bit);
+    }
+    if sum.compress() != *commitment {
+        return false;
+    }
     let mut power = h_point();
     let mut h = Hasher::new();
     for ((s0, s1), bit) in s0.iter().zip(s1).zip(bits) {
@@ -197,7 +207,6 @@ pub fn borromean_verify(proof: &[u8], commitment: &[u8; 32]) -> bool {
         let Ok(bit) = point_from_bytes(bit) else {
             return false;
         };
-        sum = sum.add(&bit);
         let ll = EdwardsPoint::double_scalar_mul_base_vartime(&ee, &bit, &slide_scalar(s0));
         let mut hash = Hasher::new();
         hash.update(&ll.compress());
@@ -209,8 +218,8 @@ pub fn borromean_verify(proof: &[u8], commitment: &[u8; 32]) -> bool {
         h.update(&lv.compress());
         power = power.double();
     }
-    // The bits add up to the commitment, and the signatures close.
-    sum.compress() == *commitment && h.finalize_scalar() == *ee_bytes
+    // The signatures close.
+    h.finalize_scalar() == *ee_bytes
 }
 
 /// The key image as a point, if it is one consensus accepts: not the

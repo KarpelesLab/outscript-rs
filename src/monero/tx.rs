@@ -525,6 +525,30 @@ impl Bulletproof {
         Ok(proof)
     }
 
+    /// Decodes a proof as a transaction carries it (`A`, `S`, `T1`, `T2`,
+    /// `taux`, `mu`, the counted `L` and `R`, then `a`, `b` and `t`), which
+    /// must take up all of `data`.
+    ///
+    /// Fails with [`Error::UnexpectedEof`], [`Error::TrailingData`],
+    /// [`Error::InvalidTransaction`] (no rounds, or not as many `L` as
+    /// `R`) or [`Error::CryptoNote`] (a bad varint). The structure only is
+    /// checked: see `Bulletproof::verify`.
+    pub fn parse(data: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader { data };
+        let proof = Self::read(&mut r)?;
+        if !r.data.is_empty() {
+            return Err(Error::TrailingData);
+        }
+        Ok(proof)
+    }
+
+    /// The serialized proof: what [`parse`](Self::parse) reads.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write(&mut out, true);
+        out
+    }
+
     /// Appends the proof: with the lengths of `L` and `R` as serialized in a
     /// transaction, without them as hashed for the signatures.
     fn write(&self, out: &mut Vec<u8>, lengths: bool) {
@@ -555,6 +579,30 @@ impl BulletproofPlus {
             return Err(Error::InvalidTransaction);
         }
         Ok(proof)
+    }
+
+    /// Decodes a proof as a transaction carries it (`A`, `A1`, `B`, `r1`,
+    /// `s1`, `d1`, then the counted `L` and `R`), which must take up all of
+    /// `data`.
+    ///
+    /// Fails with [`Error::UnexpectedEof`], [`Error::TrailingData`],
+    /// [`Error::InvalidTransaction`] (no rounds, or not as many `L` as
+    /// `R`) or [`Error::CryptoNote`] (a bad varint). The structure only is
+    /// checked: see [`verify`](Self::verify).
+    pub fn parse(data: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader { data };
+        let proof = Self::read(&mut r)?;
+        if !r.data.is_empty() {
+            return Err(Error::TrailingData);
+        }
+        Ok(proof)
+    }
+
+    /// The serialized proof: what [`parse`](Self::parse) reads.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write(&mut out, true);
+        out
     }
 
     /// Appends the proof: with the lengths of `L` and `R` as serialized in a

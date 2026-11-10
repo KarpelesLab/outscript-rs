@@ -8,12 +8,12 @@ use super::keys::{AccountKeys, SubaddressIndex, ViewKeys, subaddress_secret_key}
 use super::ringct::commit_point;
 use crate::cryptonote::{
     EdwardsPoint, Hasher, MAX_VARINT_LEN, cn_fast_hash_parts, derivation_to_scalar,
-    generate_key_derivation, generate_key_image, point_from_bytes, scalar_from_bytes,
-    scalar_from_u64, write_varint,
+    generate_key_derivation, generate_key_image, hash_to_scalar, point_from_bytes,
+    scalar_from_bytes, scalar_from_u64, scalar_reduce, write_varint,
 };
 
 #[cfg(feature = "alloc")]
-use super::tx::Transaction;
+use super::tx::{EcdhInfo, Transaction};
 #[cfg(feature = "alloc")]
 use super::{extra, ringct::zero_commit};
 #[cfg(feature = "alloc")]
@@ -126,8 +126,91 @@ impl core::fmt::Debug for OutputAmount {
     }
 }
 
+/// The two scalars the old 32-byte form offsets the mask and the amount of an
+/// output by: `Hs(shared_scalar)` and `Hs(Hs(shared_scalar))`.
+fn legacy_amount_keys(shared_scalar: &[u8; 32]) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
+    let first = Zeroizing::new(hash_to_scalar(shared_scalar));
+    let second = Zeroizing::new(hash_to_scalar(&*first));
+    (first, second)
+}
+
+/// Encrypts the mask and the amount of an output the way the RingCT types 1
+/// to 3 (2017 and 2018) did (`ecdhEncode`, the 32-byte form): the mask plus
+/// `Hs(shared_scalar)` and the amount plus `Hs(Hs(shared_scalar))`, as
+/// scalars. Returns the encrypted mask and the encrypted amount.
+///
+/// Transactions no longer use this form; it is here for what reads it
+/// ([`decode_amount_legacy`]) to be tested against. Fails with
+/// [`Error::CryptoNote`] if `mask` is not a reduced scalar.
+pub fn encrypt_amount_legacy(
+    shared_scalar: &[u8; 32],
+    amount: u64,
+    mask: &[u8; 32],
+) -> Result<([u8; 32], [u8; 32]), Error> {
+    let (mask_key, amount_key) = legacy_amount_keys(shared_scalar);
+    let mask = scalar_from_bytes(mask)?.add(&scalar_from_bytes(&mask_key)?);
+    let amount = scalar_from_u64(amount).add(&scalar_from_bytes(&amount_key)?);
+    Ok((mask.to_bytes(), amount.to_bytes()))
+}
+
+/// Opens the amount of an output of RingCT type 1, 2 or 3 (2017 and 2018),
+/// whose mask and amount are both encrypted, in 32 bytes each (`ecdhDecode`,
+/// the 32-byte form): removes the offsets `Hs(shared_scalar)` and
+/// `Hs(Hs(shared_scalar))` and checks the result against the output's
+/// `commitment`.
+///
+/// `derivation` is the key derivation the output was recognised with. Fails
+/// with [`Error::CommitmentMismatch`] if the amount does not fit in 64 bits
+/// or `mask * G + amount * H` is not the commitment: the output cannot be
+/// spent.
+///
+/// ```
+/// use outscript::cryptonote::derivation_to_scalar;
+/// use outscript::monero::{commit, decode_amount_legacy, encrypt_amount_legacy};
+///
+/// let derivation = [7u8; 32];
+/// let shared = derivation_to_scalar(&derivation, 1);
+/// let mut mask = [0u8; 32];
+/// mask[0] = 99;
+/// let (encrypted_mask, encrypted_amount) = encrypt_amount_legacy(&shared, 1_000, &mask)?;
+/// let commitment = commit(1_000, &mask)?;
+///
+/// let opened =
+///     decode_amount_legacy(&derivation, 1, &encrypted_mask, &encrypted_amount, &commitment)?;
+/// assert_eq!(opened.amount, 1_000);
+/// assert_eq!(*opened.mask, mask);
+/// # Ok::<(), outscript::monero::Error>(())
+/// ```
+pub fn decode_amount_legacy(
+    derivation: &[u8; 32],
+    output_index: u64,
+    encrypted_mask: &[u8; 32],
+    encrypted_amount: &[u8; 32],
+    commitment: &[u8; 32],
+) -> Result<OutputAmount, Error> {
+    let shared = Zeroizing::new(derivation_to_scalar(derivation, output_index));
+    let (mask_key, amount_key) = legacy_amount_keys(&shared);
+    let mask = scalar_reduce(encrypted_mask).sub(&scalar_from_bytes(&mask_key)?);
+    let amount = scalar_reduce(encrypted_amount).sub(&scalar_from_bytes(&amount_key)?);
+    // The amount is the low 8 bytes; an honest sender leaves the rest zero.
+    let amount_bytes = Zeroizing::new(amount.to_bytes());
+    let (low, high) = amount_bytes.split_at(8);
+    let value = u64::from_le_bytes(<[u8; 8]>::try_from(low).unwrap_or_default());
+    let point = commit_point(&amount, &mask);
+    if high.iter().any(|b| *b != 0) || point.compress() != *commitment {
+        return Err(Error::CommitmentMismatch);
+    }
+    Ok(OutputAmount {
+        amount: value,
+        mask: Zeroizing::new(mask.to_bytes()),
+    })
+}
+
 /// Opens the amount of a RingCT output: decrypts `encrypted_amount`, derives
 /// the mask, and checks them against the output's `commitment`.
+///
+/// This is the current form, of the RingCT types 4 and up; the older ones
+/// take [`decode_amount_legacy`].
 ///
 /// `derivation` is the key derivation the output was recognised with. Fails
 /// with [`Error::CommitmentMismatch`] if `mask * G + amount * H` is not the
@@ -276,6 +359,10 @@ pub struct OwnedOutput {
     pub derivation: Zeroizing<[u8; 32]>,
     /// The decrypted 8-byte payment id of the transaction, if it has one.
     /// Every transaction with two outputs carries one, usually zero.
+    ///
+    /// The long, unencrypted payment ids of old transactions are not
+    /// repeated here: they are in the clear in the extra field
+    /// ([`payment_id`](super::payment_id) of the transaction's `extra`).
     pub payment_id: Option<[u8; 8]>,
 }
 
@@ -294,7 +381,11 @@ impl core::fmt::Debug for OwnedOutput {
 #[cfg(feature = "alloc")]
 impl ViewKeys {
     /// Finds the outputs of `tx` that belong to this account, with their
-    /// amounts.
+    /// amounts. Every format the chain has seen is read: the amounts in the
+    /// clear of version 1 and coinbase transactions, the 32-byte encrypted
+    /// masks and amounts of RingCT types 1 to 3
+    /// ([`decode_amount_legacy`]), and the 8-byte encrypted amounts since
+    /// ([`decode_amount`]).
     ///
     /// Each output is tried against the transaction public keys of the extra
     /// field and against its own additional key, if any, as in
@@ -306,8 +397,14 @@ impl ViewKeys {
     /// before: only one output per key can ever be spent, so a second one,
     /// whatever amount it claims, is worthless (the "burning bug").
     ///
-    /// Fails with [`Error::Unsupported`] for a transaction whose amounts
-    /// this cannot read (the pre-2019 32-byte encrypted amounts).
+    /// An output of a version 1 transaction has no commitment on the chain:
+    /// the one reported is `G + amount * H`, with the mask 1, which is what
+    /// stands for it in the ring of a RingCT transaction spending it. Such
+    /// outputs are referred to by their index among the outputs of the same
+    /// amount.
+    ///
+    /// Fails with [`Error::InvalidTransaction`] if the RingCT data does not
+    /// cover an output found.
     pub fn scan_transaction(
         &self,
         tx: &Transaction,
@@ -360,8 +457,19 @@ impl ViewKeys {
                     else {
                         return Err(Error::InvalidTransaction);
                     };
-                    let encrypted = encrypted.compact().ok_or(Error::Unsupported)?;
-                    match decode_amount(&derivation, output_index, &encrypted, commitment) {
+                    let opened = match encrypted {
+                        EcdhInfo::Compact(amount) => {
+                            decode_amount(&derivation, output_index, amount, commitment)
+                        }
+                        EcdhInfo::Full { mask, amount } => decode_amount_legacy(
+                            &derivation,
+                            output_index,
+                            mask,
+                            amount,
+                            commitment,
+                        ),
+                    };
+                    match opened {
                         Ok(opened) => (opened.amount, opened.mask, *commitment),
                         Err(_) => continue,
                     }

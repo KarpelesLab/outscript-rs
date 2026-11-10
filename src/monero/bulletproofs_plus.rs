@@ -76,6 +76,16 @@ impl BulletproofPlusGenerators {
     pub fn max_outputs(&self) -> usize {
         self.0.max_outputs()
     }
+
+    /// A copy of the process-wide generators, for the tests: at least
+    /// those for `outputs` commitments.
+    #[cfg(test)]
+    pub(crate) fn shared(outputs: usize) -> Self {
+        Self(Generators::clone(&super::bp_common::cached(
+            Kind::Plus,
+            outputs,
+        )))
+    }
 }
 
 /// The transcript before anything is absorbed:

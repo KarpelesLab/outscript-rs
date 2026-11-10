@@ -176,8 +176,9 @@ pub use ringct::{H, commit, verify_balance, zero_commit};
 #[cfg(feature = "alloc")]
 pub use scan::OwnedOutput;
 pub use scan::{
-    OutputAmount, commitment_mask, decode_amount, decrypt_amount, derive_subaddress_public_key,
-    derive_view_tag, encrypt_amount, encrypt_payment_id,
+    OutputAmount, commitment_mask, decode_amount, decode_amount_legacy, decrypt_amount,
+    derive_subaddress_public_key, derive_view_tag, encrypt_amount, encrypt_amount_legacy,
+    encrypt_payment_id,
 };
 #[cfg(feature = "alloc")]
 pub use tx::{

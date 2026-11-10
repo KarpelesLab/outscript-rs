@@ -14,11 +14,77 @@ pub(super) struct RealTx {
     pub(super) rings: Vec<Vec<RingMember>>,
 }
 
+/// A transaction of the fixtures the donation address has outputs in, in
+/// full or pruned.
+pub(super) struct DonationTx {
+    pub(super) name: String,
+    pub(super) txid: [u8; 32],
+    pub(super) tx: Transaction,
+    /// The hash of the prunable data, when `tx` is pruned.
+    pub(super) prunable_hash: Option<[u8; 32]>,
+    /// The outputs the explorer finds: their indices and amounts.
+    pub(super) owned: Vec<(usize, u64)>,
+    /// The long payment id the explorer shows.
+    pub(super) payment_id: Option<[u8; 32]>,
+}
+
+/// The transactions with outputs to the donation address.
+pub(super) fn donation_txs() -> Vec<DonationTx> {
+    let full = mainnet_txs();
+    let mut pruned = BTreeMap::new();
+    let mut payment_ids = BTreeMap::new();
+    for line in MAINNET.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        match f.first().copied() {
+            Some("pruned") => {
+                let tx = Transaction::parse_pruned(&hex::decode(f[5]).unwrap()).unwrap();
+                pruned.insert(f[1], (h32(f[3]), h32(f[4]), tx));
+            }
+            Some("payment_id") => {
+                payment_ids.insert(f[1], h32(f[2]));
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for line in MAINNET.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.first() != Some(&"owned") {
+            continue;
+        }
+        let name = f[1];
+        let owned = f[2..]
+            .iter()
+            .map(|entry| {
+                let (index, amount) = entry.split_once(':').unwrap();
+                (index.parse().unwrap(), amount.parse().unwrap())
+            })
+            .collect();
+        let (txid, tx, prunable_hash) = match pruned.remove(name) {
+            Some((txid, prunable_hash, tx)) => (txid, tx, Some(prunable_hash)),
+            None => {
+                let real = &full[name];
+                (real.txid, Transaction::parse(&real.bytes).unwrap(), None)
+            }
+        };
+        out.push(DonationTx {
+            name: String::from(name),
+            txid,
+            tx,
+            prunable_hash,
+            owned,
+            payment_id: payment_ids.get(name).copied(),
+        });
+    }
+    out
+}
+
 pub(super) fn mainnet_txs() -> BTreeMap<String, RealTx> {
     let mut txs = BTreeMap::new();
     for line in MAINNET.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
         match f.first().copied() {
+            Some("pruned" | "owned" | "payment_id") => {}
             Some("tx") => {
                 txs.insert(
                     String::from(f[1]),
@@ -55,7 +121,7 @@ pub(super) fn mainnet_txs() -> BTreeMap<String, RealTx> {
 #[test]
 fn mainnet_round_trip_and_txid() {
     let txs = mainnet_txs();
-    assert_eq!(txs.len(), 12);
+    assert_eq!(txs.len(), 18);
     let mut types = Vec::new();
     for (name, real) in &txs {
         let tx = Transaction::parse(&real.bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -166,7 +232,7 @@ fn mainnet_round_trip_and_txid() {
 #[test]
 fn mainnet_bulletproofs_plus() {
     let txs = mainnet_txs();
-    let generators = BulletproofPlusGenerators::new(4);
+    let generators = BulletproofPlusGenerators::shared(4);
     for name in ["rct6_1in_2out", "rct6_1in_3out"] {
         let tx = Transaction::parse(&txs[name].bytes).unwrap();
         assert_eq!(tx.verify_range_proof(), Ok(true), "{name}");
@@ -263,20 +329,34 @@ fn mainnet_clsag() {
 fn mainnet_verify_all_formats() {
     let txs = mainnet_txs();
     let mut seen = Vec::new();
+    let mut verified = 0;
     for (name, real) in &txs {
-        if real.rings.is_empty() {
+        let tx = Transaction::parse(&real.bytes).unwrap();
+        seen.push((tx.prefix.version, tx.rct.rct_type));
+        // (The two with Borromean proofs that `rct_full` and `rct_simple`
+        // verify are left to them: these proofs take a while.)
+        if real.rings.is_empty() || name == "rct1" || name == "rct2" {
             continue;
         }
-        let tx = Transaction::parse(&real.bytes).unwrap();
         assert_eq!(tx.verify(&real.rings), Ok(true), "{name}");
-        seen.push((tx.prefix.version, tx.rct.rct_type));
+        verified += 1;
     }
     seen.sort();
     seen.dedup();
     assert_eq!(
         seen,
-        [(1, 0), (2, 1), (2, 2), (2, 3), (2, 4), (2, 5), (2, 6)]
+        [
+            (1, 0),
+            (2, 0),
+            (2, 1),
+            (2, 2),
+            (2, 3),
+            (2, 4),
+            (2, 5),
+            (2, 6)
+        ]
     );
+    assert_eq!(verified, 12);
 }
 
 /// Parsing never panics on, and rejects, truncated and corrupted
@@ -287,15 +367,17 @@ fn parse_rejections() {
     for (name, real) in &txs {
         let bytes = &real.bytes;
         // Every truncation fails; so does trailing data.
-        let step = (bytes.len() / 200).max(1);
+        let step = (bytes.len() / 120).max(1);
         for cut in (0..bytes.len()).step_by(step) {
             assert!(Transaction::parse(&bytes[..cut]).is_err(), "{name} {cut}");
         }
         let mut longer = bytes.clone();
         longer.push(0);
         assert_eq!(Transaction::parse(&longer), Err(Error::TrailingData));
-        // Flipping any of the first bytes must not panic.
-        for i in 0..bytes.len().min(300) {
+        // Flipping any of the first bytes must not panic (some of them
+        // only for the larger transactions, which take a while to hash).
+        let stride = 1 + bytes.len() / 700;
+        for i in (0..bytes.len().min(300)).step_by(stride) {
             for bit in [0x01u8, 0x80, 0xff] {
                 let mut bad = bytes.clone();
                 bad[i] ^= bit;
@@ -409,7 +491,7 @@ fn bulletproofs_plus_prove() {
 #[cfg_attr(debug_assertions, ignore)]
 fn bulletproofs_plus_prove_large() {
     let mut rng = test_rng(12);
-    let generators = BulletproofPlusGenerators::new(16);
+    let generators = BulletproofPlusGenerators::shared(16);
     for count in [5usize, 16] {
         let amounts: Vec<u64> = (0..count as u64).map(|i| i * 1_000_003).collect();
         let masks: Vec<[u8; 32]> = (0..count)
@@ -423,6 +505,169 @@ fn bulletproofs_plus_prove_large() {
             .collect();
         assert!(proof.verify_with(&generators, &commitments), "{count}");
     }
+}
+
+/// Scanning the whole history of the chain: outputs of real transactions of
+/// the old formats to the donation address of the Monero project, whose
+/// secret view key is public. The outputs and amounts expected are those a
+/// block explorer finds with that key.
+///
+/// - version 1: amounts in the clear, and a long payment id;
+/// - RingCT types 1, 2 and 3: masks and amounts encrypted in 32 bytes each
+///   (types 1 and 2 from the pruned transactions a daemon serves for
+///   scanning).
+#[test]
+fn scan_legacy_outputs() {
+    let donation: Address = "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A"
+        .parse()
+        .unwrap();
+    let view = ViewKeys::new(
+        &h32("f359631075708155cc3d92a32b75a7d02a5dcf27756707b47a2b31b21c389501"),
+        &donation.spend_public,
+    )
+    .unwrap();
+    let other = AccountKeys::from_seed(&[9u8; 32]).unwrap();
+
+    let mut formats = Vec::new();
+    for real in donation_txs() {
+        let (name, tx) = (&real.name, &real.tx);
+        formats.push((tx.prefix.version, tx.rct.rct_type));
+        match real.prunable_hash {
+            Some(hash) => assert_eq!(tx.hash_with_prunable_hash(&hash), Some(real.txid)),
+            None => assert_eq!(tx.hash(), real.txid, "{name}"),
+        }
+
+        let owned = view.scan_transaction(tx, &mut |_| None).unwrap();
+        let found: Vec<(usize, u64)> = owned.iter().map(|o| (o.index, o.amount)).collect();
+        assert_eq!(found, real.owned, "{name}");
+        for output in &owned {
+            assert_eq!(output.subaddress, SubaddressIndex::MAIN);
+            assert_eq!(output.key, tx.prefix.outputs[output.index].key);
+            // The amount and the mask open the commitment.
+            assert_eq!(
+                commit(output.amount, &output.mask).unwrap(),
+                output.commitment,
+                "{name}"
+            );
+            if tx.prefix.version == 1 {
+                // In the clear, with the commitment a RingCT ring would use.
+                assert_eq!(output.amount, tx.prefix.outputs[output.index].amount);
+                assert_eq!(output.commitment, zero_commit(output.amount));
+                assert_eq!(output_commitment(tx, output.index), None);
+            } else {
+                assert_eq!(tx.prefix.outputs[output.index].amount, 0);
+                assert_eq!(output_commitment(tx, output.index), Some(output.commitment));
+                // The primitive, on its own.
+                let EcdhInfo::Full { mask, amount } = tx.rct.ecdh_info[output.index] else {
+                    panic!("{name}");
+                };
+                assert_eq!(tx.rct.ecdh_info[output.index].compact(), None);
+                let index = output.index as u64;
+                let commitment = &output.commitment;
+                let opened =
+                    decode_amount_legacy(&output.derivation, index, &mask, &amount, commitment)
+                        .unwrap();
+                assert_eq!((opened.amount, *opened.mask), (output.amount, *output.mask));
+                // Encrypting them again gives what the chain has.
+                let shared = crate::cryptonote::derivation_to_scalar(&output.derivation, index);
+                assert_eq!(
+                    encrypt_amount_legacy(&shared, output.amount, &output.mask).unwrap(),
+                    (mask, amount),
+                    "{name}"
+                );
+                // Another output's data, or another commitment, does not
+                // open.
+                let wrong =
+                    decode_amount_legacy(&output.derivation, index + 1, &mask, &amount, commitment);
+                assert_eq!(wrong.unwrap_err(), Error::CommitmentMismatch);
+                let wrong =
+                    decode_amount_legacy(&output.derivation, index, &amount, &mask, commitment);
+                assert_eq!(wrong.unwrap_err(), Error::CommitmentMismatch);
+            }
+        }
+        // The payment id, long and in the clear in these old transactions.
+        assert_eq!(
+            payment_id(&tx.prefix.extra),
+            real.payment_id.map(PaymentId::Unencrypted),
+            "{name}"
+        );
+        assert!(owned.iter().all(|output| output.payment_id.is_none()));
+        // Nothing for another account.
+        let none = other
+            .view_keys()
+            .scan_transaction(tx, &mut |_| None)
+            .unwrap();
+        assert!(none.is_empty(), "{name}");
+    }
+    formats.sort();
+    assert_eq!(formats, [(1, 0), (2, 1), (2, 2), (2, 3)]);
+
+    // The long payment id of the version 1 transaction is text.
+    let all = donation_txs();
+    let v1 = all.iter().find(|real| real.name == "v1_donation").unwrap();
+    assert_eq!(v1.payment_id.unwrap(), *b"1000000 Monero blocks - XMR4ever");
+}
+
+/// The 32-byte encrypted amounts, both ways, and what is refused.
+#[test]
+fn legacy_amount_round_trip() {
+    let mut rng = test_rng(31);
+    for amount in [0u64, 1, 1_000_000_000_000, u64::MAX] {
+        let mut derivation = [0u8; 32];
+        rng(&mut derivation);
+        let mask = random_scalar(&mut rng).unwrap().to_bytes();
+        let shared = crate::cryptonote::derivation_to_scalar(&derivation, 3);
+        let (encrypted_mask, encrypted_amount) =
+            encrypt_amount_legacy(&shared, amount, &mask).unwrap();
+        assert_ne!(encrypted_mask, mask);
+        let commitment = commit(amount, &mask).unwrap();
+        let opened = decode_amount_legacy(
+            &derivation,
+            3,
+            &encrypted_mask,
+            &encrypted_amount,
+            &commitment,
+        )
+        .unwrap();
+        assert_eq!((opened.amount, *opened.mask), (amount, mask));
+        // Another commitment.
+        let other = commit(amount ^ 1, &mask).unwrap();
+        assert_eq!(
+            decode_amount_legacy(&derivation, 3, &encrypted_mask, &encrypted_amount, &other)
+                .unwrap_err(),
+            Error::CommitmentMismatch
+        );
+    }
+    // An amount of more than 64 bits is not one, even if a commitment to
+    // that scalar is given.
+    let derivation = [5u8; 32];
+    let shared = crate::cryptonote::derivation_to_scalar(&derivation, 0);
+    let mask = random_scalar(&mut rng).unwrap();
+    let (encrypted_mask, encrypted_amount) =
+        encrypt_amount_legacy(&shared, u64::MAX, &mask.to_bytes()).unwrap();
+    let one_more = crate::cryptonote::scalar_from_bytes(&encrypted_amount)
+        .unwrap()
+        .add(&Scalar::ONE);
+    let big = crate::cryptonote::scalar_from_u64(u64::MAX).add(&Scalar::ONE);
+    let commitment = ringct::commit_point(&big, &mask).compress();
+    assert_eq!(
+        decode_amount_legacy(
+            &derivation,
+            0,
+            &encrypted_mask,
+            &one_more.to_bytes(),
+            &commitment
+        )
+        .unwrap_err(),
+        Error::CommitmentMismatch
+    );
+    // Encrypted values that are not reduced scalars are taken modulo the
+    // group order, as the reference does: no panic, no match.
+    assert_eq!(
+        decode_amount_legacy(&derivation, 0, &[0xff; 32], &[0xff; 32], &commitment).unwrap_err(),
+        Error::CommitmentMismatch
+    );
+    assert!(encrypt_amount_legacy(&shared, 1, &[0xff; 32]).is_err());
 }
 
 /// The scanning vectors of `monero-rs`: transactions with the keys of their

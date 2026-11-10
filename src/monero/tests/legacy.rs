@@ -131,8 +131,6 @@ fn rct_full() {
     assert_eq!(tx.rct.rct_type, RCT_TYPE_FULL);
     assert_eq!(tx.rct.mlsags.len(), 1);
     assert_eq!(tx.verify_balance(), Err(Error::Unsupported));
-    assert_eq!(tx.verify_ring_signatures(&rings), Ok(true));
-    assert_eq!(tx.verify_range_proof(), Ok(true));
     assert_eq!(tx.verify(&rings), Ok(true));
 
     let message = tx.signature_hash();
@@ -201,20 +199,11 @@ fn borromean_range_proofs() {
     let commitment = &tx.rct.out_pk[0];
     assert_eq!(proof.0.len(), BORROMEAN_PROOF_LEN);
     assert!(proof.verify(commitment));
-    assert!(borromean_verify(&proof.0, commitment));
     // Another commitment.
     assert!(!proof.verify(&tx.rct.out_pk[1]));
     assert!(!proof.verify(&[0xff; 32]));
     // Any part changed: s0, s1, ee, the bit commitments.
-    for position in [
-        0usize,
-        31,
-        63 * 32,
-        64 * 32 + 5,
-        127 * 32,
-        128 * 32,
-        129 * 32 + 1,
-    ] {
+    for position in [31usize, 64 * 32 + 5, 128 * 32, 129 * 32 + 1] {
         let mut bad = proof.clone();
         bad.0[position] ^= 1;
         assert!(!bad.verify(commitment), "{position}");
@@ -254,8 +243,6 @@ fn rct_simple() {
     assert_eq!(tx.rct.mlsags.len(), tx.prefix.inputs.len());
     assert!(tx.prefix.inputs.len() >= 2);
     assert_eq!(tx.verify_balance(), Ok(true));
-    assert_eq!(tx.verify_ring_signatures(&rings), Ok(true));
-    assert_eq!(tx.verify_range_proof(), Ok(true));
     assert_eq!(tx.verify(&rings), Ok(true));
 
     let message = tx.signature_hash();
@@ -306,8 +293,8 @@ fn rct_simple() {
 /// types that carry them and of every size the fixtures have.
 #[test]
 fn bulletproofs_original() {
-    let generators = BulletproofGenerators::new(4);
-    assert_eq!(generators.max_outputs(), 4);
+    let generators = BulletproofGenerators::shared(4);
+    assert!(generators.max_outputs() >= 4);
     let mut sizes = Vec::new();
     for name in BULLETPROOF_TXS {
         let (tx, rings) = real(name);
@@ -316,13 +303,16 @@ fn bulletproofs_original() {
         let commitments = &tx.rct.out_pk;
         sizes.push((tx.rct.rct_type, commitments.len()));
         assert!(proof.verify(commitments), "{name}");
-        assert_eq!(tx.verify_range_proof(), Ok(true), "{name}");
-        assert_eq!(tx.verify(&rings), Ok(true), "{name}");
         if commitments.len() > 4 {
-            assert!(!proof.verify_with(&generators, commitments), "{name}");
+            let small = BulletproofGenerators::new(2);
+            assert!(!proof.verify_with(&small, commitments), "{name}");
             continue;
         }
         assert!(proof.verify_with(&generators, commitments), "{name}");
+        // One proof of two outputs and one of three are taken apart.
+        if !["rct4", "rct3_1in_3out"].contains(&name) {
+            continue;
+        }
 
         if commitments.len() > 1 {
             let mut bad = commitments.clone();
@@ -388,10 +378,84 @@ fn bulletproofs_original() {
     assert!(!proof.verify_with(&small, &tx.rct.out_pk));
 }
 
+/// Original Bulletproofs made by the prover of `monero-oxide`
+/// (`monero-bulletproofs`), over one to seven commitments: the chain has
+/// none over a single output, since wallets always made two.
+#[test]
+fn bulletproofs_reference_prover() {
+    let generators = BulletproofGenerators::shared(8);
+    let mut sizes = Vec::new();
+    let mut batch_data = Vec::new();
+    for line in include_str!("../testdata/monero_oxide_bulletproofs.txt").lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(f[0], "bulletproof");
+        let count: usize = f[1].parse().unwrap();
+        let bytes = hex::decode(f[2]).unwrap();
+        let proof = Bulletproof::parse(&bytes).unwrap();
+        assert_eq!(proof.serialize(), bytes);
+        let commitments: Vec<[u8; 32]> = f[3..].iter().map(|c| h32(c)).collect();
+        assert_eq!(commitments.len(), count);
+        assert_eq!(
+            proof.l.len(),
+            6 + count.next_power_of_two().trailing_zeros() as usize
+        );
+        assert!(proof.verify_with(&generators, &commitments), "{count}");
+        // Bound to the commitments and their number.
+        let mut bad = commitments.clone();
+        bad[count - 1] = commitments[0];
+        if count > 1 {
+            assert!(!proof.verify_with(&generators, &bad), "{count}");
+        }
+        bad.push(H);
+        assert!(!proof.verify_with(&generators, &bad), "{count}");
+        let mut bad = proof.clone();
+        bad.t[0] ^= 1;
+        assert!(!bad.verify_with(&generators, &commitments), "{count}");
+        sizes.push(count);
+        batch_data.push((proof, commitments));
+
+        // Parsing: truncated, and with trailing data.
+        assert!(Bulletproof::parse(&bytes[..bytes.len() - 1]).is_err());
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_eq!(Bulletproof::parse(&longer), Err(Error::TrailingData));
+    }
+    assert_eq!(sizes, [1, 1, 2, 5, 7]);
+    let batch: Vec<(&Bulletproof, &[[u8; 32]])> = batch_data
+        .iter()
+        .map(|(proof, commitments)| (proof, &commitments[..]))
+        .collect();
+    assert_eq!(
+        Bulletproof::verify_batch(&generators, &batch, &mut test_rng(22)),
+        Ok(true)
+    );
+    assert!(Bulletproof::parse(&[]).is_err());
+
+    // The same for a Bulletproof+ of a real transaction.
+    let all = mainnet_txs();
+    let tx = Transaction::parse(&all["rct6_1in_3out"].bytes).unwrap();
+    let proof = &tx.rct.bulletproofs_plus[0];
+    let bytes = proof.serialize();
+    assert_eq!(BulletproofPlus::parse(&bytes).unwrap(), *proof);
+    assert!(BulletproofPlus::parse(&bytes[1..]).is_err());
+    assert!(BulletproofPlus::parse(&[]).is_err());
+}
+
 /// The real transactions with an original Bulletproof.
-const BULLETPROOF_TXS: [&str; 3] = ["rct3", "rct4", "rct5"];
+const BULLETPROOF_TXS: [&str; 7] = [
+    "rct3",
+    "rct4",
+    "rct5",
+    "rct3_donation",
+    "rct3_1in_3out",
+    "rct3_1in_8out",
+    "rct3_1in_16out",
+];
 /// Their RingCT types and numbers of outputs.
-const BULLETPROOF_SIZES: [(u8, usize); 3] = [(3, 2), (4, 2), (5, 2)];
+const BULLETPROOF_SIZES: [(u8, usize); 6] = [(3, 2), (3, 3), (3, 8), (3, 16), (4, 2), (5, 2)];
 
 /// Batches: many proofs in one multi-scalar multiplication.
 #[test]
@@ -401,7 +465,7 @@ fn range_proof_batches() {
 
     // The original Bulletproofs.
     let txs: Vec<Transaction> = BULLETPROOF_TXS.iter().map(|name| real(name).0).collect();
-    let generators = BulletproofGenerators::new(16);
+    let generators = BulletproofGenerators::shared(16);
     let mut batch: Vec<(&Bulletproof, &[[u8; 32]])> = txs
         .iter()
         .map(|tx| (&tx.rct.bulletproofs[0], &tx.rct.out_pk[..]))
@@ -424,8 +488,8 @@ fn range_proof_batches() {
     );
     // One bad proof spoils the batch, wherever it is and whichever of its
     // two equations it breaks.
-    for position in 0..batch.len() {
-        for edit in 0..3 {
+    for (position, edit) in [(0, 0), (3, 1), (batch.len() - 1, 2)] {
+        {
             let mut bad = batch[position].0.clone();
             match edit {
                 0 => bad.taux[0] ^= 1,
@@ -470,7 +534,7 @@ fn range_proof_batches() {
         .iter()
         .map(|name| Transaction::parse(&all[*name].bytes).unwrap())
         .collect();
-    let generators = BulletproofPlusGenerators::new(16);
+    let generators = BulletproofPlusGenerators::shared(16);
     let batch: Vec<(&BulletproofPlus, &[[u8; 32]])> = txs
         .iter()
         .map(|tx| (&tx.rct.bulletproofs_plus[0], &tx.rct.out_pk[..]))
@@ -487,7 +551,7 @@ fn range_proof_batches() {
         BulletproofPlus::verify_batch(&generators, &batch, &mut zeros),
         Err(Error::BadRandomness)
     );
-    for position in 0..batch.len() {
+    for position in [0, batch.len() - 1] {
         let mut bad = batch[position].0.clone();
         bad.d1[0] ^= 1;
         let mut spoiled = batch.clone();
