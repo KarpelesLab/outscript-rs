@@ -5,6 +5,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::par;
 use super::plonk::Rotation;
 use crate::orchard::{Fp, vesta};
 
@@ -82,6 +83,73 @@ pub(crate) fn fft<G: FftGroup>(a: &mut [G], omega: Fp, log_n: u32) {
                 let t = hi[j].group_scale(&twiddles[j * stride]);
                 hi[j] = lo[j].group_sub(&t);
                 lo[j] = lo[j].group_add(&t);
+            }
+        }
+        m *= 2;
+    }
+}
+
+/// The fewest butterflies of one level of an FFT worth a thread.
+const FFT_MIN_BUTTERFLIES: usize = 4;
+
+/// [`fft`], with the butterflies of each level split over the threads
+/// there are: for elements costly to scale (curve points), where one
+/// butterfly is worth far more than starting a thread. The operations, and
+/// so the result, are those of [`fft`].
+pub(crate) fn fft_par<G: FftGroup + Send>(a: &mut [G], omega: Fp, log_n: u32) {
+    let n = a.len();
+    assert_eq!(n, 1 << log_n);
+    if par::max_threads() <= 1 || log_n < 4 {
+        return fft(a, omega, log_n);
+    }
+    for k in 0..n {
+        let rk = k.reverse_bits() >> (usize::BITS - log_n);
+        if k < rk {
+            a.swap(rk, k);
+        }
+    }
+    let mut twiddles = Vec::with_capacity(n / 2);
+    let mut w = Fp::ONE;
+    for _ in 0..n / 2 {
+        twiddles.push(w);
+        w *= omega;
+    }
+    let twiddles = &twiddles;
+    /// One butterfly, with the twiddle factor of its position in the block.
+    fn butterfly<G: FftGroup>(lo: &mut G, hi: &mut G, twiddle: Option<&Fp>) {
+        let t = match twiddle {
+            Some(twiddle) => hi.group_scale(twiddle),
+            // The first twiddle is one.
+            None => *hi,
+        };
+        *hi = lo.group_sub(&t);
+        *lo = lo.group_add(&t);
+    }
+    let mut m = 1;
+    for _ in 0..log_n {
+        let stride = n / (2 * m);
+        let twiddle = |j: usize| (j != 0).then(|| &twiddles[j * stride]);
+        if m < 2 * FFT_MIN_BUTTERFLIES || n / (2 * m) >= par::max_threads() {
+            // Many blocks: whole blocks to each thread.
+            let min_len = 2 * m * FFT_MIN_BUTTERFLIES.div_ceil(m);
+            par::chunks_mut(a, min_len, 2 * m, |_, part| {
+                for block in part.chunks_mut(2 * m) {
+                    let (lo, hi) = block.split_at_mut(m);
+                    for (j, (lo, hi)) in lo.iter_mut().zip(hi.iter_mut()).enumerate() {
+                        butterfly(lo, hi, twiddle(j));
+                    }
+                }
+            });
+        } else {
+            // Few large blocks: each split over the threads.
+            for block in a.chunks_mut(2 * m) {
+                let (lo, hi) = block.split_at_mut(m);
+                let mut pairs: Vec<(&mut G, &mut G)> = lo.iter_mut().zip(hi.iter_mut()).collect();
+                par::chunks_mut(&mut pairs, FFT_MIN_BUTTERFLIES, 1, |first, part| {
+                    for (j, (lo, hi)) in part.iter_mut().enumerate() {
+                        butterfly(&mut **lo, &mut **hi, twiddle(first + j));
+                    }
+                });
             }
         }
         m *= 2;

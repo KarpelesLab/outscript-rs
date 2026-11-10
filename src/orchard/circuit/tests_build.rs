@@ -182,3 +182,53 @@ fn build_prove_sign_verify_post_nu6_3() {
 fn build_prove_sign_verify_insecure() {
     build_and_check(CircuitVersion::InsecurePreNu6_2, "insecure");
 }
+
+/// The proving key and the proof of a bundle are the same on one thread
+/// and on many; prints how long each takes.
+#[cfg(feature = "std")]
+#[test]
+#[ignore = "slow in the test profile"]
+fn threads_do_not_change_the_bundle() {
+    use crate::orchard::halo2::{max_threads, set_max_threads};
+    let _guard = crate::orchard::halo2::tests::THREADS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let version = CircuitVersion::FixedPostNu6_2;
+    let sk = SpendingKey::from_bytes(seed(1)).unwrap();
+    let fvk = sk.to_fvk();
+    let sender = fvk.address_at(0u32, Scope::External);
+    let rho = Nullifier::from_fp(Fp::from_uniform_bytes(&seed(3)));
+    let note = Note::from_parts(sender, 500_000_000, rho, seed(4)).unwrap();
+    let leaves = [note.cmx().to_fp()];
+    let anchor = tree::root(&leaves).unwrap();
+    let path = tree::witness(&leaves, 0).unwrap();
+    let run = |threads: usize| {
+        set_max_threads(threads);
+        let t = std::time::Instant::now();
+        let pk = ProvingKey::build(version);
+        let keygen = t.elapsed();
+        let mut builder = Builder::new(version, Flags::ENABLED, anchor);
+        builder.add_spend(&fvk, note, path).unwrap();
+        builder
+            .add_output(None, sender, 400_000_000, NO_MEMO)
+            .unwrap();
+        let t = std::time::Instant::now();
+        let bundle = builder.build(&pk, &seed(5)).unwrap().bundle().to_bytes();
+        std::eprintln!(
+            "{} thread(s): proving key in {keygen:?}, 2 actions built and proven in {:?}",
+            max_threads(),
+            t.elapsed()
+        );
+        let key = format!("{:?}", pk.verifying_key().halo2().pinned());
+        (key, bundle)
+    };
+    let single = run(1);
+    for threads in [2, 5, 0] {
+        assert!(run(threads) == single, "{threads} threads");
+    }
+    let parsed = BundleRef::parse(&single.1).unwrap().unwrap();
+    assert_eq!(
+        parsed.verify_proof(&VerifyingKey::embedded(version)),
+        Ok(())
+    );
+}

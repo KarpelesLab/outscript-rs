@@ -21,12 +21,13 @@ mod commitment;
 pub(crate) mod dev;
 mod keygen;
 mod multiopen;
+mod par;
 mod pdqsort;
 pub mod plonk;
 mod poly;
 mod prover;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod transcript;
 mod value;
 mod verifier;
@@ -36,7 +37,10 @@ pub use commitment::Params;
 pub(crate) use keygen::keygen_vk_with_plan;
 pub(crate) use keygen::vk_from_parts;
 pub use keygen::{PinnedVerificationKey, ProvingKey, VerifyingKey, keygen_pk, keygen_vk};
+#[cfg(feature = "std")]
+pub use par::{max_threads, set_max_threads};
 pub use prover::create_proof;
+pub(crate) use prover::create_proof_sync;
 pub use value::Value;
 pub use verifier::{BatchVerifier, verify_proof};
 

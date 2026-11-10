@@ -10,6 +10,7 @@ use purecrypto::hash::Blake2bMac;
 
 use super::circuit::{Assignment, Circuit, synthesize};
 use super::commitment::Params;
+use super::par;
 use super::plonk::{
     Advice, Any, Column, ConstraintSystem, Fixed, Hex, Instance, PermutationArgument,
     PinnedConstraintSystem, Selector, SelectorPlan,
@@ -505,10 +506,8 @@ pub fn keygen_vk<C: Circuit>(params: &Params, circuit: &C) -> Result<VerifyingKe
 
 fn vk_of(params: &Params, s: &Synthesized) -> VerifyingKey {
     let commit = |polys: &[Vec<Fp>]| {
-        let points: Vec<vesta::Point> = polys
-            .iter()
-            .map(|poly| params.commit_lagrange(poly, Fp::ONE))
-            .collect();
+        let points: Vec<vesta::Point> =
+            par::map(polys, |_, poly| params.commit_lagrange(poly, Fp::ONE));
         let mut out = vec![vesta::Affine::IDENTITY; points.len()];
         vesta::Point::batch_normalize(&points, &mut out);
         out
@@ -529,16 +528,10 @@ pub fn keygen_pk<C: Circuit>(params: &Params, circuit: &C) -> Result<ProvingKey,
     let n = params.n;
 
     let to_coeff = |values: &[Vec<Fp>]| -> Vec<Vec<Fp>> {
-        values
-            .iter()
-            .map(|v| domain.lagrange_to_coeff(v.clone()))
-            .collect()
+        par::map(values, |_, v| domain.lagrange_to_coeff(v.clone()))
     };
     let to_extended = |polys: &[Vec<Fp>]| -> Vec<Vec<Fp>> {
-        polys
-            .iter()
-            .map(|p| domain.coeff_to_extended(p.clone()))
-            .collect()
+        par::map(polys, |_, p| domain.coeff_to_extended(p.clone()))
     };
     let fixed_polys = to_coeff(&s.fixed);
     let fixed_cosets = to_extended(&fixed_polys);

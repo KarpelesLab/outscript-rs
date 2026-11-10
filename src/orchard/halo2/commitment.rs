@@ -8,7 +8,8 @@ use alloc::vec::Vec;
 use purecrypto::hash::Blake2bMac;
 
 use super::Error;
-use super::poly::{compute_inner_product, eval_polynomial, fft};
+use super::par;
+use super::poly::{compute_inner_product, eval_polynomial, fft_par};
 use super::transcript::{TranscriptRead, TranscriptWrite};
 use crate::orchard::{Fp, vesta};
 
@@ -47,13 +48,11 @@ impl Params {
         assert!(k < 32);
         let n = 1usize << k;
         let hash = |msg: &[u8]| vesta::Point::hash_to_curve(b"Halo2-Parameters", msg);
-        let g_projective: Vec<vesta::Point> = (0..n as u32)
-            .map(|i| {
-                let mut message = [0u8; 5];
-                message[1..5].copy_from_slice(&i.to_le_bytes());
-                hash(&message)
-            })
-            .collect();
+        let g_projective: Vec<vesta::Point> = par::map_range(n, |i| {
+            let mut message = [0u8; 5];
+            message[1..5].copy_from_slice(&(i as u32).to_le_bytes());
+            hash(&message)
+        });
         let mut g = vec![vesta::Affine::IDENTITY; n];
         vesta::Point::batch_normalize(&g_projective, &mut g);
         Params {
@@ -76,11 +75,13 @@ impl Params {
         // The Lagrange basis generators are the inverse FFT of the
         // generators.
         let mut g_lagrange: Vec<vesta::Point> = params.g.iter().map(|g| g.to_point()).collect();
-        fft(&mut g_lagrange, omega_inv(k), k);
+        fft_par(&mut g_lagrange, omega_inv(k), k);
         let minv = Fp::TWO_INV.pow_vartime(&[k as u64, 0, 0, 0]);
-        for g in g_lagrange.iter_mut() {
-            *g = g.mul_vartime(&minv);
-        }
+        par::chunks_mut(&mut g_lagrange, 8, 1, |_, chunk| {
+            for g in chunk.iter_mut() {
+                *g = g.mul_vartime(&minv);
+            }
+        });
         params.g_lagrange = vec![vesta::Affine::IDENTITY; params.n];
         vesta::Point::batch_normalize(&g_lagrange, &mut params.g_lagrange);
         params
@@ -132,6 +133,12 @@ impl Params {
     pub(crate) fn commit(&self, poly: &[Fp], r: Fp) -> vesta::Point {
         assert!(poly.len() <= self.n);
         vesta::Point::msm_vartime(poly, &self.g).add(&self.w.to_point().mul_vartime(&r))
+    }
+
+    /// [`Params::commit`], splitting the work over the threads there are.
+    pub(crate) fn commit_par(&self, poly: &[Fp], r: Fp) -> vesta::Point {
+        assert!(poly.len() <= self.n);
+        par::msm(poly, &self.g).add(&self.w.to_point().mul_vartime(&r))
     }
 
     /// Commits to a polynomial given by its values on the first
@@ -246,7 +253,7 @@ impl Msm {
             scalars.extend_from_slice(g_scalars);
             bases.extend_from_slice(&params.g);
         }
-        bool::from(vesta::Point::msm_vartime(&scalars, &bases).is_identity())
+        bool::from(par::msm(&scalars, &bases).is_identity())
     }
 }
 
@@ -287,6 +294,9 @@ impl Drop for ProverRng {
     }
 }
 
+/// The fewest generators folded on several threads.
+const FOLD_MIN_LEN: usize = 16;
+
 /// Creates an opening proof: `p_poly` (committed with blinding `p_blind`)
 /// evaluates at `x_3` to a value the verifier already knows.
 pub(crate) fn create_proof(
@@ -304,7 +314,7 @@ pub(crate) fn create_proof(
     let s_at_x3 = eval_polynomial(&s_poly, x_3);
     s_poly[0] -= s_at_x3;
     let s_poly_blind = rng.next();
-    let s_poly_commitment = params.commit(&s_poly, s_poly_blind).to_affine();
+    let s_poly_commitment = params.commit_par(&s_poly, s_poly_blind).to_affine();
     transcript.write_point(&s_poly_commitment)?;
 
     let xi = transcript.squeeze_challenge();
@@ -338,8 +348,8 @@ pub(crate) fn create_proof(
     for j in 0..params.k {
         let half = 1usize << (params.k - j - 1);
 
-        let l_j = vesta::Point::msm_vartime(&p_prime[half..], &g_prime[0..half]);
-        let r_j = vesta::Point::msm_vartime(&p_prime[0..half], &g_prime[half..]);
+        let l_j = par::msm(&p_prime[half..], &g_prime[0..half]);
+        let r_j = par::msm(&p_prime[0..half], &g_prime[half..]);
         let value_l_j = compute_inner_product(&p_prime[half..], &b[0..half]);
         let value_r_j = compute_inner_product(&p_prime[0..half], &b[half..]);
         let l_j_randomness = rng.next();
@@ -359,16 +369,20 @@ pub(crate) fn create_proof(
         let u_j_inv = u_j.invert().ok_or(Error::Synthesis)?;
 
         // Fold the vectors.
-        let mut folded = Vec::with_capacity(half);
         for i in 0..half {
             p_prime[i] = p_prime[i] + p_prime[i + half] * u_j_inv;
             b[i] = b[i] + b[i + half] * u_j;
-            folded.push(
-                g_prime[i]
-                    .to_point()
-                    .add(&g_prime[i + half].to_point().mul_vartime(&u_j)),
-            );
         }
+        let fold = |i: usize| {
+            g_prime[i]
+                .to_point()
+                .add(&g_prime[i + half].to_point().mul_vartime(&u_j))
+        };
+        let folded: Vec<vesta::Point> = if half >= FOLD_MIN_LEN {
+            par::map_range(half, fold)
+        } else {
+            (0..half).map(fold).collect()
+        };
         p_prime.truncate(half);
         b.truncate(half);
         g_prime.truncate(half);

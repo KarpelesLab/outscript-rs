@@ -1,7 +1,14 @@
 //! Proof creation, as `halo2_proofs::plonk::create_proof`: the transcript
 //! is the one the verifier replays, the polynomials are computed here in a
-//! simpler way than the reference (expressions are compiled to small stack
-//! programs and evaluated row by row on the extended domain).
+//! simpler way than the reference (the expressions are compiled together
+//! into one straight-line program, run point by point on the extended
+//! domain).
+//!
+//! What does not depend on an order (commitments, transforms, the values
+//! of the quotient polynomial) is split over threads when there are some;
+//! the blinding factors are drawn and the transcript is written on the
+//! calling thread, in the order of the reference, so the proof is the same
+//! whatever the number of threads.
 
 use alloc::collections::BTreeMap;
 use alloc::vec;
@@ -13,6 +20,7 @@ use super::circuit::{Assignment, Circuit, synthesize};
 use super::commitment::{Params, ProverRng};
 use super::keygen::ProvingKey;
 use super::multiopen::{self, ProverQuery};
+use super::par;
 use super::plonk::{Advice, Any, Column, ConstraintSystem, Expression, Fixed, Instance, Selector};
 use super::poly::{EvaluationDomain, eval_polynomial};
 use super::transcript::TranscriptWrite;
@@ -93,118 +101,176 @@ impl Assignment for WitnessCollection<'_> {
     }
 }
 
-/// One instruction of a compiled expression.
+/// One step of a [`Graph`]: a value computed from the columns or from the
+/// values of earlier steps.
 #[derive(Clone, Copy)]
-enum Op {
+enum Node {
     Constant(Fp),
-    Fixed(usize, i32),
-    Advice(usize, i32),
-    Instance(usize, i32),
-    Negate,
-    Add,
-    Mul,
-    Scale(Fp),
+    /// The value of a fixed column, this many points further.
+    Fixed(usize, usize),
+    /// The value of an advice column, this many points further.
+    Advice(usize, usize),
+    /// The value of an instance column, this many points further.
+    Instance(usize, usize),
+    Negate(usize),
+    Add(usize, usize),
+    Mul(usize, usize),
+    Square(usize),
+    Scale(usize, Fp),
 }
 
-/// Appends the postfix program of `expr` to `out`.
-fn compile(expr: &Expression, out: &mut Vec<Op>) {
-    match expr {
-        Expression::Constant(c) => out.push(Op::Constant(*c)),
-        Expression::Selector(_) => unreachable!("virtual selectors are removed"),
-        Expression::Fixed(q) => out.push(Op::Fixed(q.column_index, q.rotation.0)),
-        Expression::Advice(q) => out.push(Op::Advice(q.column_index, q.rotation.0)),
-        Expression::Instance(q) => out.push(Op::Instance(q.column_index, q.rotation.0)),
-        Expression::Negated(a) => {
-            compile(a, out);
-            out.push(Op::Negate);
-        }
-        Expression::Sum(a, b) => {
-            compile(a, out);
-            compile(b, out);
-            out.push(Op::Add);
-        }
-        Expression::Product(a, b) => {
-            compile(a, out);
-            compile(b, out);
-            out.push(Op::Mul);
-        }
-        Expression::Scaled(a, f) => {
-            compile(a, out);
-            out.push(Op::Scale(*f));
+/// What identifies a node: two nodes with the same key have the same
+/// value.
+type NodeKey = (u8, [u64; 4], usize, usize);
+
+impl Node {
+    fn key(&self) -> NodeKey {
+        match *self {
+            Node::Constant(c) => (0, c.to_raw(), 0, 0),
+            Node::Fixed(c, s) => (1, [0; 4], c, s),
+            Node::Advice(c, s) => (2, [0; 4], c, s),
+            Node::Instance(c, s) => (3, [0; 4], c, s),
+            Node::Negate(a) => (4, [0; 4], a, 0),
+            Node::Add(a, b) => (5, [0; 4], a, b),
+            Node::Mul(a, b) => (6, [0; 4], a, b),
+            Node::Square(a) => (7, [0; 4], a, 0),
+            Node::Scale(a, f) => (8, f.to_raw(), a, 0),
         }
     }
 }
 
-/// The columns an expression is evaluated over, as values on a domain of
-/// `len` points where one row of the circuit is `step` points.
+/// Expressions compiled together into one straight-line program over a
+/// domain: every distinct subexpression is computed once per point, however
+/// many of the expressions it appears in.
+struct Graph {
+    nodes: Vec<Node>,
+    index: BTreeMap<NodeKey, usize>,
+    /// The number of points of the domain (a power of two).
+    len: usize,
+    /// The number of points one row of the circuit spans.
+    step: usize,
+}
+
+impl Graph {
+    /// An empty program over a domain of `len` points where one row of the
+    /// circuit is `step` points.
+    fn new(len: usize, step: usize) -> Self {
+        debug_assert!(len.is_power_of_two());
+        Graph {
+            nodes: Vec::new(),
+            index: BTreeMap::new(),
+            len,
+            step,
+        }
+    }
+
+    fn node(&mut self, node: Node) -> usize {
+        let nodes = &mut self.nodes;
+        *self.index.entry(node.key()).or_insert_with(|| {
+            nodes.push(node);
+            nodes.len() - 1
+        })
+    }
+
+    /// The number of points `rotation` rows further.
+    fn shift(&self, rotation: i32) -> usize {
+        (rotation as i64 * self.step as i64).rem_euclid(self.len as i64) as usize
+    }
+
+    /// Adds an expression; returns the step holding its value.
+    fn add(&mut self, expr: &Expression) -> usize {
+        match expr {
+            Expression::Constant(c) => self.node(Node::Constant(*c)),
+            Expression::Selector(_) => unreachable!("virtual selectors are removed"),
+            Expression::Fixed(q) => {
+                let shift = self.shift(q.rotation.0);
+                self.node(Node::Fixed(q.column_index, shift))
+            }
+            Expression::Advice(q) => {
+                let shift = self.shift(q.rotation.0);
+                self.node(Node::Advice(q.column_index, shift))
+            }
+            Expression::Instance(q) => {
+                let shift = self.shift(q.rotation.0);
+                self.node(Node::Instance(q.column_index, shift))
+            }
+            Expression::Negated(a) => {
+                let a = self.add(a);
+                self.node(Node::Negate(a))
+            }
+            Expression::Sum(a, b) => {
+                let (a, b) = (self.add(a), self.add(b));
+                // (the field is commutative: order the operands so that
+                // both orders share a step)
+                self.node(Node::Add(a.min(b), a.max(b)))
+            }
+            Expression::Product(a, b) => {
+                let (a, b) = (self.add(a), self.add(b));
+                if a == b {
+                    self.node(Node::Square(a))
+                } else {
+                    self.node(Node::Mul(a.min(b), a.max(b)))
+                }
+            }
+            Expression::Scaled(a, f) => {
+                let a = self.add(a);
+                self.node(Node::Scale(a, *f))
+            }
+        }
+    }
+
+    /// Adds expressions; returns the steps holding their values.
+    fn add_all(&mut self, exprs: &[Expression]) -> Vec<usize> {
+        exprs.iter().map(|e| self.add(e)).collect()
+    }
+
+    /// A buffer for the values of the steps.
+    fn scratch(&self) -> Vec<Fp> {
+        vec![Fp::ZERO; self.nodes.len()]
+    }
+
+    /// Runs the program at point `i` of the domain: `values[s]` becomes the
+    /// value of step `s`.
+    fn run(&self, columns: &Columns<'_>, i: usize, values: &mut [Fp]) {
+        let mask = self.len - 1;
+        for (step, node) in self.nodes.iter().enumerate() {
+            let value = match *node {
+                Node::Constant(c) => c,
+                Node::Fixed(c, s) => columns.fixed[c][(i + s) & mask],
+                Node::Advice(c, s) => columns.advice[c][(i + s) & mask],
+                Node::Instance(c, s) => columns.instance[c][(i + s) & mask],
+                Node::Negate(a) => -values[a],
+                Node::Add(a, b) => values[a] + values[b],
+                Node::Mul(a, b) => values[a] * values[b],
+                Node::Square(a) => values[a].square(),
+                Node::Scale(a, f) => values[a] * f,
+            };
+            values[step] = value;
+        }
+    }
+}
+
+/// The columns an expression is evaluated over, as values on a domain.
 struct Columns<'a> {
     fixed: &'a [Vec<Fp>],
     advice: &'a [Vec<Fp>],
     instance: &'a [Vec<Fp>],
-    len: usize,
-    step: usize,
 }
 
-impl Columns<'_> {
-    /// The index of the point `rotation` rows away from point `i`.
-    #[inline]
-    fn rotated(&self, i: usize, rotation: i32) -> usize {
-        let shift = (rotation as i64 * self.step as i64).rem_euclid(self.len as i64) as usize;
-        (i + shift) % self.len
-    }
-
-    /// Runs a program at point `i`.
-    fn run(&self, program: &[Op], i: usize, stack: &mut Vec<Fp>) -> Fp {
-        stack.clear();
-        for op in program {
-            match *op {
-                Op::Constant(c) => stack.push(c),
-                Op::Fixed(c, r) => stack.push(self.fixed[c][self.rotated(i, r)]),
-                Op::Advice(c, r) => stack.push(self.advice[c][self.rotated(i, r)]),
-                Op::Instance(c, r) => stack.push(self.instance[c][self.rotated(i, r)]),
-                Op::Negate => {
-                    let a = stack.pop().expect("well-formed program");
-                    stack.push(-a);
-                }
-                Op::Add => {
-                    let b = stack.pop().expect("well-formed program");
-                    let a = stack.pop().expect("well-formed program");
-                    stack.push(a + b);
-                }
-                Op::Mul => {
-                    let b = stack.pop().expect("well-formed program");
-                    let a = stack.pop().expect("well-formed program");
-                    stack.push(a * b);
-                }
-                Op::Scale(f) => {
-                    let a = stack.pop().expect("well-formed program");
-                    stack.push(a * f);
-                }
-            }
-        }
-        stack.pop().expect("well-formed program")
-    }
+/// The steps of a [`Graph`] holding the input and table expressions of a
+/// lookup argument.
+struct LookupSteps {
+    input: Vec<usize>,
+    table: Vec<usize>,
 }
 
-/// The compiled input and table expressions of a lookup argument.
-struct LookupPrograms {
-    input: Vec<Vec<Op>>,
-    table: Vec<Vec<Op>>,
-}
-
-impl LookupPrograms {
-    /// The expressions compressed with powers of theta, at point `i`.
-    fn compressed(
-        programs: &[Vec<Op>],
-        columns: &Columns<'_>,
-        theta: Fp,
-        i: usize,
-        stack: &mut Vec<Fp>,
-    ) -> Fp {
-        programs.iter().fold(Fp::ZERO, |acc, program| {
-            acc * theta + columns.run(program, i, stack)
-        })
-    }
+/// Expressions compressed with powers of theta, from the values of their
+/// steps.
+#[inline]
+fn compressed(steps: &[usize], values: &[Fp], theta: Fp) -> Fp {
+    steps
+        .iter()
+        .fold(Fp::ZERO, |acc, step| acc * theta + values[*step])
 }
 
 /// A committed polynomial: coefficients, blinding factor, and the values
@@ -263,15 +329,12 @@ fn sort_key(v: &Fp) -> [u64; 4] {
     [l[3], l[2], l[1], l[0]]
 }
 
-/// Given the values of the compressed input and table expressions, a
-/// permutation of the inputs (sorted, so equal values are adjacent) and a
-/// permutation of the table such that each input either repeats the one
-/// above or equals the table value on its row. The rows after the usable
-/// ones are random.
+/// Given the values of the compressed input and table expressions on the
+/// usable rows, a permutation of the inputs (sorted, so equal values are
+/// adjacent) and a permutation of the table such that each input either
+/// repeats the one above or equals the table value on its row.
 fn permute_expression_pair(
     usable_rows: usize,
-    n: usize,
-    rng: &mut ProverRng,
     input_expression: &[Fp],
     table_expression: &[Fp],
 ) -> Result<(Vec<Fp>, Vec<Fp>), Error> {
@@ -314,8 +377,6 @@ fn permute_expression_pair(
     if !repeated_input_rows.is_empty() {
         return Err(Error::Synthesis);
     }
-    permuted_input.extend((usable_rows..n).map(|_| rng.next()));
-    permuted_table.extend((usable_rows..n).map(|_| rng.next()));
     Ok((permuted_input, permuted_table))
 }
 
@@ -323,24 +384,80 @@ fn permute_expression_pair(
 fn batch_invert(values: &mut [Fp]) {
     let mut scratch = vec![Fp::ZERO; values.len()];
     Fp::batch_invert(values, &mut scratch);
+    scratch.zeroize();
 }
 
-/// Commits to the values of a polynomial on the domain with a fresh
-/// blinding factor, writes the commitment to the transcript, and keeps the
-/// polynomial in the forms needed later.
+/// Commits to polynomials given by their values on the domain, each with
+/// its blinding factor, and puts them in the forms needed later. The
+/// commitments are computed side by side; the caller writes them to the
+/// transcript, in order.
 fn commit_values(
     params: &Params,
     domain: &EvaluationDomain,
-    rng: &mut ProverRng,
-    transcript: &mut TranscriptWrite,
-    values: &[Fp],
-) -> Result<Committed, Error> {
-    let blind = rng.next();
-    let commitment = params.commit_lagrange(values, blind).to_affine();
-    transcript.write_point(&commitment)?;
-    let poly = domain.lagrange_to_coeff(values.to_vec());
-    let coset = domain.coeff_to_extended(poly.clone());
-    Ok(Committed { poly, blind, coset })
+    polys: &[(&[Fp], Fp)],
+) -> Vec<(vesta::Affine, Committed)> {
+    par::map(polys, |_, (values, blind)| {
+        let commitment = params.commit_lagrange(values, *blind).to_affine();
+        let poly = domain.lagrange_to_coeff(values.to_vec());
+        let coset = domain.coeff_to_extended(poly.clone());
+        (
+            commitment,
+            Committed {
+                poly,
+                blind: *blind,
+                coset,
+            },
+        )
+    })
+}
+
+/// Checks the shape of what a proof is asked for; returns the number of
+/// usable rows.
+fn check_shape(
+    params: &Params,
+    pk: &ProvingKey,
+    circuits: usize,
+    instances: &[&[&[Fp]]],
+) -> Result<usize, Error> {
+    let meta = &pk.vk.cs;
+    let n = params.n;
+    if params.g_lagrange.len() != n || pk.vk.domain.n != n {
+        return Err(Error::NotEnoughRows);
+    }
+    if circuits != instances.len() {
+        return Err(Error::InvalidInstances);
+    }
+    let usable_rows = n - (meta.blinding_factors() + 1);
+    for instance in instances.iter() {
+        if instance.len() != meta.num_instance_columns
+            || instance.iter().any(|values| values.len() > usable_rows)
+        {
+            return Err(Error::InvalidInstances);
+        }
+    }
+    Ok(usable_rows)
+}
+
+/// Synthesizes a circuit to obtain its witness: the advice columns.
+fn synthesize_advice<C: Circuit>(
+    pk: &ProvingKey,
+    circuit: &C,
+    instances: &[&[Fp]],
+    usable_rows: usize,
+) -> Result<Secret, Error> {
+    let meta = &pk.vk.cs;
+    let mut cs = ConstraintSystem::default();
+    let config = circuit.configure(&mut cs);
+    let mut witness = WitnessCollection {
+        advice: Secret(vec![
+            vec![Fp::ZERO; pk.vk.domain.n];
+            meta.num_advice_columns
+        ]),
+        instances,
+        usable_rows,
+    };
+    synthesize(&mut witness, circuit, config, meta.constants.clone())?;
+    Ok(witness.advice)
 }
 
 /// Creates a proof that each of `circuits` is satisfied with the
@@ -351,6 +468,9 @@ fn commit_values(
 ///
 /// The proof is not checked: with a witness that does not satisfy the
 /// circuit this returns either an error or a proof that will not verify.
+///
+/// With the `std` feature the work is split over several threads (see
+/// `set_max_threads`); the proof does not depend on their number.
 pub fn create_proof<C: Circuit>(
     params: &Params,
     pk: &ProvingKey,
@@ -358,21 +478,45 @@ pub fn create_proof<C: Circuit>(
     instances: &[&[&[Fp]]],
     random: &[u8; 64],
 ) -> Result<Vec<u8>, Error> {
+    let usable_rows = check_shape(params, pk, circuits.len(), instances)?;
+    let advice = circuits
+        .iter()
+        .zip(instances.iter())
+        .map(|(circuit, instances)| synthesize_advice(pk, circuit, instances, usable_rows))
+        .collect::<Result<Vec<Secret>, Error>>()?;
+    prove(params, pk, advice, instances, random)
+}
+
+/// [`create_proof`] for circuits that can be shared between threads: they
+/// are synthesized side by side too. The proof is the same.
+pub(crate) fn create_proof_sync<C: Circuit + Sync>(
+    params: &Params,
+    pk: &ProvingKey,
+    circuits: &[C],
+    instances: &[&[&[Fp]]],
+    random: &[u8; 64],
+) -> Result<Vec<u8>, Error> {
+    let usable_rows = check_shape(params, pk, circuits.len(), instances)?;
+    let advice = par::map(circuits, |i, circuit| {
+        synthesize_advice(pk, circuit, instances[i], usable_rows)
+    })
+    .into_iter()
+    .collect::<Result<Vec<Secret>, Error>>()?;
+    prove(params, pk, advice, instances, random)
+}
+
+/// Creates the proof from the witnesses of the circuits.
+fn prove(
+    params: &Params,
+    pk: &ProvingKey,
+    advice: Vec<Secret>,
+    instances: &[&[&[Fp]]],
+    random: &[u8; 64],
+) -> Result<Vec<u8>, Error> {
     let vk = &pk.vk;
     let meta = &vk.cs;
     let domain = &vk.domain;
     let n = params.n;
-    if params.g_lagrange.len() != n || domain.n != n {
-        return Err(Error::NotEnoughRows);
-    }
-    if circuits.len() != instances.len() {
-        return Err(Error::InvalidInstances);
-    }
-    for instance in instances.iter() {
-        if instance.len() != meta.num_instance_columns {
-            return Err(Error::InvalidInstances);
-        }
-    }
 
     let mut rng = ProverRng::new(random);
     let mut transcript = TranscriptWrite::new();
@@ -404,9 +548,6 @@ pub fn create_proof<C: Circuit>(
     for instance in instances.iter() {
         let mut instance_values = Vec::with_capacity(instance.len());
         for values in instance.iter() {
-            if values.len() > usable_rows {
-                return Err(Error::InvalidInstances);
-            }
             let mut poly = vec![Fp::ZERO; n];
             poly[..values.len()].copy_from_slice(values);
             let commitment = params.commit_lagrange(values, Fp::ONE).to_affine();
@@ -418,144 +559,180 @@ pub fn create_proof<C: Circuit>(
         instance_parts.push((instance_values, instance_polys, instance_cosets));
     }
 
-    // The advice columns: synthesized, blinded, committed.
-    let mut statements = Vec::with_capacity(circuits.len());
-    for ((circuit, instances), (instance_values, instance_polys, instance_cosets)) in
-        circuits.iter().zip(instances.iter()).zip(instance_parts)
+    // The advice columns: synthesized and blinded, one statement after the
+    // other.
+    let mut statements = Vec::with_capacity(advice.len());
+    for (mut advice_values, (instance_values, instance_polys, instance_cosets)) in
+        advice.into_iter().zip(instance_parts)
     {
-        let mut cs = ConstraintSystem::default();
-        let config = circuit.configure(&mut cs);
-        let mut witness = WitnessCollection {
-            advice: Secret(vec![vec![Fp::ZERO; n]; meta.num_advice_columns]),
-            instances,
-            usable_rows,
-        };
-        // Synthesize the circuit to obtain the witness and other
-        // information.
-        synthesize(&mut witness, circuit, config, meta.constants.clone())?;
-        let mut advice_values = witness.advice;
-
         // Add blinding factors to advice columns
         for advice in advice_values.0.iter_mut() {
             for cell in advice[usable_rows..].iter_mut() {
                 *cell = rng.next();
             }
         }
-        // Compute commitments to advice column polynomials
+        // The blinding factors of the commitments to the advice columns.
         let advice_blinds: Vec<Fp> = advice_values.0.iter().map(|_| rng.next()).collect();
-        let commitments: Vec<vesta::Point> = advice_values
-            .0
-            .iter()
-            .zip(advice_blinds.iter())
-            .map(|(poly, blind)| params.commit_lagrange(poly, *blind))
-            .collect();
-        let mut affine = vec![vesta::Affine::IDENTITY; commitments.len()];
-        vesta::Point::batch_normalize(&commitments, &mut affine);
-        for commitment in &affine {
-            transcript.write_point(commitment)?;
-        }
-        let advice_polys = Secret(to_coeff(&advice_values.0));
-        let advice_cosets = Secret(to_extended(&advice_polys.0));
         statements.push(Statement {
             instance_values,
             instance_polys,
             instance_cosets,
             advice_values,
-            advice_polys,
-            advice_cosets,
+            advice_polys: Secret(Vec::new()),
+            advice_cosets: Secret(Vec::new()),
             advice_blinds,
             lookups: Vec::new(),
             permutation_sets: Vec::new(),
         });
     }
+    // Compute commitments to advice column polynomials
+    {
+        let columns: Vec<(&[Fp], Fp)> = statements
+            .iter()
+            .flat_map(|statement| {
+                statement
+                    .advice_values
+                    .0
+                    .iter()
+                    .map(|values| &values[..])
+                    .zip(statement.advice_blinds.iter().copied())
+            })
+            .collect();
+        let mut committed = commit_values(params, domain, &columns).into_iter();
+        drop(columns);
+        for statement in statements.iter_mut() {
+            for _ in 0..meta.num_advice_columns {
+                let (commitment, mut column) = committed.next().expect("one for each column");
+                transcript.write_point(&commitment)?;
+                statement
+                    .advice_polys
+                    .0
+                    .push(core::mem::take(&mut column.poly));
+                statement
+                    .advice_cosets
+                    .0
+                    .push(core::mem::take(&mut column.coset));
+            }
+        }
+    }
 
-    // Compile the expressions once.
-    let gate_programs: Vec<Vec<Op>> = meta
+    // Compile the expressions once: the lookups alone on the domain, and
+    // everything on the extended domain.
+    let lookup_graphs: Vec<(Graph, LookupSteps)> = meta
+        .lookups
+        .iter()
+        .map(|lookup| {
+            let mut graph = Graph::new(n, 1);
+            let steps = LookupSteps {
+                input: graph.add_all(&lookup.input_expressions),
+                table: graph.add_all(&lookup.table_expressions),
+            };
+            (graph, steps)
+        })
+        .collect();
+    let mut graph = Graph::new(ext_n, ext_step);
+    let gate_steps: Vec<usize> = meta
         .gates
         .iter()
         .flat_map(|gate| gate.polys.iter())
-        .map(|poly| {
-            let mut program = Vec::new();
-            compile(poly, &mut program);
-            program
-        })
+        .map(|poly| graph.add(poly))
         .collect();
-    let compile_all = |expressions: &[Expression]| -> Vec<Vec<Op>> {
-        expressions
-            .iter()
-            .map(|e| {
-                let mut program = Vec::new();
-                compile(e, &mut program);
-                program
-            })
-            .collect()
-    };
-    let lookup_programs: Vec<LookupPrograms> = meta
+    let lookup_steps: Vec<LookupSteps> = meta
         .lookups
         .iter()
-        .map(|lookup| LookupPrograms {
-            input: compile_all(&lookup.input_expressions),
-            table: compile_all(&lookup.table_expressions),
+        .map(|lookup| LookupSteps {
+            input: graph.add_all(&lookup.input_expressions),
+            table: graph.add_all(&lookup.table_expressions),
         })
         .collect();
-    let mut stack: Vec<Fp> = Vec::with_capacity(64);
 
     // Sample theta challenge for keeping lookup columns linearly independent
     let theta = transcript.squeeze_challenge();
 
     // The permuted input and table columns of each lookup.
-    for statement in statements.iter_mut() {
-        let columns = Columns {
-            fixed: &pk.fixed_values,
-            advice: &statement.advice_values.0,
-            instance: &statement.instance_values,
-            len: n,
-            step: 1,
-        };
-        let mut lookups = Vec::with_capacity(lookup_programs.len());
-        for programs in lookup_programs.iter() {
-            let compressed_input: Vec<Fp> = (0..n)
-                .map(|i| {
-                    LookupPrograms::compressed(&programs.input, &columns, theta, i, &mut stack)
-                })
-                .collect();
-            let compressed_table: Vec<Fp> = (0..n)
-                .map(|i| {
-                    LookupPrograms::compressed(&programs.table, &columns, theta, i, &mut stack)
-                })
-                .collect();
-            let (permuted_input_values, permuted_table_values) = permute_expression_pair(
-                usable_rows,
-                n,
-                &mut rng,
-                &compressed_input,
-                &compressed_table,
-            )?;
-            let permuted_input = commit_values(
-                params,
-                domain,
-                &mut rng,
-                &mut transcript,
-                &permuted_input_values,
-            )?;
-            let permuted_table = commit_values(
-                params,
-                domain,
-                &mut rng,
-                &mut transcript,
-                &permuted_table_values,
-            )?;
-            lookups.push(LookupState {
+    {
+        // What does not depend on an order, for every lookup of every
+        // statement: the compressed expressions and their permutations on
+        // the usable rows.
+        let work: Vec<(&Statement, &(Graph, LookupSteps))> = statements
+            .iter()
+            .flat_map(|statement| lookup_graphs.iter().map(move |lookup| (statement, lookup)))
+            .collect();
+        type Permuted = (Vec<Fp>, Vec<Fp>, Vec<Fp>, Vec<Fp>);
+        let permuted = par::map(&work, |_, (statement, (graph, steps))| {
+            let columns = Columns {
+                fixed: &pk.fixed_values,
+                advice: &statement.advice_values.0,
+                instance: &statement.instance_values,
+            };
+            let mut values = graph.scratch();
+            let mut compressed_input = Vec::with_capacity(n);
+            let mut compressed_table = Vec::with_capacity(n);
+            for i in 0..n {
+                graph.run(&columns, i, &mut values);
+                compressed_input.push(compressed(&steps.input, &values, theta));
+                compressed_table.push(compressed(&steps.table, &values, theta));
+            }
+            values.zeroize();
+            let result: Result<Permuted, Error> =
+                permute_expression_pair(usable_rows, &compressed_input, &compressed_table).map(
+                    |(permuted_input, permuted_table)| {
+                        (
+                            compressed_input,
+                            compressed_table,
+                            permuted_input,
+                            permuted_table,
+                        )
+                    },
+                );
+            result
+        });
+        drop(work);
+        // The rows after the usable ones are random; then the blinding
+        // factors of the two commitments.
+        let mut parts = Vec::with_capacity(permuted.len());
+        for result in permuted {
+            let (compressed_input, compressed_table, mut permuted_input, mut permuted_table) =
+                result?;
+            permuted_input.extend((usable_rows..n).map(|_| rng.next()));
+            permuted_table.extend((usable_rows..n).map(|_| rng.next()));
+            let blinds = [rng.next(), rng.next()];
+            parts.push((
                 compressed_input,
                 compressed_table,
-                permuted_input_values,
-                permuted_table_values,
                 permuted_input,
                 permuted_table,
-                product: None,
-            });
+                blinds,
+            ));
         }
-        statement.lookups = lookups;
+        let polys: Vec<(&[Fp], Fp)> = parts
+            .iter()
+            .flat_map(|(_, _, input, table, blinds)| {
+                [(&input[..], blinds[0]), (&table[..], blinds[1])]
+            })
+            .collect();
+        let mut committed = commit_values(params, domain, &polys).into_iter();
+        drop(polys);
+        let mut parts = parts.into_iter();
+        for statement in statements.iter_mut() {
+            for _ in 0..lookup_graphs.len() {
+                let (compressed_input, compressed_table, input, table, _) =
+                    parts.next().expect("one for each lookup");
+                let (commitment, permuted_input) = committed.next().expect("two for each lookup");
+                transcript.write_point(&commitment)?;
+                let (commitment, permuted_table) = committed.next().expect("two for each lookup");
+                transcript.write_point(&commitment)?;
+                statement.lookups.push(LookupState {
+                    compressed_input,
+                    compressed_table,
+                    permuted_input_values: input,
+                    permuted_table_values: table,
+                    permuted_input,
+                    permuted_table,
+                    product: None,
+                });
+            }
+        }
     }
 
     // Sample beta challenge
@@ -565,18 +742,30 @@ pub fn create_proof<C: Circuit>(
 
     // The permutation product polynomials.
     let chunk_len = vk.cs_degree - 2;
-    for statement in statements.iter_mut() {
-        // Each column contributes a factor delta to the coset labels.
-        let mut deltaomega = Fp::ONE;
-        // Track the "last" value from the previous columns set
-        let mut last_z = Fp::ONE;
-        let mut sets = Vec::new();
-        for (columns, permutations) in meta
+    {
+        let column_sets: Vec<_> = meta
             .permutation
             .columns
             .chunks(chunk_len)
             .zip(pk.permutations.chunks(chunk_len))
-        {
+            .collect();
+        // Each column contributes a factor delta to the coset labels.
+        let mut deltaomegas = Vec::with_capacity(column_sets.len());
+        let mut deltaomega = Fp::ONE;
+        for (columns, _) in column_sets.iter() {
+            deltaomegas.push(deltaomega);
+            for _ in columns.iter() {
+                deltaomega *= Fp::DELTA;
+            }
+        }
+        // The factors of the running products, for every set of columns of
+        // every statement.
+        let work: Vec<(&Statement, usize)> = statements
+            .iter()
+            .flat_map(|statement| (0..column_sets.len()).map(move |set| (statement, set)))
+            .collect();
+        let factors = par::map(&work, |_, (statement, set)| {
+            let (columns, permutations) = column_sets[*set];
             let values_of = |column: &Column<Any>| -> &Vec<Fp> {
                 match column.column_type {
                     Any::Advice => &statement.advice_values.0[column.index],
@@ -598,6 +787,7 @@ pub fn create_proof<C: Circuit>(
             }
             batch_invert(&mut modified_values);
             // The numerators: prod (p_j(omega^i) + delta^j omega^i beta + gamma)
+            let mut deltaomega = deltaomegas[*set];
             for column in columns.iter() {
                 let values = values_of(column);
                 let mut cur = deltaomega;
@@ -607,7 +797,21 @@ pub fn create_proof<C: Circuit>(
                 }
                 deltaomega *= Fp::DELTA;
             }
-            // The running product.
+            Secret(vec![modified_values])
+        });
+        drop(work);
+        // The running products, each starting where the previous set of
+        // columns of its statement ended, with random last rows.
+        let mut products = Secret(Vec::with_capacity(factors.len()));
+        let mut blinds = Vec::with_capacity(factors.len());
+        for (index, modified_values) in factors.iter().enumerate() {
+            let modified_values = &modified_values.0[0];
+            // Track the "last" value from the previous columns set
+            let last_z = if index % column_sets.len() == 0 {
+                Fp::ONE
+            } else {
+                products.0[index - 1][n - (blinding_factors + 1)]
+            };
             let mut z = Vec::with_capacity(n);
             z.push(last_z);
             for row in 1..n {
@@ -616,22 +820,33 @@ pub fn create_proof<C: Circuit>(
             for z in z[n - blinding_factors..].iter_mut() {
                 *z = rng.next();
             }
-            // Set new "last" value
-            last_z = z[n - (blinding_factors + 1)];
-            sets.push(commit_values(
-                params,
-                domain,
-                &mut rng,
-                &mut transcript,
-                &z,
-            )?);
+            products.0.push(z);
+            blinds.push(rng.next());
         }
-        statement.permutation_sets = sets;
+        drop(factors);
+        let polys: Vec<(&[Fp], Fp)> = products
+            .0
+            .iter()
+            .map(|z| &z[..])
+            .zip(blinds.iter().copied())
+            .collect();
+        let mut committed = commit_values(params, domain, &polys).into_iter();
+        for statement in statements.iter_mut() {
+            for _ in 0..column_sets.len() {
+                let (commitment, set) = committed.next().expect("one for each set");
+                transcript.write_point(&commitment)?;
+                statement.permutation_sets.push(set);
+            }
+        }
     }
 
     // The lookup product polynomials.
-    for statement in statements.iter_mut() {
-        for lookup in statement.lookups.iter_mut() {
+    {
+        let work: Vec<&LookupState> = statements
+            .iter()
+            .flat_map(|statement| statement.lookups.iter())
+            .collect();
+        let factors = par::map(&work, |_, lookup| {
             // Denominator uses the permuted input and table expressions
             let mut lookup_product: Vec<Fp> = lookup
                 .permuted_input_values
@@ -650,29 +865,45 @@ pub fn create_proof<C: Circuit>(
                 *product *= *input_term + beta;
                 *product *= *table_term + gamma;
             }
+            Secret(vec![lookup_product])
+        });
+        drop(work);
+        let mut products = Secret(Vec::with_capacity(factors.len()));
+        let mut blinds = Vec::with_capacity(factors.len());
+        for lookup_product in factors.iter() {
             let mut z = Vec::with_capacity(n);
             let mut state = Fp::ONE;
             z.push(state);
-            for cur in lookup_product.iter().take(n - blinding_factors - 1) {
+            for cur in lookup_product.0[0].iter().take(n - blinding_factors - 1) {
                 state *= *cur;
                 z.push(state);
             }
             z.extend((0..blinding_factors).map(|_| rng.next()));
             debug_assert_eq!(z.len(), n);
-            lookup.product = Some(commit_values(
-                params,
-                domain,
-                &mut rng,
-                &mut transcript,
-                &z,
-            )?);
+            products.0.push(z);
+            blinds.push(rng.next());
+        }
+        drop(factors);
+        let polys: Vec<(&[Fp], Fp)> = products
+            .0
+            .iter()
+            .map(|z| &z[..])
+            .zip(blinds.iter().copied())
+            .collect();
+        let mut committed = commit_values(params, domain, &polys).into_iter();
+        for statement in statements.iter_mut() {
+            for lookup in statement.lookups.iter_mut() {
+                let (commitment, product) = committed.next().expect("one for each lookup");
+                transcript.write_point(&commitment)?;
+                lookup.product = Some(product);
+            }
         }
     }
 
     // A random polynomial that blinds h(X).
     let random_poly: Vec<Fp> = (0..n).map(|_| rng.next()).collect();
     let random_blind = rng.next();
-    transcript.write_point(&params.commit(&random_poly, random_blind).to_affine())?;
+    transcript.write_point(&params.commit_par(&random_poly, random_blind).to_affine())?;
 
     // Obtain challenge for keeping all separate gates linearly independent
     let y = transcript.squeeze_challenge();
@@ -681,93 +912,96 @@ pub fn create_proof<C: Circuit>(
     // every statement, combined with powers of y.
     let mut h_values = vec![Fp::ZERO; ext_n];
     let last_rotation = -((blinding_factors + 1) as i32);
-    // The identity polynomial on the extended coset.
-    let extended_omega = (Fp::ZETA, domain.extended_omega);
-    for statement in statements.iter() {
-        let columns = Columns {
-            fixed: &pk.fixed_cosets,
-            advice: &statement.advice_cosets.0,
-            instance: &statement.instance_cosets,
-            len: ext_n,
-            step: ext_step,
-        };
-        let coset_of = |column: &Column<Any>| -> &Vec<Fp> {
-            match column.column_type {
-                Any::Advice => &statement.advice_cosets.0[column.index],
-                Any::Fixed => &pk.fixed_cosets[column.index],
-                Any::Instance => &statement.instance_cosets[column.index],
-            }
-        };
-        let sets = &statement.permutation_sets;
-        let mut x_coset = extended_omega.0;
-        for (i, h) in h_values.iter_mut().enumerate() {
+    let mask = ext_n - 1;
+    let next_shift = graph.shift(1);
+    let prev_shift = graph.shift(-1);
+    let last_shift = graph.shift(last_rotation);
+    par::chunks_mut(&mut h_values, 64, 1, |start, chunk| {
+        let mut values = graph.scratch();
+        // The identity polynomial on the extended coset.
+        let mut x_coset = Fp::ZETA * domain.extended_omega.pow_vartime(&[start as u64, 0, 0, 0]);
+        for (offset, h) in chunk.iter_mut().enumerate() {
+            let i = start + offset;
             let mut acc = *h;
             let l0 = pk.l0[i];
             let l_last = pk.l_last[i];
             let active_rows = Fp::ONE - (l_last + pk.l_blind[i]);
-            let next = columns.rotated(i, 1);
+            let next = (i + next_shift) & mask;
+            let prev = (i + prev_shift) & mask;
+            let last = (i + last_shift) & mask;
+            for statement in statements.iter() {
+                let columns = Columns {
+                    fixed: &pk.fixed_cosets,
+                    advice: &statement.advice_cosets.0,
+                    instance: &statement.instance_cosets,
+                };
+                let coset_of = |column: &Column<Any>| -> &Vec<Fp> {
+                    match column.column_type {
+                        Any::Advice => &statement.advice_cosets.0[column.index],
+                        Any::Fixed => &pk.fixed_cosets[column.index],
+                        Any::Instance => &statement.instance_cosets[column.index],
+                    }
+                };
+                let sets = &statement.permutation_sets;
+                graph.run(&columns, i, &mut values);
 
-            // The custom gates.
-            for program in gate_programs.iter() {
-                acc = acc * y + columns.run(program, i, &mut stack);
-            }
-
-            // The permutation argument (see the verifier for the
-            // identities).
-            if let Some(first_set) = sets.first() {
-                acc = acc * y + l0 * (Fp::ONE - first_set.coset[i]);
-            }
-            if let Some(last_set) = sets.last() {
-                let z = last_set.coset[i];
-                acc = acc * y + (z.square() - z) * l_last;
-            }
-            let last = columns.rotated(i, last_rotation);
-            for (set, prev) in sets.iter().skip(1).zip(sets.iter()) {
-                acc = acc * y + (set.coset[i] - prev.coset[last]) * l0;
-            }
-            let mut current_delta = beta * x_coset;
-            for ((set, cols), permutation_cosets) in sets
-                .iter()
-                .zip(meta.permutation.columns.chunks(chunk_len))
-                .zip(pk.permutation_cosets.chunks(chunk_len))
-            {
-                let mut left = set.coset[next];
-                for (column, permutation_coset) in cols.iter().zip(permutation_cosets.iter()) {
-                    left *= coset_of(column)[i] + beta * permutation_coset[i] + gamma;
+                // The custom gates.
+                for step in gate_steps.iter() {
+                    acc = acc * y + values[*step];
                 }
-                let mut right = set.coset[i];
-                for column in cols.iter() {
-                    right *= coset_of(column)[i] + current_delta + gamma;
-                    current_delta *= Fp::DELTA;
+
+                // The permutation argument (see the verifier for the
+                // identities).
+                if let Some(first_set) = sets.first() {
+                    acc = acc * y + l0 * (Fp::ONE - first_set.coset[i]);
                 }
-                acc = acc * y + (left - right) * active_rows;
-            }
+                if let Some(last_set) = sets.last() {
+                    let z = last_set.coset[i];
+                    acc = acc * y + (z.square() - z) * l_last;
+                }
+                for (set, prev) in sets.iter().skip(1).zip(sets.iter()) {
+                    acc = acc * y + (set.coset[i] - prev.coset[last]) * l0;
+                }
+                let mut current_delta = beta * x_coset;
+                for ((set, cols), permutation_cosets) in sets
+                    .iter()
+                    .zip(meta.permutation.columns.chunks(chunk_len))
+                    .zip(pk.permutation_cosets.chunks(chunk_len))
+                {
+                    let mut left = set.coset[next];
+                    for (column, permutation_coset) in cols.iter().zip(permutation_cosets.iter()) {
+                        left *= coset_of(column)[i] + beta * permutation_coset[i] + gamma;
+                    }
+                    let mut right = set.coset[i];
+                    for column in cols.iter() {
+                        right *= coset_of(column)[i] + current_delta + gamma;
+                        current_delta *= Fp::DELTA;
+                    }
+                    acc = acc * y + (left - right) * active_rows;
+                }
 
-            // The lookup arguments.
-            let prev = columns.rotated(i, -1);
-            for (lookup, programs) in statement.lookups.iter().zip(lookup_programs.iter()) {
-                let product = lookup.product.as_ref().expect("committed above");
-                let z = product.coset[i];
-                let a = lookup.permuted_input.coset[i];
-                let s = lookup.permuted_table.coset[i];
-                acc = acc * y + (Fp::ONE - z) * l0;
-                acc = acc * y + (z.square() - z) * l_last;
-                let left = product.coset[next] * (a + beta) * (s + gamma);
-                let right = z
-                    * (LookupPrograms::compressed(&programs.input, &columns, theta, i, &mut stack)
-                        + beta)
-                    * (LookupPrograms::compressed(&programs.table, &columns, theta, i, &mut stack)
-                        + gamma);
-                acc = acc * y + (left - right) * active_rows;
-                acc = acc * y + (a - s) * l0;
-                acc = acc * y + (a - s) * (a - lookup.permuted_input.coset[prev]) * active_rows;
+                // The lookup arguments.
+                for (lookup, steps) in statement.lookups.iter().zip(lookup_steps.iter()) {
+                    let product = lookup.product.as_ref().expect("committed above");
+                    let z = product.coset[i];
+                    let a = lookup.permuted_input.coset[i];
+                    let s = lookup.permuted_table.coset[i];
+                    acc = acc * y + (Fp::ONE - z) * l0;
+                    acc = acc * y + (z.square() - z) * l_last;
+                    let left = product.coset[next] * (a + beta) * (s + gamma);
+                    let right = z
+                        * (compressed(&steps.input, &values, theta) + beta)
+                        * (compressed(&steps.table, &values, theta) + gamma);
+                    acc = acc * y + (left - right) * active_rows;
+                    acc = acc * y + (a - s) * l0;
+                    acc = acc * y + (a - s) * (a - lookup.permuted_input.coset[prev]) * active_rows;
+                }
             }
-
             *h = acc;
-            x_coset *= extended_omega.1;
+            x_coset *= domain.extended_omega;
         }
-    }
-    stack.zeroize();
+        values.zeroize();
+    });
 
     // Divide by the vanishing polynomial and split h(X) into pieces of n
     // coefficients.
@@ -775,8 +1009,11 @@ pub fn create_proof<C: Circuit>(
     let h_poly = domain.extended_to_coeff(h_values);
     let h_pieces: Vec<&[Fp]> = h_poly.chunks_exact(n).collect();
     let h_blinds: Vec<Fp> = h_pieces.iter().map(|_| rng.next()).collect();
-    for (h_piece, blind) in h_pieces.iter().zip(h_blinds.iter()) {
-        transcript.write_point(&params.commit(h_piece, *blind).to_affine())?;
+    let h_commitments = par::map(&h_pieces, |i, h_piece| {
+        params.commit(h_piece, h_blinds[i]).to_affine()
+    });
+    for commitment in h_commitments.iter() {
+        transcript.write_point(commitment)?;
     }
 
     let x = transcript.squeeze_challenge();

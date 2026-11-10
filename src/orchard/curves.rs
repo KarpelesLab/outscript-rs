@@ -435,14 +435,28 @@ macro_rules! pasta_curve {
                 /// public scalars only.
                 pub fn mul_vartime(&self, scalar: &Scalar) -> Point {
                     let limbs = scalar.to_raw();
+                    // 4-bit fixed windows: table[d] = d * self
+                    let mut table = [Point::IDENTITY; 16];
+                    table[1] = *self;
+                    let mut filled = 1;
                     let mut acc = Point::IDENTITY;
                     let mut started = false;
-                    for i in (0..255).rev() {
+                    for w in (0..64).rev() {
                         if started {
-                            acc = acc.double();
+                            acc = acc.double().double().double().double();
                         }
-                        if (limbs[i / 64] >> (i % 64)) & 1 == 1 {
-                            acc = acc.add(self);
+                        let d = ((limbs[w / 16] >> (4 * (w % 16))) & 15) as usize;
+                        if d != 0 {
+                            // the table is filled as far as needed
+                            while filled < d {
+                                filled += 1;
+                                table[filled] = if filled % 2 == 0 {
+                                    table[filled / 2].double()
+                                } else {
+                                    table[filled - 1].add(self)
+                                };
+                            }
+                            acc = if started { acc.add(&table[d]) } else { table[d] };
                             started = true;
                         }
                     }

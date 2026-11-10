@@ -231,7 +231,7 @@ pub(crate) fn create_proof(
     let q_prime_poly = q_prime_poly.ok_or(Error::Synthesis)?;
 
     let q_prime_blind = rng.next();
-    let q_prime_commitment = params.commit(&q_prime_poly, q_prime_blind).to_affine();
+    let q_prime_commitment = params.commit_par(&q_prime_poly, q_prime_blind).to_affine();
     transcript.write_point(&q_prime_commitment)?;
 
     let x_3 = transcript.squeeze_challenge();

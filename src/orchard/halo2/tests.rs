@@ -164,3 +164,35 @@ fn small_circuit_proof_roundtrip() {
         std::fs::write(format!("{dir}/small_proof.hex"), hex::encode(&proof)).unwrap();
     }
 }
+
+/// Serializes the tests that change the number of threads, so that each
+/// really runs with the number it sets.
+#[cfg(feature = "std")]
+pub(crate) static THREADS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Parameters, keys and proofs do not depend on the number of threads.
+#[cfg(feature = "std")]
+#[test]
+fn threads_do_not_change_keys_or_proofs() {
+    let _guard = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    let run = |threads: usize| {
+        set_max_threads(threads);
+        assert_eq!(max_threads(), threads);
+        let params = Params::new(6);
+        let circuit = mul_circuit();
+        let pk = keygen_pk(&params, &circuit).unwrap();
+        let instance = [Fp::from_u64(42)];
+        let instances: [&[&[Fp]]; 2] = [&[&instance], &[&instance]];
+        let circuits = [circuit.clone(), circuit];
+        let proof = create_proof(&params, &pk, &circuits, &instances, &[3u8; 64]).unwrap();
+        assert_eq!(verify_proof(&params, pk.vk(), &instances, &proof), Ok(()));
+        let points: Vec<String> = params.g_lagrange.iter().map(point).collect();
+        (points, format!("{:?}", pk.vk().pinned()), proof)
+    };
+    let single = run(1);
+    for threads in [2, 3, 7, 64] {
+        assert_eq!(run(threads), single, "{threads} threads");
+    }
+    set_max_threads(0);
+    assert!(max_threads() >= 1);
+}

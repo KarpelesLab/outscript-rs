@@ -562,5 +562,5 @@ pub fn create_proof(
     let columns = halo2_instances(instances);
     let columns: Vec<[&[Fp]; 1]> = columns.iter().map(|c| [&c[..]]).collect();
     let columns: Vec<&[&[Fp]]> = columns.iter().map(|c| &c[..]).collect();
-    halo2::create_proof(&pk.params, &pk.pk, circuits, &columns, random)
+    halo2::create_proof_sync(&pk.params, &pk.pk, circuits, &columns, random)
 }
