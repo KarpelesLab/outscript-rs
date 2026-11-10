@@ -254,6 +254,12 @@ macro_rules! pasta_curve {
                     self.z.is_zero()
                 }
 
+                /// The homogeneous projective coordinates `(X, Y, Z)`, with
+                /// `x = X / Z` and `y = Y / Z` (`Z = 0` for the identity).
+                pub const fn coordinates(&self) -> (Base, Base, Base) {
+                    (self.x, self.y, self.z)
+                }
+
                 /// This point in affine coordinates (one field inversion).
                 pub fn to_affine(&self) -> Affine {
                     let zinv = self.z.invert_or_zero();

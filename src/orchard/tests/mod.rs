@@ -4,6 +4,8 @@
 use serde_json::Value;
 
 mod curves;
+mod gen_tables;
+mod hashes;
 
 /// The rows of a test vector file, without its two header rows.
 pub(crate) fn vectors(json: &str) -> Vec<Vec<Value>> {
