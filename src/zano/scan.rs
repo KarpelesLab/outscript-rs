@@ -231,8 +231,11 @@ impl Wallet {
     /// gives an empty result. Confidential outputs and transparent outputs
     /// to one key are looked at; multisig and gateway outputs are not.
     ///
-    /// The payment id attachment of a version 4 transaction is encrypted
-    /// in a way this module does not implement: it is returned as it is.
+    /// An encrypted payment id attachment of a version 4 transaction is
+    /// not read: hard fork 6 changed how extra entries and attachments are
+    /// encrypted (ChaCha20 under a key from a Keccak sponge that
+    /// `purecrypto` does not expose), which this module does not implement.
+    /// Such transactions carry their payment ids in the outputs.
     pub fn scan_tx(&self, tx: &super::Transaction) -> Result<ScanResult, Error> {
         use super::tx::{TRANSACTION_VERSION_POST_HF6, Variant};
 
@@ -278,15 +281,20 @@ impl Wallet {
                 }
                 _ => None,
             });
+        let hf6 = tx.version >= TRANSACTION_VERSION_POST_HF6;
         if let Some(attachment) = attachment {
+            let encrypted = attachment.flags & TX_SERVICE_ATTACHMENT_ENCRYPT_BODY != 0;
             let mut body = attachment.body.clone();
-            if attachment.flags & TX_SERVICE_ATTACHMENT_ENCRYPT_BODY != 0
-                && tx.version < TRANSACTION_VERSION_POST_HF6
-            {
+            if encrypted && !hf6 {
                 crypt_payment_id(&derivation, &mut body);
             }
-            result.payment_id = Some(body);
-        } else if let Some(id) = result.output_payment_ids.iter().find(|id| **id != 0) {
+            if !(encrypted && hf6) {
+                result.payment_id = Some(body);
+            }
+        }
+        if result.payment_id.is_none()
+            && let Some(id) = result.output_payment_ids.iter().find(|id| **id != 0)
+        {
             result.payment_id = Some(id.to_le_bytes().to_vec());
         }
         Ok(result)

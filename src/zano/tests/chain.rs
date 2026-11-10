@@ -204,6 +204,93 @@ fn tool_build_rings() {
     }
 }
 
+/// The compact form of a `.rings` file the fixtures use: for each member,
+/// the index of its input, then its stealth address, concealing point,
+/// amount commitment and blinded asset id.
+fn rings_to_binary(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        out.push(fields[0].parse::<u8>().unwrap());
+        for field in &fields[1..5] {
+            out.extend_from_slice(&super::h32(field));
+        }
+    }
+    out
+}
+
+/// Reads the compact rings of a fixture: per input with a ring, its
+/// members.
+pub(super) fn rings_from_binary(bytes: &[u8]) -> Vec<Vec<RingMember>> {
+    let mut rings: Vec<(u8, Vec<RingMember>)> = Vec::new();
+    for record in bytes.as_chunks::<129>().0 {
+        let key = |n: usize| -> [u8; 32] { record[1 + 32 * n..33 + 32 * n].try_into().unwrap() };
+        let member = RingMember {
+            global_index: 0,
+            stealth_address: key(0),
+            concealing_point: key(1),
+            amount_commitment: key(2),
+            blinded_asset_id: key(3),
+        };
+        match rings.last_mut() {
+            Some((last, ring)) if *last == record[0] => ring.push(member),
+            _ => rings.push((record[0], vec![member])),
+        }
+    }
+    rings.into_iter().map(|(_, ring)| ring).collect()
+}
+
+/// Copies the transactions named by `ZANO_EXPORT` (`name:txid,...`) and
+/// their rings into the directory `ZANO_FIXTURE_DIR`, and prints what the
+/// chain says of each.
+#[test]
+#[ignore = "needs ZANO_TX_DIR"]
+fn tool_export_fixtures() {
+    let Some(dir) = tool_dir() else { return };
+    let target = std::path::PathBuf::from(std::env::var("ZANO_FIXTURE_DIR").unwrap());
+    std::fs::create_dir_all(&target).unwrap();
+    let block_lines = std::fs::read_to_string(dir.join("blocks.jsonl")).unwrap();
+    let blocks: Vec<serde_json::Value> = block_lines
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for entry in std::env::var("ZANO_EXPORT").unwrap().split(',') {
+        let (name, prefix) = entry.split_once(':').unwrap();
+        let id = hex_files(&dir, "hex")
+            .into_iter()
+            .find(|id| id.starts_with(prefix))
+            .expect("transaction");
+        let text = std::fs::read_to_string(dir.join(format!("{id}.hex"))).unwrap();
+        std::fs::write(
+            target.join(format!("{name}.bin")),
+            hex::decode(text.trim()).unwrap(),
+        )
+        .unwrap();
+        let rings = std::fs::read_to_string(dir.join(format!("{id}.rings")));
+        if let Ok(rings) = &rings {
+            std::fs::write(target.join(format!("{name}.rings")), rings_to_binary(rings)).unwrap();
+        }
+        let block = blocks.iter().find(|block| {
+            block["txs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tx| tx.as_str() == Some(&id))
+        });
+        match block {
+            Some(block) => println!(
+                "FIXTURE {name} {id} height={} block={} base_reward={} total_fee={} rings={}",
+                block["height"],
+                block["id"].as_str().unwrap(),
+                block["base_reward"],
+                block["total_fee"],
+                rings.is_ok(),
+            ),
+            None => println!("FIXTURE {name} {id} rings={}", rings.is_ok()),
+        }
+    }
+}
+
 /// Verifies the proof-of-stake blocks of `pos.jsonl` (collected with the
 /// stake modifier and difficulty the daemon gave before each).
 #[test]
@@ -234,9 +321,7 @@ fn tool_pos() {
             ring: parse_rings(&rings).remove(0),
         };
         let reward = block["base_reward"].as_u64().unwrap();
-        let context = VerifyContext::new(&[&[]])
-            .block_reward(reward)
-            .stake(&stake);
+        let context = VerifyContext::new(&[]).block_reward(reward).stake(&stake);
         println!(
             "{} {id} {:?} | {} {} {} {} {}",
             block["height"],

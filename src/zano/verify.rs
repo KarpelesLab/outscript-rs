@@ -107,6 +107,10 @@ impl<'a> VerifyContext<'a> {
     /// key image (transparent or confidential), in input order, the outputs
     /// its `key_offsets` refer to, in ring order. For a transparent input
     /// only the stealth addresses are used.
+    ///
+    /// The confidential stake input of a proof-of-stake block is the
+    /// exception: its ring, which needs the concealing points too, is in
+    /// the [`StakeContext`], and it has no entry here.
     pub fn new(rings: &'a [&'a [ClsagGgxInput]]) -> Self {
         VerifyContext {
             rings,
@@ -274,7 +278,14 @@ impl Transaction {
             if matches!(input, Variant::Gen { .. }) {
                 continue;
             }
-            let ring = rings.next().ok_or(VerifyError::MissingRing(index))?;
+            // The ring of a Zarcanum stake comes with the stake context.
+            let zarcanum_stake =
+                index == 1 && self.is_pos_coinbase() && matches!(input, Variant::ZcInput(_));
+            let ring = if zarcanum_stake {
+                &[][..]
+            } else {
+                rings.next().ok_or(VerifyError::MissingRing(index))?
+            };
             self.check_input(index, ring, &tx_id, context.stake)?;
         }
 

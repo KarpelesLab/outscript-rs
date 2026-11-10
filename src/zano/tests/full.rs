@@ -678,18 +678,12 @@ fn sign_matches_zanolib() {
     assert_eq!(delegated, signed);
 }
 
-/// What `construct_tx` does and zanolib did not: the ring of a source is
-/// sorted, the outputs are shuffled when the blob asks, the extra entries
-/// and attachments of the blob go into the transaction (encrypted where
-/// the reference encrypts), and the current blob format gets the id, the
-/// derivation and the key images of the change back.
-#[test]
-fn sign_as_construct_tx() {
+/// A small unsigned transaction, to keep the tests below quick: the first
+/// source of the fixture with a ring of three, into its two destinations,
+/// unshuffled; with the wallet and the one-time key of the fixture.
+fn small_ftp() -> (Wallet, FinalizeTxParam, [u8; 32]) {
     let w = wallet();
     let fin = w.parse_finalized(SIGNED).unwrap();
-    let key = Some(&fin.one_time_key);
-    // A small transaction, to keep the test quick: the first source of the
-    // fixture with a ring of three, into the two destinations.
     let mut plain = fin.ftp.clone();
     plain.shuffle = false;
     plain.sources.truncate(1);
@@ -708,26 +702,20 @@ fn sign_as_construct_tx() {
         .unwrap() as u64;
     plain.prepared_destinations[0].amount = 500_000_000_000;
     plain.prepared_destinations[1].amount = 390_000_000_000;
-    let mut shuffled = plain.clone();
+    (w, plain, fin.one_time_key)
+}
+
+/// What `construct_tx` does and zanolib did not, first: the outputs are
+/// shuffled when the blob asks.
+#[test]
+fn sign_shuffles_outputs() {
+    let (w, mut shuffled, key) = small_ftp();
+    let key = Some(&key);
     shuffled.shuffle = true;
-    let reference = w.sign(&mut stream(0), &plain, key).unwrap();
-    assert!(verify_all(&reference.tx, &plain));
-
-    // A ring in any order gives the same transaction: it is sorted, and the
-    // real output found again.
-    let mut ftp = plain.clone();
-    for source in &mut ftp.sources {
-        let real = source.outputs[source.real_output as usize].clone();
-        source.outputs.reverse();
-        source.real_output = source.outputs.iter().position(|o| *o == real).unwrap() as u64;
-    }
-    let signed = w.sign(&mut stream(0), &ftp, key).unwrap();
-    assert_eq!(signed.tx, reference.tx);
-
-    // Shuffled: the same outputs up to their order (which changes what is
-    // derived from the index), and a valid transaction. Some stream gives
-    // the other order.
-    let orders: Vec<Vec<u64>> = (0..4)
+    // The same outputs up to their order (which changes what is derived
+    // from the index), and a valid transaction. Some stream gives the other
+    // order.
+    let orders: Vec<Vec<u64>> = [0u64, 2, 3]
         .map(|seed| {
             let signed = w.sign(&mut stream(seed * 1000), &shuffled, key).unwrap();
             assert!(verify_all(&signed.tx, &shuffled));
@@ -735,13 +723,18 @@ fn sign_as_construct_tx() {
             assert_eq!(found.outputs.len(), 2);
             found.outputs.iter().map(|o| o.amount).collect()
         })
-        .collect();
+        .to_vec();
     assert!(orders.contains(&vec![500_000_000_000, 390_000_000_000]));
     assert!(orders.contains(&vec![390_000_000_000, 500_000_000_000]));
+}
 
-    // Extra entries and attachments are copied; a comment, a receiver and
-    // a flagged attachment are encrypted for the crypt address, with the
-    // checksum that lets both sides find the key again.
+/// Extra entries and attachments are copied; a comment and a flagged
+/// attachment are encrypted for the crypt address, with the checksum that
+/// lets both sides find the key again.
+#[test]
+fn sign_copies_and_encrypts() {
+    let (w, plain, key) = small_ftp();
+    let key = Some(&key);
     let recipient = Wallet::generate(&mut stream(77), 0).unwrap();
     let mut ftp = plain.clone();
     ftp.crypt_address = AccountPublicAddr::from(&recipient.address());
@@ -829,13 +822,28 @@ fn sign_as_construct_tx() {
     let prefix_len = signed.tx.prefix_bytes().len();
     let serialized = &bytes[prefix_len..prefix_len + info.sz as usize];
     assert_eq!((info.cnt, info.hsh), (2, cn_fast_hash(serialized)));
+}
 
-    // The current blob format: sources name their asset, and the signed
-    // blob carries the id, the derivation and the change's key images.
+/// The current blob format: sources name their asset, and the signed blob
+/// carries the id, the derivation and the change's key images. A ring in
+/// any order gives the same transaction: it is sorted, and the real output
+/// found again. Version 4 outputs carry payment ids.
+#[test]
+fn sign_current_format() {
+    let (w, plain, key) = small_ftp();
+    let key = Some(&key);
+    let reference = w.sign(&mut stream(0), &plain, key).unwrap();
+    assert!(verify_all(&reference.tx, &plain));
+    assert_eq!((reference.tx_id, reference.derivation), ([0; 32], [0; 32]));
+    assert!(reference.outs_key_images.is_empty());
+
     let mut ftp = plain.clone();
     ftp.format = FtpFormat::Current;
     for source in &mut ftp.sources {
         source.asset_id = Some(NATIVE_COIN_ASSET_ID);
+        let real = source.outputs[source.real_output as usize].clone();
+        source.outputs.reverse();
+        source.real_output = source.outputs.iter().position(|o| *o == real).unwrap() as u64;
     }
     assert_eq!(FinalizeTxParam::from_bytes(&ftp.to_bytes()).unwrap(), ftp);
     assert_ne!(ftp.to_bytes().len(), plain.to_bytes().len());

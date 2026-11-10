@@ -6,7 +6,7 @@ use purecrypto::zeroize::Zeroize;
 use crate::prelude::*;
 
 use super::ftp::{FinalizeTxParam, FinalizedTx, TxDest, TxSource, TxSourceOutputEntry};
-use super::tx::{AccountPublicAddr, Variant};
+use super::tx::{AccountPublicAddr, TRANSACTION_VERSION_POST_HF6, Variant, mainnet_tx_version};
 use super::{Address, Error, Wallet, crypto};
 
 /// One output of an input's ring — the real output or a decoy — as the
@@ -111,14 +111,18 @@ impl TransferInput {
             separately_signed_tx_complete: false,
             htlc_origin: Vec::new(),
             asset_id: Some(self.asset_id),
-            is_zc_input: true,
+            is_zc_input: self.amount_blinding_mask != [0u8; 32]
+                || self.asset_id_blinding_mask != [0u8; 32],
         })
     }
 }
 
 /// An output to create: `amount` of `asset_id` to `address`.
 ///
-/// A payment id in the address is not attached to the transaction.
+/// The payment id of an integrated address goes into the output of a
+/// version 4 transaction, if it is of eight bytes at most
+/// ([`Error::PaymentIdTooLong`] otherwise); it is not attached to a
+/// transaction of version 2 or 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferDest {
     /// The recipient.
@@ -162,14 +166,42 @@ impl Wallet {
         }
         for dest in dests {
             crypto::point(&dest.asset_id)?;
+            // The payment id of an integrated address goes into a version 4
+            // output, as the eight bytes `convert_payment_id` makes of it.
+            let mut payment_id = 0u64;
+            let id = dest.address.payment_id();
+            if version >= TRANSACTION_VERSION_POST_HF6 && !id.is_empty() {
+                let mut bytes = [0u8; 8];
+                let start = 8usize
+                    .checked_sub(id.len())
+                    .ok_or(Error::PaymentIdTooLong)?;
+                bytes[start..].copy_from_slice(id);
+                payment_id = u64::from_le_bytes(bytes);
+            }
             ftp.prepared_destinations.push(TxDest {
                 amount: dest.amount,
                 addr: vec![AccountPublicAddr::from(&dest.address)],
                 asset_id: dest.asset_id,
+                payment_id,
                 ..Default::default()
             });
         }
         Ok(ftp)
+    }
+
+    /// [`build_transfer`](Self::build_transfer) with the transaction
+    /// version and the hardfork id of a block at `height` of the main
+    /// network ([`mainnet_tx_version`]): the height the transaction is
+    /// expected to be included at, in practice the current one.
+    pub fn build_transfer_at_height(
+        &self,
+        rng: &mut dyn FnMut(&mut [u8]),
+        inputs: &[TransferInput],
+        dests: &[TransferDest],
+        height: u64,
+    ) -> Result<FinalizedTx, Error> {
+        let (version, hardfork_id) = mainnet_tx_version(height);
+        self.build_transfer(rng, inputs, dests, version, u64::from(hardfork_id))
     }
 
     /// Builds and signs a transfer of `inputs` to `dests`

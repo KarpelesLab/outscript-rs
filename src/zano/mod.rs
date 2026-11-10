@@ -1,9 +1,10 @@
 //! Zano: addresses, keys and transactions, built on the primitives the
 //! CryptoNote family shares ([`cryptonote`](crate::cryptonote)).
 //!
-//! This is a port of the Go library `KarpelesLab/zanolib`, checked against
-//! it and against Zano's C++ sources. It covers what an offline signer and a
-//! deposit scanner need for confidential (Zarcanum, post-HF4) transactions:
+//! It started as a port of the Go library `KarpelesLab/zanolib` and now
+//! follows Zano's C++ sources, checked against the main network's
+//! transactions of every era. It covers what an offline signer, a deposit
+//! scanner and a verifier need:
 //!
 //! - **Addresses** ([`Address`], [`AddressType`]): standard, integrated,
 //!   auditable and auditable integrated, with flags and payment ids.
@@ -11,23 +12,38 @@
 //!   from it, view-only wallets, auditable accounts.
 //! - **Scanning**: [`Wallet::key_derivation`] and [`Wallet::scan_output`]
 //!   tell whether an output belongs to the wallet and decode its amount and
-//!   asset, with the view key only and without a heap; `Wallet::scan_tx`
-//!   does a whole `Transaction` and recovers the payment id.
+//!   asset — the native coin or any other — with the view key only and
+//!   without a heap; `Wallet::scan_tx` does a whole `Transaction`, and
+//!   recovers the payment id of the transaction and of each output.
 //! - **Signing**: `Wallet::parse_ftp` reads the unsigned transaction a
 //!   view-only `simplewallet` prepares (`FinalizeTxParam`),
-//!   `Wallet::sign` builds and signs it, and `FinalizedTx::encrypt` gives
-//!   the blob that wallet broadcasts. `Wallet::build_transfer` does without
-//!   the wallet, from scanned outputs and rings of decoys.
+//!   `Wallet::sign` builds and signs it as `construct_tx` does, and
+//!   `FinalizedTx::encrypt` gives the blob that wallet broadcasts.
+//!   `Wallet::build_transfer` does without the wallet, from scanned outputs
+//!   and rings of decoys; `Wallet::build_transfer_at_height` picks the
+//!   transaction version of the height.
+//! - **Verification**: `Transaction::verify` checks a whole transaction of
+//!   any version given the outputs its rings refer to — the signatures of
+//!   its inputs, the asset surjection, range and balance proofs, the
+//!   proofs of an asset operation, and the stake proof of a
+//!   proof-of-stake block (`StakeContext`).
 //! - **Proofs**, each with its verifier: the CLSAG-GGX ring signature
-//!   (`generate_clsag_ggx`), Bulletproofs+ range proofs
+//!   (`generate_clsag_ggx`), the CryptoNote ring signature of transparent
+//!   inputs (`generate_ring_signature`), Bulletproofs+ range proofs
 //!   (`generate_bpp`), the BGE one-out-of-many proof of asset surjection
 //!   (`generate_bge_proof`), the vector UG aggregation proof and the
 //!   double Schnorr proof of the balance
 //!   (`generate_vector_ug_aggregation_proof`,
-//!   `generate_double_schnorr_sig`); `Transaction::verify_proofs` and
-//!   `Transaction::verify_input` check a whole transaction.
-//! - **Wire formats**: `Transaction` and its `Variant`s, the wallet
-//!   blobs, ChaCha8 ([`chacha8`]) and epee portable storage (`epee`).
+//!   `generate_double_schnorr_sig`), the Schnorr signature of asset owners
+//!   (`generate_schnorr_sig`); and, to verify only, the Zarcanum
+//!   proof-of-stake proof with its range proof and ring signature
+//!   (`verify_zarcanum_proof`, `verify_bppe`, `verify_clsag_ggxxg`).
+//! - **Assets**: asset operations (`AssetDescriptorOperation`), the
+//!   derivation of an asset id (`AssetDescriptorBase::asset_id`), and
+//!   `Transaction::verify_asset_operation`.
+//! - **Wire formats**: `Transaction` and its `Variant`s for versions 0 to
+//!   4, the wallet blobs, ChaCha8 ([`chacha8`]) and epee portable storage
+//!   (`epee`).
 //!
 //! The network client (`zanorpc`) and threshold signing (`zanompc`) of
 //! zanolib are not ported; `InputSigner` is the seam the latter plugs
@@ -87,25 +103,32 @@
 //!
 //! # Compatibility
 //!
-//! The formats are those of Zano 2.1.x (transaction versions 2 and 3). The
-//! wallet blobs are not versioned and follow the wallet's C++ structures:
-//! they match Zano 2.1.0.382 to 2.1.19.477, like zanolib. Where zanolib and
-//! Zano disagree, this module follows Zano:
+//! The transaction formats are those of Zano's main network up to hard
+//! fork 7: transaction versions 0 and 1 (transparent, before hard fork 4 at
+//! block 2 555 000), 2 (Zarcanum), 3 (hard fork 5, block 3 076 400) and 4
+//! (hard forks 6 and 7, block 3 833 000), which `mainnet_tx_version` tells
+//! from a height. The gateway types of hard fork 6, which the main network
+//! never accepted, are parsed and nothing more.
+//!
+//! The wallet blobs are not versioned and follow the wallet's C++
+//! structures, in two layouts (`FtpFormat`): that of Zano 2.1.0.382 to
+//! 2.1.19.477, and that of Zano 2.2. Parsing tells them apart.
+//!
+//! Where zanolib and Zano disagree, this module follows Zano:
 //!
 //! - varints are the standard ones (zanolib writes 128 as the single byte
-//!   `0x80`);
+//!   `0x80`), and the output index of a `ref_by_id` is one;
 //! - the range proof is right for three and more outputs, and the
 //!   surjection proof for more than four inputs (zanolib's are not);
 //! - an output's mixing attribute comes from the unsigned transaction;
 //! - the concealing point of a scanned output is compared after the
-//!   multiplication by 8.
+//!   multiplication by 8;
+//! - signing sorts the rings, shuffles the outputs when asked, copies and
+//!   encrypts the extra entries and attachments, and shows the bare native
+//!   asset id where `construct_tx` does.
 //!
-//! Like zanolib, signing only handles confidential inputs and outputs,
-//! keeps the destinations in order (no shuffling), does not copy the
-//! unsigned transaction's extra entries and attachments into the
-//! transaction, and blinds every asset id (the
-//! `tdef_explicit_native_asset_id` destination flag is not acted on), all of
-//! which a verifier accepts.
+//! What signing does not build is listed with `Wallet::sign`, what
+//! verification leaves to the chain with `Transaction::verify`.
 
 mod address;
 #[cfg(feature = "alloc")]
