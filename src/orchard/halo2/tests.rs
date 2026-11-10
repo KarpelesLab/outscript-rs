@@ -101,3 +101,47 @@ fn orchard_parameters_match_the_reference() {
     check_params(&Params::new(11), lines[1], true);
     check_params(&Params::for_verifier(11, 10), lines[1], false);
 }
+
+/// Our proofs verify, and are rejected for other public inputs. Set
+/// `OUTSCRIPT_DUMP_DIR` to write the proof to `small_proof.hex` there, for
+/// the reference verifier (`small <hex>` in the scratch project accepts
+/// it).
+#[test]
+fn small_circuit_proof_roundtrip() {
+    let params = Params::new(4);
+    let circuit = mul_circuit();
+    let pk = keygen_pk(&params, &circuit).unwrap();
+    let instance = [Fp::from_u64(42)];
+    let instances: [&[&[Fp]]; 2] = [&[&instance], &[&instance]];
+    let circuits = [circuit.clone(), circuit];
+    let proof = create_proof(&params, &pk, &circuits, &instances, &[3u8; 64]).unwrap();
+    assert_eq!(verify_proof(&params, pk.vk(), &instances, &proof), Ok(()));
+    let wrong = [Fp::from_u64(41)];
+    let bad: [&[&[Fp]]; 2] = [&[&wrong], &[&instance]];
+    assert!(verify_proof(&params, pk.vk(), &bad, &proof).is_err());
+    // the proof has the size the reference produces
+    let reference = REFERENCE.lines().nth(3).unwrap();
+    assert_eq!(proof.len() * 2, reference.len() - "proof=".len());
+    // other randomness, another proof
+    let other = create_proof(&params, &pk, &circuits, &instances, &[4u8; 64]).unwrap();
+    assert_ne!(proof, other);
+    assert_eq!(verify_proof(&params, pk.vk(), &instances, &other), Ok(()));
+    // a witness outside the lookup table cannot be proven
+    let bad_circuit = Mul {
+        a: Value::known(Fp::from_u64(8)),
+        b: Fp::from_u64(6),
+    };
+    let bad_instance = [Fp::from_u64(48)];
+    let r = create_proof(
+        &params,
+        &pk,
+        &[bad_circuit],
+        &[&[&bad_instance]],
+        &[5u8; 64],
+    );
+    assert!(r.is_err());
+    #[cfg(feature = "std")]
+    if let Ok(dir) = std::env::var("OUTSCRIPT_DUMP_DIR") {
+        std::fs::write(format!("{dir}/small_proof.hex"), hex::encode(&proof)).unwrap();
+    }
+}

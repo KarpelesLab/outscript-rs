@@ -163,7 +163,7 @@ pub(crate) struct EvaluationDomain {
     pub(crate) extended_k: u32,
     pub(crate) omega: Fp,
     pub(crate) omega_inv: Fp,
-    extended_omega: Fp,
+    pub(crate) extended_omega: Fp,
     extended_omega_inv: Fp,
     quotient_poly_degree: usize,
     ifft_divisor: Fp,

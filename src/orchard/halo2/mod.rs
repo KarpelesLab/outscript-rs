@@ -27,6 +27,7 @@ mod multiopen;
 mod pdqsort;
 pub mod plonk;
 mod poly;
+mod prover;
 #[cfg(test)]
 mod tests;
 mod transcript;
@@ -35,6 +36,7 @@ mod verifier;
 
 pub use commitment::Params;
 pub use keygen::{PinnedVerificationKey, ProvingKey, VerifyingKey, keygen_pk, keygen_vk};
+pub use prover::create_proof;
 pub use value::Value;
 pub use verifier::{BatchVerifier, verify_proof};
 
