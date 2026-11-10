@@ -32,6 +32,8 @@
 //! decompositions the circuits consume ([`pedersen::bits_le`],
 //! [`note::note_commitment_bits`]).
 
+#[cfg(feature = "zcash-sapling-prover")]
+pub mod builder;
 pub mod bundle;
 #[cfg(feature = "zcash-sapling-prover")]
 pub mod circuit;
