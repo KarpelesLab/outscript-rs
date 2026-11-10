@@ -1,0 +1,6 @@
+# Text embedded with include_str!/include_bytes! must be the same bytes on
+# every platform: keep LF line endings on checkout.
+* text=auto eol=lf
+*.bin binary
+*.vk binary
+*.params binary

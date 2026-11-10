@@ -55,8 +55,10 @@ impl WordList {
     fn word(&self, index: usize) -> Option<&'static str> {
         let start = usize::from(*self.offsets.get(index)?);
         let end = usize::from(*self.offsets.get(index + 1)?);
-        // Without the newline.
-        self.text.get(start..end.checked_sub(1)?)
+        // Without the newline, nor the carriage return a checkout that
+        // converts line endings puts before it.
+        let word = self.text.get(start..end.checked_sub(1)?)?;
+        Some(word.strip_suffix('\r').unwrap_or(word))
     }
 
     /// The words, in order.
