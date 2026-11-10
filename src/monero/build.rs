@@ -22,9 +22,11 @@ use crate::prelude::*;
 
 /// An output to spend, with the ring that hides it.
 ///
-/// Choosing the decoys (and fetching their keys and commitments from a
-/// daemon) is up to the caller; the choice matters for privacy, and wallets
-/// follow the reference's distribution.
+/// The choice of the decoys matters for privacy, and wallets follow the
+/// reference wallet's distribution: [`DecoyPicker`](super::DecoyPicker)
+/// picks the candidates that way and [`build_ring`](super::build_ring)
+/// makes the three ring fields here from what the daemon says of them.
+/// Fetching is up to the caller.
 #[derive(Clone)]
 pub struct TransactionInput {
     /// The ring: the output being spent and its decoys, ordered by global
@@ -232,7 +234,9 @@ impl TransactionBuilder {
         self
     }
 
-    /// Sets the fee, in atomic units (zero by default).
+    /// Sets the fee, in atomic units (zero by default): see
+    /// [`estimate_fee`](super::estimate_fee) for what the reference wallet
+    /// pays.
     pub fn fee(&mut self, fee: u64) -> &mut Self {
         self.fee = fee;
         self

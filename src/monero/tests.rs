@@ -1269,4 +1269,6 @@ mod build;
 #[cfg(feature = "alloc")]
 mod legacy;
 #[cfg(feature = "alloc")]
+mod wallet;
+#[cfg(feature = "alloc")]
 mod with_alloc;

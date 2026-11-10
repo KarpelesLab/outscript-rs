@@ -3,6 +3,7 @@
 
 use super::bulletproofs_plus::BulletproofPlus;
 use super::clsag::{Clsag, RingMember};
+use super::fee::weight_clawback;
 use super::legacy_sig::{
     BORROMEAN_PROOF_LEN, borromean_verify, check_ring_signature, key_image_point,
 };
@@ -989,6 +990,34 @@ impl Transaction {
         h.update(&self.base_hash());
         h.update(&cn_fast_hash(&proofs));
         h.finalize()
+    }
+
+    /// The weight of the transaction, which fees and block limits are
+    /// counted in (`get_transaction_weight`): its size in bytes, plus, when
+    /// it has a Bulletproof or Bulletproof+ over more than two outputs, a
+    /// clawback of most of what aggregating the range proofs saved (see
+    /// [`estimate_tx_weight`](super::estimate_tx_weight)).
+    pub fn weight(&self) -> u64 {
+        let size = self.serialize().len() as u64;
+        if self.prefix.version < 2 {
+            return size;
+        }
+        let rct = &self.rct;
+        let plus = rct.rct_type == RCT_TYPE_BULLETPROOF_PLUS;
+        let rounds: Vec<usize> = if plus {
+            rct.bulletproofs_plus.iter().map(|p| p.l.len()).collect()
+        } else if has_bulletproofs(rct.rct_type) {
+            rct.bulletproofs.iter().map(|p| p.l.len()).collect()
+        } else {
+            return size;
+        };
+        // The outputs the proofs are padded to.
+        let mut padded = 0u64;
+        for rounds in rounds {
+            let extra = u32::try_from(rounds.saturating_sub(6)).unwrap_or(u32::MAX);
+            padded = padded.saturating_add(1u64.checked_shl(extra).unwrap_or(u64::MAX));
+        }
+        size.saturating_add(weight_clawback(padded, plus))
     }
 
     /// The fee: what the RingCT data states for a version 2 transaction,

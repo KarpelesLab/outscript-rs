@@ -12,43 +12,59 @@
 //!   and printed as base58 without a heap.
 //! - **Keys**: [`AccountKeys`] (spend and view secrets, from a seed or a
 //!   spend key), the view-only [`ViewKeys`], subaddresses by
-//!   [`SubaddressIndex`], and the 25-word English mnemonic
-//!   ([`seed_from_mnemonic`], [`seed_to_mnemonic_words`]).
+//!   [`SubaddressIndex`], and the 25-word mnemonic in English
+//!   ([`seed_from_mnemonic`], [`seed_to_mnemonic_words`]) and the eleven
+//!   other languages of the reference wallet ([`MnemonicLanguage`],
+//!   [`seed_from_mnemonic_in`], [`seed_from_mnemonic_any`]).
 //! - **Scanning**: [`ViewKeys::key_derivation`] and
 //!   [`ViewKeys::check_output`] recognise an output (view tag first, then the
 //!   main address or a subaddress from the caller's table);
-//!   [`decode_amount`] opens its amount and mask against the commitment;
+//!   [`decode_amount`] opens its amount and mask against the commitment
+//!   ([`decode_amount_legacy`] for the outputs of 2017 and 2018);
 //!   [`AccountKeys::output_key_image`] gives the one-time secret key and the
 //!   key image. With `alloc`, `ViewKeys::scan_transaction` does all of it
-//!   for a parsed transaction.
+//!   for a parsed transaction of any format, back to the first block.
 //! - **The extra field**: [`parse_extra`] and the lookups on top of it
 //!   ([`tx_public_key`], [`additional_public_key`], [`payment_id`]).
 //! - **RingCT**: Pedersen commitments ([`commit`], [`zero_commit`],
 //!   [`verify_balance`]) and CLSAG ring signatures ([`clsag_sign`],
 //!   [`clsag_verify`]) without a heap; with `alloc`, the Bulletproofs+ range
-//!   proof (`BulletproofPlus`).
+//!   proof (`BulletproofPlus`: proving, verifying, and verifying in
+//!   batches).
+//! - **The older formats**, verification only: the ring signatures of
+//!   version 1 transactions ([`check_ring_signature`]) and the Borromean
+//!   range proof ([`borromean_verify`]) without a heap; with `alloc`, MLSAG
+//!   ring signatures (`Mlsag`) and the original Bulletproofs
+//!   (`Bulletproof`).
 //! - **Transactions** (with `alloc`): `Transaction` parses and serializes
 //!   every format the chain has seen — version 1, and RingCT types 0 to 6 —
-//!   and computes the transaction id and the hash the signatures sign;
-//!   for the current format (version 2, RingCT type 6: CLSAG and
-//!   Bulletproofs+) it also verifies the ring signatures, the range proof
-//!   and the balance. `TransactionBuilder` builds and signs such a
-//!   transaction from the caller's inputs, rings and destinations.
+//!   computes the transaction id, the hash the signatures sign and the
+//!   weight, and verifies the ring signatures, the range proofs and the
+//!   balance of all of them (`Transaction::verify`). `TransactionBuilder`
+//!   builds and signs a transaction of the current format (version 2,
+//!   RingCT type 6: CLSAG and Bulletproofs+) from the caller's inputs,
+//!   rings and destinations.
+//! - **Wallet arithmetic**: weights and fees as the reference wallet
+//!   computes them ([`estimate_tx_weight`], [`calculate_fee_from_weight`]);
+//!   with `alloc`, its decoy selection (`DecoyPicker`, `build_ring`) over
+//!   the output distribution the caller fetched.
 //!
-//! Not here: decoy selection, fee estimation, the daemon RPC, verification
-//! of the proofs of the older formats (MLSAG, Borromean, the original
-//! Bulletproofs), and multisignature.
+//! Not here: the daemon RPC (everything works on data the caller fetched),
+//! signing in the older formats, the checksum-less 24-word mnemonics that
+//! predate 2014, and multisignature.
 //!
 //! # Randomness
 //!
 //! The crate has no random number generator. Whatever needs randomness —
-//! [`clsag_sign`], `BulletproofPlus::prove`, `TransactionBuilder::build` —
+//! [`clsag_sign`], `BulletproofPlus::prove`, `TransactionBuilder::build`,
+//! the weights of a batched verification, the picks of `DecoyPicker` —
 //! takes `rng: &mut dyn FnMut(&mut [u8])`, which must fill the slice it is
 //! given with cryptographically secure random bytes on every call. Transaction
 //! keys, commitment masks and signature nonces come from it: a predictable or
-//! repeating source reveals amounts and secret keys. A source that leaves its
-//! buffer zeroed is detected ([`Error::BadRandomness`]); nothing else about
-//! its quality can be.
+//! repeating source reveals amounts and secret keys, and one an observer
+//! can reproduce tells them which ring members are decoys. A source that
+//! leaves its buffer zeroed is detected ([`Error::BadRandomness`]); nothing
+//! else about its quality can be.
 //!
 //! # Secrets and timing
 //!
@@ -59,7 +75,9 @@
 //! entries without branching or indexing on the scalars. Verification is
 //! variable-time and only sees public data. The position of the real output
 //! in a ring is not hidden from an observer of the local machine's timing:
-//! signing walks the ring starting from it.
+//! signing walks the ring starting from it, and decoy selection is
+//! variable-time. Looking the words of a mnemonic up in a word list goes
+//! through the whole list for every word, but is not constant-time either.
 //!
 //! # Untrusted input
 //!
@@ -129,7 +147,10 @@ mod bulletproofs;
 #[cfg(feature = "alloc")]
 mod bulletproofs_plus;
 mod clsag;
+#[cfg(feature = "alloc")]
+mod decoys;
 mod extra;
+mod fee;
 mod keys;
 mod legacy_sig;
 mod mnemonic;
@@ -155,6 +176,8 @@ pub use bulletproofs_plus::{
 #[cfg(feature = "alloc")]
 pub use clsag::Clsag;
 pub use clsag::{ClsagParts, RingMember, clsag_sign, clsag_verify};
+#[cfg(feature = "alloc")]
+pub use decoys::{DecoyCandidate, DecoyPicker, build_ring};
 pub use extra::{
     ExtraField, ExtraIter, PaymentId, TX_EXTRA_NONCE_ENCRYPTED_PAYMENT_ID, TX_EXTRA_NONCE_MAX_LEN,
     TX_EXTRA_NONCE_PAYMENT_ID, TX_EXTRA_TAG_ADDITIONAL_PUBKEYS, TX_EXTRA_TAG_MERGE_MINING,
@@ -164,6 +187,10 @@ pub use extra::{
 };
 #[cfg(feature = "alloc")]
 pub use extra::{push_additional_public_keys, push_nonce, push_payment_id, push_tx_public_key};
+pub use fee::{
+    FEE_QUANTIZATION_MASK, RING_SIZE, calculate_fee_from_weight, estimate_fee, estimate_tx_size,
+    estimate_tx_weight,
+};
 pub use keys::{AccountKeys, SubaddressIndex, ViewKeys, subaddress_secret_key};
 pub use legacy_sig::{BORROMEAN_PROOF_LEN, borromean_verify, check_ring_signature};
 pub use mnemonic::{
@@ -224,7 +251,8 @@ pub enum Error {
     /// used for.
     KeyMismatch,
     /// A ring is empty, of the wrong size, not in increasing order, or does
-    /// not contain the output being spent.
+    /// not contain the output being spent; or there are not enough outputs
+    /// to make one from.
     InvalidRing,
     /// A range proof cannot be made for these values (none, too many, or
     /// not as many masks as amounts).
