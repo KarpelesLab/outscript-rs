@@ -28,16 +28,27 @@ const GROUP: usize = 32;
 /// A Bulletproofs+ range proof, as a transaction carries it. The commitments
 /// it is about are not part of it: they are the transaction's output
 /// commitments.
+///
+/// Its points are stored divided by 8, as Monero does: the verifier
+/// multiplies them back, which clears any torsion component.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)]
 pub struct BulletproofPlus {
+    /// `A`: the commitment to the bits of the amounts.
     pub a: [u8; 32],
+    /// `A1`: the first point of the final round.
     pub a1: [u8; 32],
+    /// `B`: the second point of the final round.
     pub b: [u8; 32],
+    /// `r1`: a response of the final round.
     pub r1: [u8; 32],
+    /// `s1`: a response of the final round.
     pub s1: [u8; 32],
+    /// `d1`: a response of the final round.
     pub d1: [u8; 32],
+    /// `L`: the left points of the inner-product rounds, `6 + log2(M)` of
+    /// them.
     pub l: Vec<[u8; 32]>,
+    /// `R`: the right points of the inner-product rounds.
     pub r: Vec<[u8; 32]>,
 }
 

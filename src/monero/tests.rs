@@ -263,6 +263,15 @@ fn account_keys() {
     bad_point[0] = 2;
     assert!(ViewKeys::new(account.view_secret(), &bad_point).is_err());
 
+    // The donation address of the Monero project and its published secret
+    // view key.
+    let donation: Address = "44AFFq5kSiGBoZ4NMDwYtN18obc8AemS33DBLWs3H7otXft3XjrpDtQGv7SqSsaBYBb98uNbr2VBBEt7f2wfn3RVGQBEP3A"
+        .parse()
+        .unwrap();
+    let donation_view = h32("f359631075708155cc3d92a32b75a7d02a5dcf27756707b47a2b31b21c389501");
+    let watch = ViewKeys::new(&donation_view, &donation.spend_public).unwrap();
+    assert_eq!(watch.address(Network::Mainnet), donation);
+
     // Secrets stay out of Debug output.
     let debug = std::format!("{account:?} {view_only:?}");
     assert!(!debug.contains("view_secret") && !debug.contains("spend_secret"));

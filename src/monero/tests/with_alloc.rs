@@ -406,3 +406,107 @@ fn bulletproofs_plus_prove_large() {
         assert!(proof.verify_with(&generators, &commitments), "{count}");
     }
 }
+
+/// The scanning vectors of `monero-rs`: transactions with the keys of their
+/// recipient, and the amounts and one-time keys the recipient's wallet finds
+/// in them — RingCT outputs, a coinbase output, view tags (one of them a
+/// false positive on an output that is not the wallet's), and outputs to
+/// subaddresses through additional transaction keys.
+#[test]
+fn scan_vectors() {
+    let mut count = 0;
+    for line in include_str!("../testdata/monero_rs_scan.txt").lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let name = f[0];
+        let account = AccountKeys::from_secret_keys(&h32(f[2]), &h32(f[1])).unwrap();
+        let tx = Transaction::parse(&hex::decode(f[3]).unwrap()).unwrap();
+        // The ids under which public daemons know these transactions (the
+        // coinbase one is the id the vectors' wallet printed).
+        let txid = match name {
+            "ringct" => "4c9c4f6b3d298c5ffa31139929b34ae53d727adf3de70ed2b8c32835d4513e25",
+            "coinbase" => "50ad877c2f126c9278dc4b043774bceb995c80bc2fa11de10a0f8379a856422e",
+            "view_tag_false_positive" => {
+                "a76998eed792c703da7287b9286541a9f281cd634b814c9b8588fbcc0a0f760d"
+            }
+            "view_tag" => "99eed466ab48df521c658669f517b4408564a0902c67b9f533f53e558a2d416d",
+            "additional_keys" => "b9cc1b04d38f15d5c2c807b5ca143be731461db1a77386b49052869f6118e0d0",
+            _ => panic!("{name}"),
+        };
+        assert_eq!(tx.hash(), h32(txid), "{name}");
+
+        // The subaddresses the vectors' wallet looked for.
+        let mut table = Vec::new();
+        for major in 0..2 {
+            for minor in 0..3 {
+                let index = SubaddressIndex::new(major, minor);
+                table.push((account.view_keys().subaddress_spend_public(index), index));
+            }
+        }
+        let mut lookup = |key: &[u8; 32]| {
+            table
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, index)| *index)
+        };
+
+        let owned = account
+            .view_keys()
+            .scan_transaction(&tx, &mut lookup)
+            .unwrap();
+        let expected = &f[4..];
+        assert_eq!(owned.len(), expected.len(), "{name}");
+        for (output, expected) in owned.iter().zip(expected) {
+            let e: Vec<&str> = expected.split(':').collect();
+            assert_eq!(output.amount, e[0].parse::<u64>().unwrap(), "{name}");
+            assert_eq!(output.key, h32(e[2]), "{name}");
+            let (secret, image) = account
+                .output_key_image(
+                    &output.derivation,
+                    output.index as u64,
+                    output.subaddress,
+                    &output.key,
+                )
+                .unwrap();
+            assert_eq!(*secret, h32(e[1]), "{name}");
+            assert_eq!(
+                image,
+                crate::cryptonote::generate_key_image(&output.key, &secret).unwrap()
+            );
+            // The amount and the mask open the output's commitment.
+            assert_eq!(
+                commit(output.amount, &output.mask).unwrap(),
+                output_commitment(&tx, output.index).unwrap(),
+                "{name}"
+            );
+        }
+
+        match name {
+            "coinbase" => assert_eq!(tx.rct.rct_type, RCT_TYPE_NULL),
+            "view_tag_false_positive" => {
+                // The other output's view tag matches too, by chance.
+                let other = 1 - owned[0].index;
+                let derivation = account
+                    .view_keys()
+                    .key_derivation(&tx_public_key(&tx.prefix.extra).unwrap())
+                    .unwrap();
+                assert_eq!(
+                    Some(derive_view_tag(&derivation, other as u64)),
+                    tx.prefix.outputs[other].view_tag
+                );
+            }
+            "additional_keys" => {
+                assert_eq!(
+                    additional_public_keys(&tx.prefix.extra).len(),
+                    tx.prefix.outputs.len() * 32
+                );
+                assert!(owned.iter().all(|output| !output.subaddress.is_main()));
+            }
+            _ => {}
+        }
+        count += 1;
+    }
+    assert_eq!(count, 5);
+}

@@ -179,18 +179,28 @@ pub struct RangeSig(pub Vec<u8>);
 /// An original Bulletproof range proof (RingCT types 3 to 5). It is parsed
 /// and serialized, not verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(missing_docs)]
 pub struct Bulletproof {
+    /// `A`.
     pub a: [u8; 32],
+    /// `S`.
     pub s: [u8; 32],
+    /// `T1`.
     pub t1: [u8; 32],
+    /// `T2`.
     pub t2: [u8; 32],
+    /// `taux`.
     pub taux: [u8; 32],
+    /// `mu`.
     pub mu: [u8; 32],
+    /// `L`: the left points of the inner-product rounds.
     pub l: Vec<[u8; 32]>,
+    /// `R`: the right points of the inner-product rounds.
     pub r: Vec<[u8; 32]>,
+    /// `a` (the scalar; `A` is the field [`a`](Self::a)).
     pub aa: [u8; 32],
+    /// `b`.
     pub b: [u8; 32],
+    /// `t`.
     pub t: [u8; 32],
 }
 
