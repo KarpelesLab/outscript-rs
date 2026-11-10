@@ -39,9 +39,13 @@
 //! constants the circuit's gadgets are built from.
 
 pub mod bundle;
+#[cfg(feature = "zcash-orchard-prover")]
+pub mod circuit;
 pub mod constants;
 mod curves;
 pub mod fields;
+#[cfg(feature = "zcash-orchard-prover")]
+pub mod halo2;
 pub mod keys;
 pub mod note;
 pub mod note_encryption;
