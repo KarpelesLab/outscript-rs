@@ -7,6 +7,7 @@
 use super::fields::Fp;
 use super::pallas::{self, Affine};
 
+mod empty_roots;
 mod fixed_bases;
 mod sinsemilla_s;
 
@@ -62,3 +63,16 @@ pub static SINSEMILLA_S: [Affine; 1024] = {
 pub fn group_hash(domain: &[u8], msg: &[u8]) -> pallas::Point {
     pallas::Point::hash_to_curve(domain, msg)
 }
+
+/// The roots of the empty subtrees of the note commitment tree: entry `l`
+/// is the root of an empty subtree of height `l`, entry 0 being the
+/// uncommitted leaf and entry 32 the anchor of the empty tree.
+pub const EMPTY_ROOTS: [Fp; 33] = {
+    let mut out = [Fp::ZERO; 33];
+    let mut i = 0;
+    while i < 33 {
+        out[i] = Fp::from_montgomery_unchecked(empty_roots::EMPTY_ROOTS_RAW[i]);
+        i += 1;
+    }
+    out
+};

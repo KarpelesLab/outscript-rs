@@ -59,7 +59,7 @@ zcash = ["secp256k1"]
 zcash-sapling = ["zcash", "purecrypto/cipher"]
 # Zcash Orchard shielded pool: Pallas/Vesta, ZIP-32 keys, unified addresses,
 # notes, note encryption and scanning, RedPallas, Orchard bundles.
-zcash-orchard = ["zcash"]
+zcash-orchard = ["zcash", "purecrypto/cipher"]
 # Both shielded pools.
 zcash-shielded = ["zcash-sapling", "zcash-orchard"]
 # Tron: addresses and `trontx` (protobuf transactions: TRX, TRC-10 and
