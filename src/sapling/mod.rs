@@ -37,11 +37,11 @@ pub mod generators;
 pub mod group_hash;
 pub mod jubjub;
 pub mod keys;
-// TMP pub mod note;
-// TMP pub mod note_encryption;
+pub mod note;
+pub mod note_encryption;
 pub mod pedersen;
 pub mod prf;
-// TMP pub mod redjubjub;
+pub mod redjubjub;
 pub mod tree;
 pub mod zip32;
 
