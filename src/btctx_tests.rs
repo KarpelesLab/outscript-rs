@@ -1689,3 +1689,232 @@ fn sign_fork_id_uses_bip143_preimage() {
         assert!(pk.verify(&legacy, &r, &sv), "{scheme}");
     }
 }
+
+/// A one-input, one-output transaction with the given witness stack.
+fn parse_fixture(witnesses: Vec<Vec<u8>>) -> BtcTx {
+    BtcTx {
+        version: 2,
+        inputs: vec![BtcTxInput {
+            txid: [0x11; 32],
+            vout: 1,
+            sequence: 0xffff_fffd,
+            witnesses,
+            ..Default::default()
+        }],
+        outputs: vec![BtcTxOutput {
+            amount: 1_000u64.into(),
+            n: 0,
+            script: vec![0x6a],
+        }],
+        locktime: 7,
+    }
+}
+
+/// The segwit flag byte must be exactly 1.
+#[test]
+fn parse_requires_segwit_flag_one() {
+    let raw = parse_fixture(vec![vec![0xaa; 3]]).bytes();
+    assert_eq!(raw[4..6], [0x00, 0x01]);
+    assert_eq!(BtcTx::from_bytes(&raw).unwrap().bytes(), raw);
+    for flag in [0x00u8, 0x02, 0x03, 0x81, 0xff] {
+        let mut bad = raw.clone();
+        bad[5] = flag;
+        assert_eq!(
+            BtcTx::from_bytes(&bad).map(|_| ()),
+            Err(Error::InvalidData),
+            "{flag:#x}"
+        );
+    }
+}
+
+/// `from_bytes` takes exactly one transaction; a stream reader stops after it.
+#[test]
+fn parse_rejects_trailing_bytes() {
+    for witnesses in [vec![], vec![vec![0xaa; 3]]] {
+        let raw = parse_fixture(witnesses).bytes();
+        assert_eq!(BtcTx::from_bytes(&raw).unwrap().bytes(), raw);
+        let mut long = raw.clone();
+        long.push(0x00);
+        assert_eq!(
+            BtcTx::from_bytes(&long).map(|_| ()),
+            Err(Error::TrailingData)
+        );
+        long.extend_from_slice(&raw);
+        assert_eq!(
+            BtcTx::from_bytes(&long).map(|_| ()),
+            Err(Error::TrailingData)
+        );
+
+        #[cfg(feature = "std")]
+        {
+            let mut tx = BtcTx::default();
+            let mut src = &long[..];
+            assert_eq!(tx.read_from(&mut src).unwrap() as usize, raw.len());
+            assert_eq!(tx.bytes(), raw);
+            assert_eq!(src.len(), long.len() - raw.len());
+        }
+    }
+}
+
+/// CompactSize integers must use their shortest encoding.
+#[test]
+fn parse_rejects_non_minimal_compact_size() {
+    let raw = parse_fixture(vec![]).bytes();
+    assert_eq!(BtcTx::from_bytes(&raw).unwrap().bytes(), raw);
+    // version (4), then the input count
+    assert_eq!(raw[4], 1);
+    for wide in [
+        &[0xfd, 0x01, 0x00][..],
+        &[0xfe, 0x01, 0x00, 0x00, 0x00],
+        &[0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ] {
+        let mut bad = raw[..4].to_vec();
+        bad.extend_from_slice(wide);
+        bad.extend_from_slice(&raw[5..]);
+        assert_eq!(
+            BtcTx::from_bytes(&bad).map(|_| ()),
+            Err(Error::NonCanonical)
+        );
+    }
+    // a script length: the output's, 1 as 0xfd 0x01 0x00
+    let at = raw.len() - 6;
+    assert_eq!(raw[at..at + 2], [0x01, 0x6a]);
+    let mut bad = raw[..at].to_vec();
+    bad.extend_from_slice(&[0xfd, 0x01, 0x00]);
+    bad.extend_from_slice(&raw[at + 1..]);
+    assert_eq!(
+        BtcTx::from_bytes(&bad).map(|_| ()),
+        Err(Error::NonCanonical)
+    );
+    // the boundaries of each width are canonical
+    let mut tx = parse_fixture(vec![
+        vec![0x01; 0xfc],
+        vec![0x02; 0xfd],
+        vec![0x03; 0x1_0000],
+    ]);
+    tx.outputs[0].script = vec![0x6a; 0xffff];
+    let raw = tx.bytes();
+    assert_eq!(BtcTx::from_bytes(&raw).unwrap().bytes(), raw);
+}
+
+/// Counts and lengths are bounded by the data (or, for a stream, by the
+/// largest valid transaction) before anything is allocated for them.
+#[test]
+fn parse_bounds_counts_and_lengths() {
+    let raw = parse_fixture(vec![vec![0xaa; 3]]).bytes();
+    // ... 01 (witness count) 03 aa aa aa, locktime
+    let wc_at = raw.len() - 9;
+    assert_eq!(raw[wc_at..wc_at + 2], [0x01, 0x03]);
+
+    let with = |at: usize, skip: usize, bytes: &[u8]| {
+        let mut v = raw[..at].to_vec();
+        v.extend_from_slice(bytes);
+        v.extend_from_slice(&raw[at + skip..]);
+        v
+    };
+    let huge = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+    let four_gb = [0xfe, 0xff, 0xff, 0xff, 0xff];
+    // 3,999,000: within the size limit, far beyond the data
+    let big = [0xfe, 0x18, 0x05, 0x3d, 0x00];
+    // 4,000,001
+    let over = [0xfe, 0x01, 0x09, 0x3d, 0x00];
+
+    let cases = [
+        // witness item count
+        (with(wc_at, 1, &huge), Error::TooLarge),
+        (with(wc_at, 1, &four_gb), Error::TooLarge),
+        (with(wc_at, 1, &over), Error::TooLarge),
+        (with(wc_at, 1, &big), Error::UnexpectedEof),
+        // witness item length
+        (with(wc_at + 1, 1, &huge), Error::TooLarge),
+        (with(wc_at + 1, 1, &over), Error::TooLarge),
+        (with(wc_at + 1, 1, &big), Error::UnexpectedEof),
+        // input count (after the marker and flag)
+        (with(6, 1, &huge), Error::TooLarge),
+        (with(6, 1, &[0xfe, 0x40, 0x42, 0x0f, 0x00]), Error::TooLarge),
+        (with(6, 1, &[0xfd, 0x10, 0x27]), Error::UnexpectedEof),
+    ];
+    for (bad, want) in &cases {
+        assert_eq!(
+            BtcTx::from_bytes(bad).map(|_| ()),
+            Err(*want),
+            "{}",
+            hex::encode(&bad[..bad.len().min(64)])
+        );
+        // a stream cannot tell how much follows: it fails the same way on
+        // the size limit, and otherwise when the data runs out
+        #[cfg(feature = "std")]
+        {
+            let err = BtcTx::default().read_from(&mut &bad[..]).unwrap_err();
+            match want {
+                Error::TooLarge => {
+                    let inner = err.get_ref().and_then(|e| e.downcast_ref::<Error>());
+                    assert_eq!(inner, Some(&Error::TooLarge));
+                }
+                _ => assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof),
+            }
+        }
+    }
+}
+
+/// Sizes that consensus allows parse: the old caps of 100,000 bytes per
+/// script or witness item and 10,000 inputs were stricter than the network.
+#[test]
+fn parse_accepts_consensus_sized_transactions() {
+    // a 150,000-byte witness item and a 120,000-byte scriptPubKey
+    let mut tx = parse_fixture(vec![vec![0xaa; 150_000], vec![], vec![0xbb]]);
+    tx.outputs[0].script = vec![0x6a; 120_000];
+    let raw = tx.bytes();
+    let back = BtcTx::from_bytes(&raw).unwrap();
+    assert_eq!(back.inputs[0].witnesses, tx.inputs[0].witnesses);
+    assert_eq!(back.bytes(), raw);
+    #[cfg(feature = "std")]
+    {
+        let mut via_stream = BtcTx::default();
+        let n = via_stream.read_from(&mut &raw[..]).unwrap();
+        assert_eq!((n as usize, via_stream.bytes()), (raw.len(), raw.clone()));
+    }
+
+    // 12,000 inputs, each with 200 empty witness items but the last
+    let mut tx = parse_fixture(vec![]);
+    let input = tx.inputs[0].clone();
+    tx.inputs = (0..12_000u32)
+        .map(|vout| BtcTxInput {
+            vout,
+            witnesses: vec![vec![]; 200],
+            ..input.clone()
+        })
+        .collect();
+    tx.inputs[11_999].witnesses.clear();
+    tx.outputs = (0..70_000)
+        .map(|n| BtcTxOutput {
+            amount: 1u64.into(),
+            n,
+            script: vec![],
+        })
+        .collect();
+    let raw = tx.bytes();
+    assert!(raw.len() < 4_000_000);
+    let back = BtcTx::from_bytes(&raw).unwrap();
+    assert_eq!(
+        (
+            back.inputs.len(),
+            back.outputs.len(),
+            back.outputs[69_999].n
+        ),
+        (12_000, 70_000, 69_999)
+    );
+    assert_eq!(back.bytes(), raw);
+
+    // one byte over the largest valid transaction is refused
+    let mut tx = parse_fixture(vec![]);
+    tx.outputs[0].script = vec![0x6a; 4_000_000 - 60 - 4];
+    let raw = tx.bytes();
+    assert_eq!(raw.len(), 4_000_000);
+    assert_eq!(BtcTx::from_bytes(&raw).unwrap().bytes(), raw);
+    tx.outputs[0].script.push(0x6a);
+    assert_eq!(
+        BtcTx::from_bytes(&tx.bytes()).map(|_| ()),
+        Err(Error::TooLarge)
+    );
+}

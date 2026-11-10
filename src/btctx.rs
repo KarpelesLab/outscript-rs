@@ -616,15 +616,26 @@ impl BtcTx {
         ln + witln.div_ceil(4)
     }
 
-    /// Parses a transaction from bytes.
+    /// Parses a transaction from bytes, which must hold exactly one
+    /// transaction ([`Error::TrailingData`] otherwise).
+    ///
+    /// The encoding must be the canonical one: minimal CompactSize integers
+    /// ([`Error::NonCanonical`]) and, for the segwit form, a flag byte of 1
+    /// ([`Error::InvalidData`]). Transactions over 4,000,000 bytes, more than
+    /// the consensus weight limit allows, fail with [`Error::TooLarge`].
     pub fn from_bytes(buf: &[u8]) -> Result<BtcTx, Error> {
         let mut tx = BtcTx::default();
-        tx.read_source(&mut SliceSource(buf))
-            .map_err(ReadError::into_error)?;
+        let mut src = SliceSource(buf);
+        tx.read_source(&mut src).map_err(ReadError::into_error)?;
+        if !src.0.is_empty() {
+            return Err(Error::TrailingData);
+        }
         Ok(tx)
     }
 
-    /// Reads a transaction from `r`, returning the number of bytes consumed.
+    /// Reads a transaction from `r`, returning the number of bytes consumed
+    /// and leaving whatever follows it unread. The same rules as
+    /// [`from_bytes`](Self::from_bytes) apply to the encoding.
     #[cfg(feature = "std")]
     pub fn read_from<R: Read>(&mut self, r: &mut R) -> io::Result<u64> {
         self.read_source(&mut IoSource(r))
@@ -634,30 +645,27 @@ impl BtcTx {
     fn read_source<S: ByteSource>(&mut self, r: &mut S) -> Result<u64, ReadError> {
         let mut n = 0u64;
         self.version = read_u32le(r, &mut n)?;
-        let mut in_cnt = read_varint(r, &mut n)?;
+        let mut in_cnt = read_count(r, &mut n, MIN_INPUT_BYTES)?;
         let mut segwit = false;
         if in_cnt == 0 {
+            // segwit marker; the flag byte that follows only has bit 0 defined
+            if read_u8(r, &mut n)? != 0x01 {
+                return Err(ReadError::Invalid);
+            }
             segwit = true;
-            read_u8(r, &mut n)?; // flag
-            in_cnt = read_varint(r, &mut n)?;
+            in_cnt = read_count(r, &mut n, MIN_INPUT_BYTES)?;
         }
-        if in_cnt > 10000 {
-            return Err(ReadError::TooLarge);
-        }
-        self.inputs = Vec::with_capacity(in_cnt as usize);
+        self.inputs = Vec::with_capacity(in_cnt.min(MAX_PREALLOC));
         for _ in 0..in_cnt {
             let mut inp = BtcTxInput::default();
             inp.read_source(r, &mut n)?;
             self.inputs.push(inp);
         }
-        let out_cnt = read_varint(r, &mut n)?;
-        if out_cnt > 65536 {
-            return Err(ReadError::TooLarge);
-        }
-        self.outputs = Vec::with_capacity(out_cnt as usize);
+        let out_cnt = read_count(r, &mut n, MIN_OUTPUT_BYTES)?;
+        self.outputs = Vec::with_capacity(out_cnt.min(MAX_PREALLOC));
         for idx in 0..out_cnt {
             let mut o = BtcTxOutput {
-                n: idx as usize,
+                n: idx,
                 ..Default::default()
             };
             o.read_source(r, &mut n)?;
@@ -665,10 +673,9 @@ impl BtcTx {
         }
         if segwit {
             for inp in &mut self.inputs {
-                let wc = read_varint(r, &mut n)?;
-                // Each witness item takes at least one byte, so cap the
-                // up-front allocation.
-                let mut ws = Vec::with_capacity(wc.min(10000) as usize);
+                // each witness item takes at least its one-byte length
+                let wc = read_count(r, &mut n, 1)?;
+                let mut ws = Vec::with_capacity(wc.min(MAX_PREALLOC));
                 for _ in 0..wc {
                     ws.push(read_var_buf(r, &mut n)?);
                 }
@@ -988,11 +995,30 @@ impl SighashCache<'_, '_> {
 
 // --- read helpers ---
 
+/// The largest serialized transaction the parser accepts. Consensus limits a
+/// transaction to 4,000,000 weight units, and every byte weighs at least one,
+/// so no valid transaction is longer. Every count and length is checked
+/// against what is left of this budget.
+const MAX_TX_BYTES: u64 = 4_000_000;
+/// The smallest serialized input: outpoint, empty scriptSig, sequence.
+const MIN_INPUT_BYTES: u64 = 41;
+/// The smallest serialized output: amount, empty scriptPubKey.
+const MIN_OUTPUT_BYTES: u64 = 9;
+/// The most elements reserved up front for a count read from the data; a
+/// longer list grows as its elements are actually read.
+const MAX_PREALLOC: usize = 1024;
+/// The most bytes reserved up front for a length read from a stream.
+const READ_CHUNK: usize = 64 * 1024;
+
 /// Errors from parsing a serialized transaction.
 #[derive(Debug)]
 enum ReadError {
     Eof,
     TooLarge,
+    /// The segwit flag byte is not 1.
+    Invalid,
+    /// A CompactSize integer is not minimally encoded.
+    NonCanonical,
     #[cfg(feature = "std")]
     Io(io::Error),
 }
@@ -1002,6 +1028,8 @@ impl core::fmt::Display for ReadError {
         match self {
             ReadError::Eof => f.write_str("unexpected end of transaction data"),
             ReadError::TooLarge => f.write_str("transaction data exceeds the allowed maximum"),
+            ReadError::Invalid => f.write_str("invalid segwit flag"),
+            ReadError::NonCanonical => f.write_str("non-canonical transaction encoding"),
             #[cfg(feature = "std")]
             ReadError::Io(e) => e.fmt(f),
         }
@@ -1013,6 +1041,8 @@ impl ReadError {
         match self {
             ReadError::Eof => Error::UnexpectedEof,
             ReadError::TooLarge => Error::TooLarge,
+            ReadError::Invalid => Error::InvalidData,
+            ReadError::NonCanonical => Error::NonCanonical,
             #[cfg(feature = "std")]
             ReadError::Io(_) => Error::UnexpectedEof,
         }
@@ -1032,6 +1062,8 @@ impl ReadError {
 /// [`Read`].
 trait ByteSource {
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ReadError>;
+    /// The number of bytes left, when the source knows it.
+    fn remaining(&self) -> Option<u64>;
 }
 
 struct SliceSource<'a>(&'a [u8]);
@@ -1046,6 +1078,9 @@ impl ByteSource for SliceSource<'_> {
         self.0 = rest;
         Ok(())
     }
+    fn remaining(&self) -> Option<u64> {
+        Some(self.0.len() as u64)
+    }
 }
 
 #[cfg(feature = "std")]
@@ -1055,6 +1090,9 @@ struct IoSource<'r, R>(&'r mut R);
 impl<R: Read> ByteSource for IoSource<'_, R> {
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ReadError> {
         self.0.read_exact(buf).map_err(ReadError::Io)
+    }
+    fn remaining(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -1074,8 +1112,12 @@ fn read_u64le<S: ByteSource>(r: &mut S, n: &mut u64) -> Result<u64, ReadError> {
     Ok(u64::from_le_bytes(b))
 }
 fn read_full<S: ByteSource>(r: &mut S, buf: &mut [u8], n: &mut u64) -> Result<(), ReadError> {
+    let end = *n + buf.len() as u64;
+    if end > MAX_TX_BYTES {
+        return Err(ReadError::TooLarge);
+    }
     r.read_exact(buf)?;
-    *n += buf.len() as u64;
+    *n = end;
     Ok(())
 }
 fn read_varint<S: ByteSource>(r: &mut S, n: &mut u64) -> Result<u64, ReadError> {
@@ -1088,19 +1130,43 @@ fn read_varint<S: ByteSource>(r: &mut S, n: &mut u64) -> Result<u64, ReadError> 
         _ => 0,
     };
     read_full(r, &mut buf[1..1 + extra], n)?;
-    let (v, _) = BtcVarInt::decode(&buf).expect("buffer holds a full varint");
+    let (v, used) = BtcVarInt::decode(&buf).expect("buffer holds a full varint");
+    // as consensus requires: the shortest encoding of the value
+    if v.len() != used {
+        return Err(ReadError::NonCanonical);
+    }
     Ok(v.0)
 }
-fn read_var_buf<S: ByteSource>(r: &mut S, n: &mut u64) -> Result<Vec<u8>, ReadError> {
-    let ln = read_varint(r, n)?;
-    if ln == 0 {
-        return Ok(Vec::new());
-    }
-    if ln > 100000 {
+/// Reads the count of elements that each take at least `min_bytes` (or, with
+/// `min_bytes` of 1, a byte length), checking that so many can follow: within
+/// the size budget, and within the source when it knows its length. The
+/// result is therefore at most [`MAX_TX_BYTES`].
+fn read_count<S: ByteSource>(r: &mut S, n: &mut u64, min_bytes: u64) -> Result<usize, ReadError> {
+    let count = read_varint(r, n)?;
+    if count > (MAX_TX_BYTES - *n) / min_bytes {
         return Err(ReadError::TooLarge);
     }
-    let mut buf = vec![0u8; ln as usize];
-    read_full(r, &mut buf, n)?;
+    if let Some(left) = r.remaining()
+        && count > left / min_bytes
+    {
+        return Err(ReadError::Eof);
+    }
+    Ok(count as usize)
+}
+fn read_var_buf<S: ByteSource>(r: &mut S, n: &mut u64) -> Result<Vec<u8>, ReadError> {
+    let ln = read_count(r, n, 1)?;
+    // a slice is known to hold `ln` more bytes; a stream may not deliver
+    // them, so its buffer grows as they arrive
+    let reserve = match r.remaining() {
+        Some(_) => ln,
+        None => ln.min(READ_CHUNK),
+    };
+    let mut buf = Vec::with_capacity(reserve);
+    while buf.len() < ln {
+        let start = buf.len();
+        buf.resize(ln.min(start + READ_CHUNK), 0);
+        read_full(r, &mut buf[start..], n)?;
+    }
     Ok(buf)
 }
 
