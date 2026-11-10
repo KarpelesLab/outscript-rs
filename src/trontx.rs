@@ -51,7 +51,7 @@ use crate::hash::sha256_once;
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
 use crate::sink::{Counter, HashSink, Sink, SliceSink};
-use crate::tron::{TronAddress, address_from_pubkey};
+use crate::tron::{ADDRESS_PREFIX, TronAddress, address_from_pubkey};
 
 /// A 65-byte recoverable signature: `r || s || v`, with `v` the recovery id
 /// (0 or 1).
@@ -179,11 +179,16 @@ impl<'a> Reader<'a> {
         Ok(v)
     }
 
-    /// A 21-byte raw address.
+    /// A 21-byte raw address, starting with the address prefix.
     fn address(&mut self, wire: u8) -> Result<TronAddress, Error> {
-        self.bytes(wire)?
+        let address: TronAddress = self
+            .bytes(wire)?
             .try_into()
-            .map_err(|_| Error::InvalidLength)
+            .map_err(|_| Error::InvalidLength)?;
+        if address[0] != ADDRESS_PREFIX {
+            return Err(Error::InvalidAddress);
+        }
+        Ok(address)
     }
 
     /// Skips a field's value.
@@ -366,13 +371,38 @@ impl<'a> TronContract<'a> {
         put_uint(s, 5, u64::from(permission_id));
     }
 
+    /// The integer fields of the contract, all `int64` on the wire.
+    fn check_int64(&self) -> Result<(), Error> {
+        let fits = match self {
+            TronContract::Transfer(c) => c.amount <= I64_MAX,
+            TronContract::TransferAsset(c) => c.amount <= I64_MAX,
+            TronContract::TriggerSmartContract(c) => {
+                c.call_value <= I64_MAX && c.call_token_value <= I64_MAX && c.token_id <= I64_MAX
+            }
+            TronContract::Other(_) => true,
+        };
+        if fits { Ok(()) } else { Err(Error::TooLarge) }
+    }
+
     /// Interprets a contract whose type URL is known; others stay `Other`.
+    ///
+    /// Nodes execute a contract by its numeric type, so a type this crate
+    /// decodes must come with its exact type URL (and the other way round):
+    /// otherwise a transfer could hide as an uninterpreted `Other`.
     fn parse(contract_type: u32, type_url: &'a str, parameter: &'a [u8]) -> Result<Self, Error> {
         let expected_type = match type_url {
             TronTransfer::TYPE_URL => TronTransfer::CONTRACT_TYPE,
             TronTransferAsset::TYPE_URL => TronTransferAsset::CONTRACT_TYPE,
             TronTriggerSmartContract::TYPE_URL => TronTriggerSmartContract::CONTRACT_TYPE,
             _ => {
+                if matches!(
+                    contract_type,
+                    TronTransfer::CONTRACT_TYPE
+                        | TronTransferAsset::CONTRACT_TYPE
+                        | TronTriggerSmartContract::CONTRACT_TYPE
+                ) {
+                    return Err(Error::InvalidData);
+                }
                 return Ok(TronContract::Other(TronOtherContract {
                     contract_type,
                     type_url,
@@ -510,6 +540,23 @@ impl<'a> TronTx<'a> {
         put_uint(s, 18, self.fee_limit);
     }
 
+    /// Checks that the transaction can be encoded faithfully: its integer
+    /// fields (expiration, timestamp, fee limit and the contract's amounts)
+    /// are `int64` on the wire, so a value above `i64::MAX` would be read as
+    /// negative and fails with [`Error::TooLarge`].
+    ///
+    /// [`raw_data_to_slice`](Self::raw_data_to_slice) and
+    /// [`encode_signed_to_slice`](Self::encode_signed_to_slice) check this
+    /// themselves. The infallible [`txid`](Self::txid), [`sign`](Self::sign)
+    /// and `Vec` encoders do not: call this first when the amounts are not
+    /// known to be in range.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.expiration > I64_MAX || self.timestamp > I64_MAX || self.fee_limit > I64_MAX {
+            return Err(Error::TooLarge);
+        }
+        self.contract.check_int64()
+    }
+
     /// The length of the serialized `raw_data`.
     pub fn raw_data_len(&self) -> usize {
         let mut c = Counter::default();
@@ -518,8 +565,10 @@ impl<'a> TronTx<'a> {
     }
 
     /// Serializes the `raw_data` into `out`, returning the number of bytes
-    /// written.
+    /// written. Fails with [`Error::TooLarge`] if an integer field exceeds
+    /// `i64::MAX` (see [`validate`](Self::validate)).
     pub fn raw_data_to_slice(&self, out: &mut [u8]) -> Result<usize, Error> {
+        self.validate()?;
         let mut s = SliceSink::new(out);
         self.write_raw(&mut s);
         s.finish().ok_or(Error::BufferTooSmall)
@@ -529,8 +578,9 @@ impl<'a> TronTx<'a> {
     #[cfg(feature = "alloc")]
     pub fn raw_data(&self) -> Vec<u8> {
         let mut out = vec![0u8; self.raw_data_len()];
-        self.raw_data_to_slice(&mut out)
-            .expect("buffer sized by raw_data_len");
+        let mut s = SliceSink::new(&mut out);
+        self.write_raw(&mut s);
+        s.finish().expect("buffer sized by raw_data_len");
         out
     }
 
@@ -558,24 +608,32 @@ impl<'a> TronTx<'a> {
 
     /// Writes the `Transaction` message (`raw_data` and `sigs`), as nodes
     /// broadcast it, into `out`, returning the number of bytes written.
+    /// Fails with [`Error::TooLarge`] if an integer field exceeds `i64::MAX`
+    /// (see [`validate`](Self::validate)).
     pub fn encode_signed_to_slice(
         &self,
         sigs: &[TronSignature],
         out: &mut [u8],
     ) -> Result<usize, Error> {
+        self.validate()?;
+        self.write_signed(sigs, out).ok_or(Error::BufferTooSmall)
+    }
+
+    /// Writes the `Transaction` message, or `None` if `out` is too small.
+    fn write_signed(&self, sigs: &[TronSignature], out: &mut [u8]) -> Option<usize> {
         let mut s = SliceSink::new(out);
         put_delimited(&mut s, 1, false, |s| self.write_raw(s));
         for sig in sigs {
             put_bytes(&mut s, 2, sig);
         }
-        s.finish().ok_or(Error::BufferTooSmall)
+        s.finish()
     }
 
     /// The `Transaction` message: see [`encode_signed_to_slice`](Self::encode_signed_to_slice).
     #[cfg(feature = "alloc")]
     pub fn encode_signed(&self, sigs: &[TronSignature]) -> Vec<u8> {
         let mut out = vec![0u8; self.signed_len(sigs.len())];
-        self.encode_signed_to_slice(sigs, &mut out)
+        self.write_signed(sigs, &mut out)
             .expect("buffer sized by signed_len");
         out
     }
@@ -981,6 +1039,172 @@ mod tests {
         let n = tx.raw_data_to_slice(&mut raw).unwrap();
         assert_eq!(TronTx::parse(&raw[..n]), Ok(tx));
         assert_eq!(tx.contract.contract_type(), 4);
+    }
+
+    fn raw_of(tx: &TronTx<'_>) -> ([u8; 256], usize) {
+        let mut raw = [0u8; 256];
+        let n = tx.raw_data_to_slice(&mut raw).unwrap();
+        (raw, n)
+    }
+
+    /// A contract type this crate decodes must come with its exact type URL:
+    /// it must not pass as an uninterpreted `Other`.
+    #[test]
+    fn parse_rejects_native_type_with_other_url() {
+        let TronContract::Transfer(transfer) = vectors()[0].contract else {
+            unreachable!()
+        };
+        let mut parameter = vec![0x0a, 0x15];
+        parameter.extend_from_slice(&transfer.owner);
+        parameter.extend_from_slice(&[0x12, 0x15]);
+        parameter.extend_from_slice(&transfer.to);
+        parameter.extend_from_slice(&[0x18, 0x09]);
+        let parse_other = |contract_type, type_url| {
+            let tx = TronTx {
+                expiration: 1,
+                ..TronTx::new(TronContract::Other(TronOtherContract {
+                    contract_type,
+                    type_url,
+                    parameter: &parameter,
+                }))
+            }
+            .with_ref_block(1, &[1; 32]);
+            let (raw, n) = raw_of(&tx);
+            TronTx::parse(&raw[..n]).map(|tx| matches!(tx.contract, TronContract::Other(_)))
+        };
+        for contract_type in [1, 2, 31] {
+            for type_url in [
+                "type.googleapis.com/protocol.TransferContract ",
+                "type.googleapis.com/protocol.transfercontract",
+                "example.com/protocol.TransferContract",
+                "/protocol.TransferContract",
+                "type.googleapis.com/protocol.VoteWitnessContract",
+                "",
+            ] {
+                assert_eq!(
+                    parse_other(contract_type, type_url),
+                    Err(Error::InvalidData),
+                    "{contract_type} {type_url:?}"
+                );
+            }
+        }
+        // a known URL with another type
+        assert_eq!(
+            parse_other(4, TronTransfer::TYPE_URL),
+            Err(Error::InvalidData)
+        );
+        assert_eq!(
+            parse_other(0, TronTriggerSmartContract::TYPE_URL),
+            Err(Error::InvalidData)
+        );
+        // other types stay uninterpreted
+        assert_eq!(
+            parse_other(4, "type.googleapis.com/protocol.VoteWitnessContract"),
+            Ok(true)
+        );
+        // and the exact pair is decoded
+        assert_eq!(parse_other(1, TronTransfer::TYPE_URL), Ok(false));
+    }
+
+    /// Addresses inside a decoded contract must carry the 0x41 prefix.
+    #[test]
+    fn parse_rejects_address_without_prefix() {
+        let raw = hex::decode(vectors()[0].raw_data).unwrap();
+        let parse = |data: &[u8]| TronTx::parse(data).map(drop);
+        assert_eq!(parse(&raw), Ok(()));
+        let owner_at = 21 + 2 + 2 + 2 + 2 + 0x2d + 2 + 2;
+        let to_at = owner_at + 21 + 2;
+        for at in [owner_at, to_at] {
+            assert_eq!(raw[at], 0x41);
+            for prefix in [0x00, 0x40, 0xa0] {
+                let mut bad = raw.clone();
+                bad[at] = prefix;
+                assert_eq!(parse(&bad), Err(Error::InvalidAddress));
+            }
+        }
+        // a smart-contract call's owner and contract
+        let raw = hex::decode(vectors()[1].raw_data).unwrap();
+        let owner = h::<21>("415bbe102a79d3cd56aacfb2dbc72e88579de71042");
+        let contract = h::<21>("41a614f803b6fd780986a42c78ec9c7f77e6ded13c");
+        for address in [owner, contract] {
+            let at = raw.windows(21).position(|w| w == address).unwrap();
+            let mut bad = raw.clone();
+            bad[at] = 0x42;
+            assert_eq!(parse(&bad), Err(Error::InvalidAddress));
+        }
+    }
+
+    /// Integer fields are int64 on the wire: larger values are rejected when
+    /// building instead of being encoded as negative numbers.
+    #[test]
+    fn build_rejects_amounts_above_i64_max() {
+        let me = address_from_pubkey(&key().public_key());
+        let to = address_from_str("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t").unwrap();
+        let too_big = i64::MAX as u64 + 1;
+        let check = |tx: TronTx<'_>| {
+            let mut out = [0u8; 512];
+            let res = tx.raw_data_to_slice(&mut out).map(drop);
+            assert_eq!(tx.validate(), res);
+            assert_eq!(
+                tx.encode_signed_to_slice(&[[0; 65]], &mut out).map(drop),
+                res
+            );
+            if res.is_ok() {
+                let n = tx.raw_data_to_slice(&mut out).unwrap();
+                assert_eq!(TronTx::parse(&out[..n]), Ok(tx));
+            }
+            res
+        };
+        let transfer = |amount| {
+            TronTx::new(TronContract::Transfer(TronTransfer {
+                owner: me,
+                to,
+                amount,
+            }))
+            .with_ref_block(1, &[1; 32])
+        };
+        assert_eq!(check(transfer(i64::MAX as u64)), Ok(()));
+        assert_eq!(check(transfer(too_big)), Err(Error::TooLarge));
+        assert_eq!(check(transfer(u64::MAX)), Err(Error::TooLarge));
+
+        let asset = |amount| {
+            TronTx::new(TronContract::TransferAsset(TronTransferAsset {
+                asset_name: b"1002000",
+                owner: me,
+                to,
+                amount,
+            }))
+            .with_ref_block(1, &[1; 32])
+        };
+        assert_eq!(check(asset(i64::MAX as u64)), Ok(()));
+        assert_eq!(check(asset(too_big)), Err(Error::TooLarge));
+
+        let call = |call_value, call_token_value, token_id| {
+            TronTx::new(TronContract::TriggerSmartContract(
+                TronTriggerSmartContract {
+                    call_value,
+                    call_token_value,
+                    token_id,
+                    ..TronTriggerSmartContract::new(me, to, &[1, 2, 3, 4])
+                },
+            ))
+            .with_ref_block(1, &[1; 32])
+        };
+        assert_eq!(check(call(1, 2, 3)), Ok(()));
+        assert_eq!(check(call(too_big, 0, 0)), Err(Error::TooLarge));
+        assert_eq!(check(call(0, too_big, 0)), Err(Error::TooLarge));
+        assert_eq!(check(call(0, 0, too_big)), Err(Error::TooLarge));
+
+        // the transaction's own int64 fields
+        for field in 0..3 {
+            let mut tx = transfer(1);
+            match field {
+                0 => tx.expiration = too_big,
+                1 => tx.timestamp = too_big,
+                _ => tx.fee_limit = too_big,
+            }
+            assert_eq!(check(tx), Err(Error::TooLarge));
+        }
     }
 
     #[test]
