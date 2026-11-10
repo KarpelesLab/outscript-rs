@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# A newer commit on the same branch or pull request supersedes the runs
+# still queued or in progress for the older ones.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
