@@ -76,7 +76,7 @@ pub fn ka_derive_public(esk: &Fr, g_d: &Point) -> Point {
 /// (`esk` and `pk_d`, or `ivk` and `epk`).
 ///
 /// The result is secret: wipe it (a [`Point`] is
-/// [`Zeroize`](purecrypto::zeroize::Zeroize)) once the key is derived.
+/// [`Zeroize`]) once the key is derived.
 pub fn ka_agree(sk: &Fr, p: &Point) -> Point {
     let mut partial = p.mul(sk);
     let shared = partial.mul_by_cofactor();
