@@ -49,8 +49,8 @@ jobs:
       fail-fast: false
       matrix:
         features:
-          - { name: no-alloc, flags: "--no-default-features --features bitcoin,evm,solana,cardano,massa,zcash,tron,bcur,bbqr" }
-          - { name: alloc, flags: "--no-default-features --features alloc,bitcoin,evm,solana,cardano,massa,zcash,tron,bcur,bbqr" }
+          - { name: no-alloc, flags: "--no-default-features --features bitcoin,evm,solana,cardano,massa,zcash,zcash-shielded,tron,bcur,bbqr" }
+          - { name: alloc, flags: "--no-default-features --features alloc,bitcoin,evm,solana,cardano,massa,zcash,zcash-shielded,tron,bcur,bbqr" }
           # each chain on its own, so none of them leans on another's gates
           - { name: bitcoin, flags: --no-default-features --features alloc,bitcoin }
           - { name: evm, flags: --no-default-features --features alloc,evm }
@@ -58,6 +58,8 @@ jobs:
           - { name: cardano, flags: --no-default-features --features alloc,cardano }
           - { name: massa, flags: --no-default-features --features alloc,massa }
           - { name: zcash, flags: --no-default-features --features alloc,zcash }
+          - { name: zcash-sapling, flags: "--no-default-features --features alloc,zcash-sapling" }
+          - { name: zcash-orchard, flags: "--no-default-features --features alloc,zcash-orchard" }
           - { name: tron, flags: --no-default-features --features alloc,tron }
           - { name: no-chains, flags: --no-default-features --features alloc }
           # the transports on their own, with and without a heap
@@ -112,7 +114,7 @@ jobs:
         run: cargo build --all-targets
 
       - name: Build (no_std, no alloc)
-        run: cargo build --no-default-features --features bitcoin,evm,solana,cardano,massa,zcash,tron,bcur,bbqr
+        run: cargo build --no-default-features --features bitcoin,evm,solana,cardano,massa,zcash,zcash-shielded,tron,bcur,bbqr
 
   docs:
     name: Docs build (warnings denied)

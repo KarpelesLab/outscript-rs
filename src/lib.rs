@@ -154,6 +154,10 @@ pub mod tron;
 pub mod trontx;
 #[cfg(feature = "zcash")]
 pub mod zcash;
+#[cfg(feature = "zcash-orchard")]
+pub mod orchard;
+#[cfg(feature = "zcash-sapling")]
+pub mod sapling;
 #[cfg(feature = "zcash")]
 pub mod zcashtx;
 

@@ -20,7 +20,7 @@ name = "outscript"
 # Chains are opt-in: each chain feature enables its modules, formats and
 # address codecs, and pulls in only the curve arithmetic it needs. The default
 # enables every chain.
-default = ["std", "bitcoin", "evm", "solana", "cardano", "massa", "zcash", "tron", "bcur", "bbqr"]
+default = ["std", "bitcoin", "evm", "solana", "cardano", "massa", "zcash", "zcash-sapling", "zcash-orchard", "tron", "bcur", "bbqr"]
 std = [
     "alloc",
     "purecrypto/std",
@@ -54,6 +54,14 @@ cardano = ["ed25519", "purecrypto/kdf"]
 massa = ["ed25519"]
 # Zcash: transparent addresses and v5 (ZIP-225/244) transaction signing.
 zcash = ["secp256k1"]
+# Zcash Sapling shielded pool: Jubjub, ZIP-32 keys, `zs` addresses, notes,
+# note encryption and scanning, RedJubjub, Sapling bundles.
+zcash-sapling = ["zcash"]
+# Zcash Orchard shielded pool: Pallas/Vesta, ZIP-32 keys, unified addresses,
+# notes, note encryption and scanning, RedPallas, Orchard bundles.
+zcash-orchard = ["zcash"]
+# Both shielded pools.
+zcash-shielded = ["zcash-sapling", "zcash-orchard"]
 # Tron: addresses and `trontx` (protobuf transactions: TRX, TRC-10 and
 # smart-contract calls, ids, signing).
 tron = ["secp256k1"]
