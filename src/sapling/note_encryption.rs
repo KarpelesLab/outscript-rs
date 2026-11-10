@@ -8,7 +8,11 @@
 //! and `esk` and a tag, under a key derived from `ovk`).
 //!
 //! Nothing here allocates: scanning a block is a loop of
-//! [`try_compact_note_decryption`] over its outputs.
+//! [`try_compact_note_decryption`] over its outputs, or one call of
+//! [`try_compact_note_decryption_batch`] with every key of the wallet.
+//!
+//! The shared secrets of the key agreement are wiped as soon as the
+//! symmetric key is derived from them.
 
 use super::field::Fr;
 use super::jubjub::Point;

@@ -26,6 +26,10 @@
 //!
 //! The Groth16 proofs are carried, not checked: [`BundleRef::verify`] checks
 //! everything else a validator does that does not need the chain state.
+//!
+//! Transactions from before NU5 (version 4, ZIP-243 layout) carry the same
+//! descriptions laid out differently, each spend with its own anchor:
+//! [`BundleV4Ref`] reads them.
 
 use super::Error;
 use super::jubjub::Point;
@@ -484,7 +488,7 @@ impl<'a> BundleRef<'a> {
     }
 
     /// [`verify`](Self::verify) with the signatures verified as a batch,
-    /// which is faster as soon as there is a spend. `random` is as for
+    /// which saves time when there are several spends. `random` is as for
     /// [`queue_signatures`](Self::queue_signatures).
     pub fn verify_batched(&self, sighash: &[u8; 32], random: &[u8]) -> Result<(), Error> {
         let mut batch = BatchVerifier::new();
@@ -522,6 +526,192 @@ impl<'a> BundleRef<'a> {
             anchor: self.anchor.copied().unwrap_or([0; 32]),
             binding_sig: self.binding_sig().unwrap_or(Signature([0; 64])),
         }
+    }
+}
+
+/// The size of a spend description of a v4 transaction: `cv`, anchor,
+/// nullifier, `rk`, proof and spend authorization signature.
+pub const SPEND_V4_SIZE: usize = 32 * 4 + GROTH_PROOF_SIZE + 64;
+/// The size of an output description of a v4 transaction: as in v5, with
+/// its proof at the end.
+pub const OUTPUT_V4_SIZE: usize = OUTPUT_SIZE + GROTH_PROOF_SIZE;
+
+/// A spend description borrowed from a v4 transaction, where every spend
+/// names its own anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpendV4Ref<'a> {
+    /// The value commitment to the spent note's value.
+    pub cv: &'a [u8; 32],
+    /// The root of the note commitment tree the spend refers to.
+    pub anchor: &'a [u8; 32],
+    /// The nullifier of the spent note.
+    pub nullifier: &'a [u8; 32],
+    /// The randomized spend validating key `rk`.
+    pub rk: &'a [u8; 32],
+    /// The Spend proof.
+    pub zkproof: &'a [u8; GROTH_PROOF_SIZE],
+    /// The spend authorization signature.
+    pub spend_auth_sig: &'a [u8; 64],
+}
+
+impl SpendV4Ref<'_> {
+    /// An owned copy, without the anchor.
+    pub fn to_owned(&self) -> SpendDescription {
+        SpendDescription {
+            cv: *self.cv,
+            nullifier: *self.nullifier,
+            rk: *self.rk,
+            zkproof: *self.zkproof,
+            spend_auth_sig: Signature(*self.spend_auth_sig),
+        }
+    }
+}
+
+fn spend_v4_ref(item: &[u8; SPEND_V4_SIZE]) -> SpendV4Ref<'_> {
+    SpendV4Ref {
+        cv: sub(item, 0),
+        anchor: sub(item, 32),
+        nullifier: sub(item, 64),
+        rk: sub(item, 96),
+        zkproof: sub(item, 128),
+        spend_auth_sig: sub(item, 128 + GROTH_PROOF_SIZE),
+    }
+}
+
+fn output_v4_ref(item: &[u8; OUTPUT_V4_SIZE]) -> OutputRef<'_> {
+    OutputRef {
+        cv: sub(item, 0),
+        cmu: sub(item, 32),
+        ephemeral_key: sub(item, 64),
+        enc_ciphertext: sub(item, 96),
+        out_ciphertext: sub(item, 96 + ENC_CIPHERTEXT_SIZE),
+        zkproof: sub(item, OUTPUT_SIZE),
+    }
+}
+
+/// The Sapling fields of a v4 (Sapling to Canopy, ZIP-243 layout)
+/// transaction, borrowed from its bytes:
+///
+/// ```text
+/// valueBalanceSapling   int64
+/// nShieldedSpend        compactSize
+/// vShieldedSpend        nShieldedSpend × 384 bytes
+/// nShieldedOutput       compactSize
+/// vShieldedOutput       nShieldedOutput × 948 bytes
+/// ```
+///
+/// They follow `nExpiryHeight` in the transaction. The binding signature
+/// is not next to them: it is the last 64 bytes of the transaction, after
+/// the JoinSplit fields, and is there only when there is a spend or an
+/// output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundleV4Ref<'a> {
+    value_balance: i64,
+    spends: &'a [[u8; SPEND_V4_SIZE]],
+    outputs: &'a [[u8; OUTPUT_V4_SIZE]],
+}
+
+impl<'a> BundleV4Ref<'a> {
+    /// Parses the Sapling fields at the start of `data` (the bytes of a v4
+    /// transaction from `valueBalanceSapling` on), and returns them with
+    /// what follows: `nJoinSplit` and the rest of the transaction.
+    ///
+    /// Only the structure is checked, and that the value balance is within
+    /// ±[`MAX_MONEY`].
+    pub fn parse_prefix(data: &'a [u8]) -> Result<(Self, &'a [u8]), Error> {
+        let mut data = data;
+        let balance = take(&mut data, 8)?;
+        let value_balance =
+            i64::from_le_bytes(balance.try_into().map_err(|_| Error::UnexpectedEof)?);
+        if !(-MAX_MONEY..=MAX_MONEY).contains(&value_balance) {
+            return Err(Error::ValueOutOfRange);
+        }
+        let n_spends = take_count(&mut data)?;
+        let spends = take_items(&mut data, n_spends)?;
+        let n_outputs = take_count(&mut data)?;
+        let outputs = take_items(&mut data, n_outputs)?;
+        let bundle = BundleV4Ref {
+            value_balance,
+            spends,
+            outputs,
+        };
+        Ok((bundle, data))
+    }
+
+    /// Whether there are neither spends nor outputs (the transaction then
+    /// has no binding signature).
+    pub const fn is_empty(&self) -> bool {
+        self.spends.is_empty() && self.outputs.is_empty()
+    }
+
+    /// The number of spend descriptions.
+    pub const fn n_spends(&self) -> usize {
+        self.spends.len()
+    }
+
+    /// The number of output descriptions.
+    pub const fn n_outputs(&self) -> usize {
+        self.outputs.len()
+    }
+
+    /// The net value leaving the Sapling pool, in zatoshis.
+    pub const fn value_balance(&self) -> i64 {
+        self.value_balance
+    }
+
+    /// Spend description `i`.
+    pub fn spend(&self, i: usize) -> Option<SpendV4Ref<'a>> {
+        self.spends.get(i).map(spend_v4_ref)
+    }
+
+    /// Output description `i`.
+    pub fn output(&self, i: usize) -> Option<OutputRef<'a>> {
+        self.outputs.get(i).map(output_v4_ref)
+    }
+
+    /// The spend descriptions, in order.
+    pub fn spends(&self) -> impl ExactSizeIterator<Item = SpendV4Ref<'a>> + Clone + use<'a> {
+        self.spends.iter().map(spend_v4_ref)
+    }
+
+    /// The output descriptions, in order.
+    pub fn outputs(&self) -> impl ExactSizeIterator<Item = OutputRef<'a>> + Clone + use<'a> {
+        self.outputs.iter().map(output_v4_ref)
+    }
+
+    /// The binding validating key: see
+    /// [`BundleRef::binding_validating_key`].
+    pub fn binding_validating_key(&self) -> Result<Point, Error> {
+        let mut sum = Point::IDENTITY;
+        for spend in self.spends() {
+            sum += Point::from_bytes(spend.cv).ok_or(Error::InvalidPoint)?;
+        }
+        for output in self.outputs() {
+            sum += Point::from_bytes(output.cv)
+                .ok_or(Error::InvalidPoint)?
+                .negate();
+        }
+        Ok(redjubjub::binding_validating_key(
+            [&sum],
+            [],
+            self.value_balance,
+        ))
+    }
+
+    /// Verifies the spend authorization signatures and the binding
+    /// signature (the last 64 bytes of the transaction) for the
+    /// transaction's ZIP-243 signature hash, which this crate does not
+    /// compute. The proofs are not verified.
+    ///
+    /// The signatures are checked by the rules in force since Canopy
+    /// (ZIP-216), which every transaction mined before it satisfies too
+    /// except for encodings that were never produced by wallets.
+    pub fn verify(&self, sighash: &[u8; 32], binding_sig: &[u8; 64]) -> Result<(), Error> {
+        for spend in self.spends() {
+            redjubjub::verify_spend(spend.rk, sighash, &Signature(*spend.spend_auth_sig))?;
+        }
+        let bvk = self.binding_validating_key()?;
+        redjubjub::verify_binding(&bvk, sighash, &Signature(*binding_sig))
     }
 }
 
@@ -987,5 +1177,88 @@ mod tests {
                 assert!(BundleRef::parse(&bytes[..len]).is_err(), "{len}");
             }
         }
+    }
+
+    /// Mainnet transaction
+    /// `b2cc959423b4cb9b9237010316d3a45f6cd2cc8eeacbf461bd350d5bfdd1afaf`
+    /// (block 1001000, version 4): its Sapling fields, against what
+    /// `zcash_primitives` reads from it and the signature hash it computes
+    /// (`mainnet_v4_sapling_proofs.json`).
+    #[test]
+    fn mainnet_v4_transaction() {
+        let raw = hex::decode(include_str!("testdata/mainnet_v4_sapling_tx.hex").trim()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/mainnet_v4_sapling_proofs.json")).unwrap();
+        let field = |v: &serde_json::Value, name: &str| -> Vec<u8> {
+            hex::decode(v[name].as_str().unwrap()).unwrap()
+        };
+        // header, version group, no transparent inputs or outputs, lock
+        // time and expiry height
+        assert_eq!(raw[..10], hex::decode("0400008085202f890000").unwrap()[..]);
+        let (bundle, rest) = BundleV4Ref::parse_prefix(&raw[18..]).unwrap();
+        // no JoinSplits, then the binding signature
+        assert_eq!((rest.len(), rest[0]), (65, 0));
+        let binding_sig: &[u8; 64] = rest[1..].try_into().unwrap();
+
+        assert_eq!(
+            bundle.value_balance(),
+            json["value_balance"].as_i64().unwrap()
+        );
+        let spends = json["spends"].as_array().unwrap();
+        let outputs = json["outputs"].as_array().unwrap();
+        assert_eq!((bundle.n_spends(), bundle.n_outputs()), (1, 2));
+        assert_eq!((spends.len(), outputs.len()), (1, 2));
+        assert!(!bundle.is_empty());
+        for (i, (spend, expected)) in bundle.spends().zip(spends).enumerate() {
+            assert_eq!(bundle.spend(i), Some(spend));
+            assert_eq!(spend.cv[..], field(expected, "cv")[..]);
+            assert_eq!(spend.anchor[..], field(expected, "anchor")[..]);
+            assert_eq!(spend.nullifier[..], field(expected, "nullifier")[..]);
+            assert_eq!(spend.rk[..], field(expected, "rk")[..]);
+            assert_eq!(spend.zkproof[..], field(expected, "zkproof")[..]);
+            assert_eq!(spend.to_owned().rk, *spend.rk);
+        }
+        for (i, (output, expected)) in bundle.outputs().zip(outputs).enumerate() {
+            assert_eq!(bundle.output(i), Some(output));
+            assert_eq!(output.cv[..], field(expected, "cv")[..]);
+            assert_eq!(output.cmu[..], field(expected, "cmu")[..]);
+            assert_eq!(
+                output.ephemeral_key[..],
+                field(expected, "ephemeral_key")[..]
+            );
+            assert_eq!(output.zkproof[..], field(expected, "zkproof")[..]);
+        }
+        assert_eq!((bundle.spend(1), bundle.output(2)), (None, None));
+
+        let sighash: [u8; 32] = field(&json, "sighash").try_into().unwrap();
+        assert_eq!(bundle.verify(&sighash, binding_sig), Ok(()));
+        assert_eq!(
+            bundle.verify(&[1; 32], binding_sig),
+            Err(Error::InvalidSignature)
+        );
+        let mut bad = *binding_sig;
+        bad[40] ^= 1;
+        assert_eq!(bundle.verify(&sighash, &bad), Err(Error::InvalidSignature));
+
+        // malformed input is an error, never a panic
+        let sapling = &raw[18..raw.len() - 65];
+        for len in 0..sapling.len() {
+            assert_eq!(
+                BundleV4Ref::parse_prefix(&sapling[..len]).unwrap_err(),
+                Error::UnexpectedEof
+            );
+        }
+        let mut huge = sapling.to_vec();
+        huge[8..9].copy_from_slice(&[0xff]);
+        assert!(BundleV4Ref::parse_prefix(&huge).is_err());
+        let mut balance = sapling.to_vec();
+        balance[7] = 0x7f;
+        assert_eq!(
+            BundleV4Ref::parse_prefix(&balance).unwrap_err(),
+            Error::ValueOutOfRange
+        );
+        let (empty, rest) = BundleV4Ref::parse_prefix(&[0; 11]).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(rest, [0]);
     }
 }

@@ -7,14 +7,17 @@
 //! - [`group_hash`], [`generators`] and [`pedersen`]: `GroupHash`, the fixed
 //!   generators, Pedersen hashes and commitments;
 //! - [`tree`]: the note commitment tree (`MerkleCRH`, empty roots, frontiers,
-//!   witnesses and authentication paths);
+//!   incremental witnesses in `zcashd`'s format and authentication paths);
 //! - [`keys`] and [`zip32`]: spending, viewing and incoming viewing keys,
 //!   payment addresses, hierarchical derivation and their Bech32 encodings;
 //! - [`note`]: notes, note commitments, nullifiers and value commitments;
-//! - [`note_encryption`]: note encryption, trial decryption and recovery
-//!   with an outgoing viewing key;
-//! - [`redjubjub`]: the spend authorization and binding signature schemes;
-//! - [`bundle`]: the Sapling part of a v5 transaction.
+//! - [`note_encryption`]: note encryption, trial decryption (one output at
+//!   a time, or many outputs and keys in a batch) and recovery with an
+//!   outgoing viewing key;
+//! - [`redjubjub`]: the spend authorization and binding signature schemes,
+//!   with batched verification;
+//! - [`bundle`]: the Sapling part of a v5 transaction, and the Sapling
+//!   fields of a v4 one.
 //!
 //! Keys, addresses, signatures, trees and trial decryption work without an
 //! allocator; only the owned bundle type needs `alloc`.
@@ -28,14 +31,19 @@
 //! allocator and enables `purecrypto`'s BLS12-381) adds the proof system:
 //!
 //! - `groth16`: Groth16 over BLS12-381, compatible with `bellman` (the
-//!   parameter file format, proof creation and verification);
+//!   parameter file format, proof creation, verification and batched
+//!   verification);
 //! - `circuit`: the Spend and Output circuits;
 //! - `prover`: the Sapling proving parameters (supplied by the caller and
-//!   checked by hash), the embedded verifying keys, and typed proving and
-//!   verification of Spend and Output descriptions;
+//!   checked by hash), the embedded verifying keys, typed proving and
+//!   verification of Spend and Output descriptions, and the complete
+//!   verification of a bundle (`verify_bundle`);
 //! - `builder`: a builder that turns notes to spend and outputs to create
 //!   into a complete, proven and signed Sapling bundle for
-//!   [`zcashtx`](crate::zcashtx).
+//!   [`zcashtx`](crate::zcashtx), with optional change, dummy spends and
+//!   outputs, shuffling, and spends authorized by a key held elsewhere (a
+//!   hardware wallet): the builder then only needs the proof generation
+//!   key.
 //!
 //! Verifying proofs needs no external file; creating them needs
 //! `sapling-spend.params` and `sapling-output.params`. The prover's
