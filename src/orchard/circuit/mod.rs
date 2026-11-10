@@ -6,6 +6,7 @@
 // While the port is in progress.
 #![allow(dead_code)]
 
+pub(crate) mod add_chip;
 pub(crate) mod ecc;
 pub(crate) mod poseidon;
 pub(crate) mod sinsemilla;

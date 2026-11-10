@@ -7,9 +7,6 @@ use crate::orchard::Fp;
 use crate::orchard::halo2::Error;
 use crate::orchard::halo2::circuit::{AssignedCell, Layouter};
 
-// Declared here until `circuit/mod.rs` does.
-#[path = "../add_chip.rs"]
-pub(crate) mod add_chip;
 mod pow5;
 #[cfg(test)]
 pub(crate) mod test_util;
