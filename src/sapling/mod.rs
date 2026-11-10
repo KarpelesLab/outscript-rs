@@ -35,6 +35,8 @@
 pub mod bundle;
 pub mod field;
 pub mod generators;
+#[cfg(feature = "zcash-sapling-prover")]
+pub mod groth16;
 pub mod group_hash;
 pub mod jubjub;
 pub mod keys;
