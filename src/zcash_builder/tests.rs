@@ -5,13 +5,14 @@
 //!
 //! With `ZCASH_TX_DUMP` set to a directory, the transactions built are
 //! written there (`<name>.hex`, with `<name>.prevouts` holding one
-//! `amount:scriptPubKey` per transparent input and `<name>.txid`), to
-//! check them with other implementations.
+//! `amount:scriptPubKey` per transparent input, `<name>.txid`, and for
+//! some `<name>.fvks`, the Orchard full viewing keys that read their
+//! notes), to check them with other implementations.
 
 use super::*;
 use crate::crypto::secp256k1::{SecpPublicKey, parse_der_signature};
 use crate::pushbytes::parse_push_bytes;
-use crate::zcashtx::branch;
+use crate::zcashtx::{TxFormat, branch, tx_format};
 use crate::{PubKey, generate_script};
 
 /// Deterministic stand-in for the caller's random generator.
@@ -110,6 +111,114 @@ fn dump(name: &str, tx: &Transaction, coins: &[Coin]) {
         .map(|coin| format!("{}:{}", coin.amount, hex::encode(&coin.script)))
         .collect();
     std::fs::write(dir.join(format!("{name}.prevouts")), prevouts.join("\n")).unwrap();
+}
+
+/// Writes the Orchard full viewing keys that read the notes of a built
+/// transaction where `ZCASH_TX_DUMP` says.
+#[cfg(feature = "zcash-orchard-prover")]
+fn dump_fvks(name: &str, fvks: &[&crate::orchard::keys::FullViewingKey]) {
+    let Some(dir) = std::env::var_os("ZCASH_TX_DUMP") else {
+        return;
+    };
+    let keys: Vec<String> = fvks.iter().map(|fvk| hex::encode(fvk.to_bytes())).collect();
+    let path = std::path::PathBuf::from(dir).join(format!("{name}.fvks"));
+    std::fs::write(path, keys.join(",")).unwrap();
+}
+
+/// The version of the transaction, by branch and by choice, and version 6
+/// transactions without shielded parts.
+#[test]
+fn transaction_versions() {
+    let k = key(1);
+    let script = p2pkh(&k);
+    let to = p2pkh(&key(9));
+    let coins = [Coin {
+        amount: 100_000,
+        script: script.clone(),
+    }];
+    let build = |branch_id: u32, version: Option<TxVersion>| {
+        let mut builder = Builder::new(branch_id, 3_600_000, 0);
+        if let Some(version) = version {
+            builder.set_tx_version(version);
+        }
+        let prevout = ZcashTxOut {
+            amount: 100_000,
+            script: &script,
+        };
+        builder
+            .add_transparent_input(&k, [7; 32], 1, u32::MAX, prevout)
+            .unwrap();
+        builder.add_transparent_output(90_000, &to).unwrap();
+        (
+            builder.tx_version(),
+            builder.build(&Provers::new(), 10_000, &random(1)),
+        )
+    };
+    // the version wallets use under each upgrade
+    for (branch_id, expected) in [
+        (branch::NU5, TxVersion::V5),
+        (branch::NU6, TxVersion::V5),
+        (branch::NU6_1, TxVersion::V5),
+        (branch::NU6_2, TxVersion::V5),
+        (branch::NU6_3, TxVersion::V6),
+        (branch::NU7, TxVersion::V6),
+        (0x1234_5678, TxVersion::V5),
+    ] {
+        let (version, tx) = build(branch_id, None);
+        assert_eq!(version, expected);
+        let tx = tx.unwrap();
+        assert_eq!(tx_format(&tx.raw).unwrap().tx_version(), Some(expected));
+        verify_transparent(&tx, &coins, 1);
+    }
+    // version 5 stays valid from NU6.3; version 6 is not before
+    for branch_id in [branch::NU6_3, branch::NU7] {
+        let (version, v5) = build(branch_id, Some(TxVersion::V5));
+        assert_eq!(version, TxVersion::V5);
+        let v5 = v5.unwrap();
+        assert_eq!(tx_format(&v5.raw), Ok(TxFormat::V5));
+        verify_transparent(&v5, &coins, 1);
+        let v6 = build(branch_id, Some(TxVersion::V6)).1.unwrap();
+        assert_eq!(v6, build(branch_id, None).1.unwrap());
+        assert_ne!(v6.txid, v5.txid);
+        assert_eq!(v6.raw.len(), v5.raw.len() + 1);
+    }
+    for branch_id in [branch::NU5, branch::NU6_2] {
+        assert_eq!(
+            build(branch_id, Some(TxVersion::V6)).1,
+            Err(Error::VersionNotActive)
+        );
+    }
+    // a branch not known here: the caller's choice is taken
+    let (_, tx) = build(0x1234_5678, Some(TxVersion::V6));
+    assert_eq!(tx_format(&tx.unwrap().raw), Ok(TxFormat::V6));
+
+    // the version 6 transaction is the one `ZcashTx::sign` makes
+    let tx = build(branch::NU7, None).1.unwrap();
+    dump("transparent_v6", &tx, &coins);
+    let inputs = [ZcashTxIn {
+        txid: [7; 32],
+        vout: 1,
+        script_sig: &[],
+        sequence: u32::MAX,
+    }];
+    let outputs = [ZcashTxOut {
+        amount: 90_000,
+        script: &to,
+    }];
+    let plain = ZcashTx {
+        version: TxVersion::V6,
+        consensus_branch_id: branch::NU7,
+        expiry_height: 3_600_000,
+        inputs: &inputs,
+        outputs: &outputs,
+        ..Default::default()
+    };
+    let prevouts = [ZcashTxOut {
+        amount: 100_000,
+        script: &script,
+    }];
+    assert_eq!(plain.sign(&[&k], &prevouts).unwrap(), tx.raw);
+    assert_eq!(plain.txid().unwrap(), tx.txid);
 }
 
 #[test]
@@ -354,9 +463,11 @@ mod orchard {
         );
         assert_eq!(orchard_circuit_version(branch::NU6_2), Some(FixedPostNu6_2));
         assert_eq!(orchard_circuit_version(branch::NU6_3), Some(PostNu6_3));
-        // NU7, Canopy, anything else
-        assert_eq!(orchard_circuit_version(0x7719_0ad9), None);
+        // NU7 keeps the circuit of NU6.3 (`zcash_protocol` 0.11.0)
+        assert_eq!(orchard_circuit_version(branch::NU7), Some(PostNu6_3));
+        // Canopy, anything else
         assert_eq!(orchard_circuit_version(0xe9ff_75a6), None);
+        assert_eq!(orchard_circuit_version(0x1234_5678), None);
         assert_eq!(orchard_circuit_version(0), None);
     }
 
@@ -366,8 +477,9 @@ mod orchard {
         let other = wallet(2, 0);
 
         // an unknown branch needs its circuit version, a bundle its anchor
-        let mut builder = Builder::new(0x7719_0ad9, 0, 0);
+        let mut builder = Builder::new(0x1234_5678, 0, 0);
         assert_eq!(builder.orchard_circuit_version(), None);
+        assert_eq!(builder.tx_version(), TxVersion::V5);
         builder.set_orchard_anchor(w.anchor).unwrap();
         assert_eq!(
             builder.add_orchard_output(None, other.address, 1, NO_MEMO),
@@ -453,6 +565,12 @@ mod orchard {
     /// pools, for the circuit version of `branch_id`: one transparent coin
     /// and one note in, one transparent output and one note out.
     fn orchard_transaction(branch_id: u32, name: &str) {
+        orchard_transaction_as(branch_id, None, name)
+    }
+
+    /// The same, in the transaction version given rather than in the one
+    /// of the branch.
+    fn orchard_transaction_as(branch_id: u32, tx_version: Option<TxVersion>, name: &str) {
         let version = orchard_circuit_version(branch_id).unwrap();
         let restricted = version.supports_cross_address_restriction();
         let w = wallet(1, 500_000);
@@ -465,6 +583,15 @@ mod orchard {
         let to = p2pkh(&key(5));
 
         let mut builder = Builder::new(branch_id, 3_500_000, 0);
+        if let Some(tx_version) = tx_version {
+            builder.set_tx_version(tx_version);
+        }
+        let tx_version = builder.tx_version();
+        assert_eq!(
+            tx_version,
+            tx_version_of(branch_id, tx_version),
+            "{name}: the version of the branch unless chosen"
+        );
         let prevout = ZcashTxOut {
             amount: coins[0].amount,
             script: &coins[0].script,
@@ -521,6 +648,8 @@ mod orchard {
             .unwrap();
         std::eprintln!("{name}: built in {:?}", start.elapsed());
         dump(name, &tx, &coins);
+        dump_fvks(name, &[&w.fvk, &other.fvk]);
+        assert_eq!(tx_format(&tx.raw).unwrap().tx_version(), Some(tx_version));
 
         let sighash = verify_transparent(&tx, &coins, 1);
         let found = verify_orchard(
@@ -558,6 +687,366 @@ mod orchard {
     #[ignore = "slow in the test profile"]
     fn orchard_transaction_nu6_3() {
         orchard_transaction(branch::NU6_3, "orchard_nu6_3");
+    }
+
+    /// Under NU7 as under NU6.3: a version 6 transaction.
+    #[test]
+    #[ignore = "slow in the test profile"]
+    fn orchard_transaction_nu7() {
+        orchard_transaction(branch::NU7, "orchard_nu7");
+    }
+
+    /// Version 5 stays valid under NU6.3 and NU7, and can be asked for.
+    #[test]
+    #[ignore = "slow in the test profile"]
+    fn orchard_transaction_v5_from_nu6_3() {
+        orchard_transaction_as(branch::NU6_3, Some(TxVersion::V5), "orchard_nu6_3_v5");
+        orchard_transaction_as(branch::NU7, Some(TxVersion::V5), "orchard_nu7_v5");
+    }
+
+    /// The version a transaction of the test is expected in.
+    fn tx_version_of(branch_id: u32, chosen: TxVersion) -> TxVersion {
+        match (branch_id, chosen) {
+            (branch::NU6_3 | branch::NU7, TxVersion::V5) => TxVersion::V5,
+            (branch::NU6_3 | branch::NU7, TxVersion::V6) => TxVersion::V6,
+            _ => TxVersion::V5,
+        }
+    }
+
+    /// An Ironwood wallet: as [`wallet`], its note being one of the
+    /// Ironwood pool, in the tree of that pool.
+    pub(super) fn ironwood_wallet(seed: u8, value: u64) -> Wallet {
+        use crate::orchard::note::NoteVersion;
+        let sk = SpendingKey::from_bytes(random(seed)).unwrap();
+        let fvk = sk.to_fvk();
+        let address = fvk.address_at(0u32, Scope::External);
+        let rho = Nullifier::from_fp(Fp::from_uniform_bytes(&random(seed.wrapping_add(110))));
+        let note = Note::from_parts_versioned(
+            address,
+            value,
+            rho,
+            random(seed.wrapping_add(111)),
+            NoteVersion::V3,
+        )
+        .unwrap();
+        let leaves = [
+            Fp::from_u64(55),
+            note.cmx().to_fp(),
+            Fp::from_u64(66),
+            Fp::from_u64(77),
+            Fp::from_u64(88),
+        ];
+        Wallet {
+            sk,
+            fvk,
+            address,
+            note,
+            path: tree::witness(&leaves, 1).unwrap(),
+            anchor: tree::root(&leaves).unwrap(),
+        }
+    }
+
+    /// Verifies the Ironwood bundle of a serialized transaction in full,
+    /// and returns the total value of the notes `fvks` can read in it.
+    pub(super) fn verify_ironwood(
+        raw: &[u8],
+        n_inputs: usize,
+        n_outputs: usize,
+        sighash: &[u8; 32],
+        actions: usize,
+        value_balance: i64,
+        fvks: &[&FullViewingKey],
+    ) -> u64 {
+        use crate::orchard::bundle::Flags;
+        use crate::orchard::note::NoteVersion;
+        use crate::orchard::note_encryption::try_note_decryption_versioned;
+        let mut inputs = vec![ZcashTxIn::default(); n_inputs];
+        let mut outputs = vec![ZcashTxOut::default(); n_outputs];
+        let parsed = ZcashTx::parse_into(raw, &mut inputs, &mut outputs).unwrap();
+        assert_eq!(parsed.version, TxVersion::V6);
+        let bundle = parsed.ironwood_bundle().unwrap().unwrap();
+        assert_eq!(bundle.action_count(), actions);
+        assert_eq!(bundle.flags(), Flags::IRONWOOD_ENABLED);
+        assert_eq!(bundle.value_balance(), value_balance);
+        assert_eq!(bundle.verify_signatures(sighash), Ok(()));
+        assert!(bundle.verify_signatures(&[0x55; 32]).is_err());
+        for vk in VerifyingKey::embedded_all() {
+            assert_eq!(
+                bundle.verify_proof(&vk).is_ok(),
+                vk.version() == CircuitVersion::PostNu6_3
+            );
+        }
+        // read as an Orchard bundle (restricted), the proof is not valid
+        let mut bytes = parsed.ironwood.to_vec();
+        let flags = 1 + actions * crate::orchard::bundle::ACTION_SIZE;
+        assert_eq!(bytes[flags], 0b111);
+        bytes[flags] = 0b011;
+        let restricted = crate::orchard::bundle::BundleRef::parse(&bytes)
+            .unwrap()
+            .unwrap();
+        let vk = VerifyingKey::embedded(CircuitVersion::PostNu6_3);
+        assert!(restricted.verify_proof(&vk).is_err());
+
+        let mut found = 0;
+        for action in bundle.actions() {
+            for fvk in fvks {
+                let ivk = fvk.to_ivk(Scope::External);
+                let output = action.output();
+                // the notes are of the Ironwood version, and of no other
+                assert_eq!(
+                    try_note_decryption(&ivk, &output, &action.enc_ciphertext),
+                    None
+                );
+                if let Some((note, _)) = try_note_decryption_versioned(
+                    NoteVersion::V3,
+                    &ivk,
+                    &output,
+                    &action.enc_ciphertext,
+                ) {
+                    assert_eq!(note.version(), NoteVersion::V3);
+                    found += note.value();
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn ironwood_checks() {
+        let w = ironwood_wallet(1, 500_000);
+        let other = wallet(2, 0);
+        let orchard_note = wallet(1, 500_000);
+
+        let mut builder = Builder::new(branch::NU7, 0, 0);
+        assert_eq!(builder.tx_version(), TxVersion::V6);
+        assert_eq!(
+            builder.orchard_circuit_version(),
+            Some(CircuitVersion::PostNu6_3)
+        );
+        // a bundle needs its anchor: that of the Ironwood tree
+        assert_eq!(
+            builder.add_ironwood_spend(&w.sk, w.note, w.path),
+            Err(Error::MissingAnchor)
+        );
+        assert_eq!(
+            builder.add_ironwood_output(None, other.address, 1, NO_MEMO),
+            Err(Error::MissingAnchor)
+        );
+        builder.set_orchard_anchor(w.anchor).unwrap();
+        assert_eq!(
+            builder.add_ironwood_output(None, other.address, 1, NO_MEMO),
+            Err(Error::MissingAnchor)
+        );
+        builder.set_ironwood_anchor(other.anchor).unwrap();
+        assert_eq!(
+            builder.add_ironwood_spend(&w.sk, w.note, w.path),
+            Err(Error::Orchard(BuildError::AnchorMismatch))
+        );
+        builder.set_ironwood_anchor(w.anchor).unwrap();
+        assert_eq!(
+            builder.add_ironwood_spend(&other.sk, w.note, w.path),
+            Err(Error::Orchard(BuildError::WrongKey))
+        );
+        assert_eq!(
+            builder.add_ironwood_output(None, other.address, MAX_MONEY + 1, NO_MEMO),
+            Err(Error::ValueOutOfRange)
+        );
+        // each pool has its notes
+        assert_eq!(
+            builder.add_ironwood_spend(&orchard_note.sk, orchard_note.note, orchard_note.path),
+            Err(Error::Orchard(BuildError::WrongNoteVersion))
+        );
+        assert_eq!(
+            builder.add_orchard_spend(&w.sk, w.note, w.path),
+            Err(Error::Orchard(BuildError::WrongNoteVersion))
+        );
+        assert_eq!(builder.logical_actions(), 0);
+        assert_eq!(builder.ironwood_balance(), Ok(0));
+
+        builder.add_ironwood_spend(&w.sk, w.note, w.path).unwrap();
+        assert_eq!(
+            builder.set_ironwood_anchor(w.anchor),
+            Err(Error::AlreadyStarted)
+        );
+        assert_eq!(builder.ironwood_balance(), Ok(500_000));
+        assert_eq!(builder.orchard_balance(), Ok(0));
+        assert_eq!(builder.fee(), Ok(500_000));
+        assert_eq!(builder.logical_actions(), 2);
+        // outputs go to any address
+        for _ in 0..3 {
+            builder
+                .add_ironwood_output(None, other.address, 150_000, NO_MEMO)
+                .unwrap();
+        }
+        assert_eq!(builder.ironwood_balance(), Ok(50_000));
+        assert_eq!(builder.logical_actions(), 3);
+        assert_eq!(builder.conventional_fee(), 15_000);
+        // the Orchard actions count with them
+        let ow = wallet(3, 70_000);
+        builder.set_orchard_anchor(ow.anchor).unwrap();
+        builder.add_orchard_spend(&ow.sk, ow.note, ow.path).unwrap();
+        assert_eq!(builder.logical_actions(), 5);
+        assert_eq!(builder.fee(), Ok(120_000));
+        assert_eq!(
+            builder.build(&Provers::new(), 120_000, &random(3)),
+            Err(Error::MissingProvingKey)
+        );
+
+        // Ironwood parts need version 6, which needs NU6.3
+        let ironwood_in = |branch_id: u32, version: Option<TxVersion>| {
+            let mut builder = Builder::new(branch_id, 0, 0);
+            if let Some(version) = version {
+                builder.set_tx_version(version);
+            }
+            builder.set_ironwood_anchor(w.anchor).unwrap();
+            builder.add_ironwood_spend(&w.sk, w.note, w.path).unwrap();
+            builder.build(&Provers::new(), 500_000, &random(3))
+        };
+        assert_eq!(
+            ironwood_in(branch::NU7, Some(TxVersion::V5)),
+            Err(Error::IronwoodNeedsV6)
+        );
+        assert_eq!(
+            ironwood_in(branch::NU6_3, Some(TxVersion::V5)),
+            Err(Error::IronwoodNeedsV6)
+        );
+        assert_eq!(
+            ironwood_in(branch::NU6_2, None),
+            Err(Error::IronwoodNeedsV6)
+        );
+        assert_eq!(
+            ironwood_in(branch::NU6_2, Some(TxVersion::V6)),
+            Err(Error::VersionNotActive)
+        );
+        assert_eq!(
+            ironwood_in(branch::NU6_3, None),
+            Err(Error::MissingProvingKey)
+        );
+
+        // from NU6.3 the Orchard pool takes no value in, in any version
+        let orchard_in = |branch_id: u32, version: TxVersion, output: u64| {
+            let w = wallet(1, 500_000);
+            let k = key(1);
+            let script = p2pkh(&k);
+            let mut builder = Builder::new(branch_id, 0, 0);
+            builder.set_tx_version(version);
+            let prevout = ZcashTxOut {
+                amount: 100_000,
+                script: &script,
+            };
+            builder
+                .add_transparent_input(&k, [1; 32], 0, u32::MAX, prevout)
+                .unwrap();
+            builder.set_orchard_anchor(w.anchor).unwrap();
+            builder.add_orchard_spend(&w.sk, w.note, w.path).unwrap();
+            builder
+                .add_orchard_output(None, w.address, output, NO_MEMO)
+                .unwrap();
+            let fee = 600_000 - output;
+            builder.build(&Provers::new(), fee, &random(3))
+        };
+        for version in [TxVersion::V5, TxVersion::V6] {
+            for branch_id in [branch::NU6_3, branch::NU7] {
+                assert_eq!(
+                    orchard_in(branch_id, version, 500_001),
+                    Err(Error::OrchardPoolClosed)
+                );
+                assert_eq!(
+                    orchard_in(branch_id, version, 500_000),
+                    Err(Error::MissingProvingKey)
+                );
+            }
+        }
+        assert_eq!(
+            orchard_in(branch::NU6_2, TxVersion::V5, 500_001),
+            Err(Error::MissingProvingKey)
+        );
+    }
+
+    /// A version 6 transaction between the transparent and the Ironwood
+    /// pools: one transparent coin and one Ironwood note in, one
+    /// transparent output and two Ironwood notes out, to another address
+    /// and back.
+    fn ironwood_transaction(branch_id: u32, name: &str) {
+        let w = ironwood_wallet(1, 500_000);
+        let other = wallet(2, 0);
+        let k = key(4);
+        let coins = [Coin {
+            amount: 100_000,
+            script: p2pkh(&k),
+        }];
+        let to = p2pkh(&key(5));
+
+        let mut builder = Builder::new(branch_id, 3_600_000, 0);
+        assert_eq!(builder.tx_version(), TxVersion::V6);
+        let prevout = ZcashTxOut {
+            amount: coins[0].amount,
+            script: &coins[0].script,
+        };
+        builder
+            .add_transparent_input(&k, [0x51; 32], 2, u32::MAX, prevout)
+            .unwrap();
+        builder.set_ironwood_anchor(w.anchor).unwrap();
+        builder.add_ironwood_spend(&w.sk, w.note, w.path).unwrap();
+        let ovk = Some(w.fvk.to_ovk(Scope::External));
+        builder
+            .add_ironwood_output(ovk, other.address, 450_000, NO_MEMO)
+            .unwrap();
+        builder
+            .add_ironwood_output(ovk, w.address, 100_000, NO_MEMO)
+            .unwrap();
+        builder.add_transparent_output(35_000, &to).unwrap();
+        assert_eq!(builder.ironwood_balance(), Ok(-50_000));
+        assert_eq!(builder.orchard_balance(), Ok(0));
+        // one transparent action and two Ironwood ones
+        assert_eq!(builder.conventional_fee(), 15_000);
+        assert_eq!(builder.fee(), Ok(15_000));
+
+        // the key of another circuit version is refused
+        let wrong = ProvingKey::build(CircuitVersion::FixedPostNu6_2);
+        let mut bad = Builder::new(branch_id, 0, 0);
+        bad.set_ironwood_anchor(w.anchor).unwrap();
+        bad.add_ironwood_spend(&w.sk, w.note, w.path).unwrap();
+        assert_eq!(
+            bad.build(&Provers::new().orchard(&wrong), 500_000, &random(8)),
+            Err(Error::Orchard(BuildError::WrongProvingKey))
+        );
+
+        let pk = ProvingKey::build(CircuitVersion::PostNu6_3);
+        let start = std::time::Instant::now();
+        let tx = builder
+            .build(&Provers::new().orchard(&pk), 15_000, &random(7))
+            .unwrap();
+        std::eprintln!("{name}: built in {:?}", start.elapsed());
+        dump(name, &tx, &coins);
+        dump_fvks(name, &[&w.fvk, &other.fvk]);
+        assert_eq!(tx_format(&tx.raw), Ok(TxFormat::V6));
+
+        let sighash = verify_transparent(&tx, &coins, 1);
+        let found = verify_ironwood(&tx.raw, 1, 1, &sighash, 2, -50_000, &[&w.fvk, &other.fvk]);
+        assert_eq!(found, 550_000);
+        let mut ins = [ZcashTxIn::default(); 1];
+        let mut outs = [ZcashTxOut::default(); 1];
+        let parsed = ZcashTx::parse_into(&tx.raw, &mut ins, &mut outs).unwrap();
+        assert!(parsed.sapling.is_empty() && parsed.orchard.is_empty());
+        assert_eq!(parsed.orchard_bundle(), Ok(None));
+        assert_eq!(parsed.conventional_fee(), Ok(15_000));
+        // the nullifier of the note spent is revealed
+        let nullifier = w.note.nullifier(&w.fvk).to_bytes();
+        let bundle = parsed.ironwood_bundle().unwrap().unwrap();
+        assert!(bundle.actions().any(|a| a.nullifier == nullifier));
+    }
+
+    #[test]
+    #[ignore = "slow in the test profile"]
+    fn ironwood_transaction_nu6_3() {
+        ironwood_transaction(branch::NU6_3, "ironwood_nu6_3");
+    }
+
+    #[test]
+    #[ignore = "slow in the test profile"]
+    fn ironwood_transaction_nu7() {
+        ironwood_transaction(branch::NU7, "ironwood_nu7");
     }
 }
 
@@ -774,6 +1263,191 @@ mod sapling {
         )
         .unwrap();
         assert_eq!(note, sent);
+    }
+}
+
+/// The whole of a version 6 transaction, under NU7: transparent coins, a
+/// Sapling note, an Orchard note and an Ironwood note in; a transparent
+/// output, a Sapling note, an Orchard note (back to its address) and two
+/// Ironwood notes out. Built, parsed back, and every proof and signature
+/// verified.
+#[cfg(all(
+    feature = "std",
+    feature = "zcash-sapling-prover",
+    feature = "zcash-orchard-prover"
+))]
+#[test]
+#[ignore = "needs the Sapling parameters"]
+fn full_transaction_v6() {
+    use crate::orchard::builder::NO_MEMO;
+    use crate::orchard::circuit::ProvingKey;
+    use crate::orchard::keys::Scope;
+
+    let branch_id = branch::NU7;
+    let version = orchard_circuit_version(branch_id).unwrap();
+    assert_eq!(version, CircuitVersion::PostNu6_3);
+    let (spend_params, output_params) = crate::sapling::prover::tests::load_params();
+    let pk = ProvingKey::build(version);
+    let provers = Provers::new()
+        .sapling_spend(&spend_params)
+        .sapling_output(&output_params)
+        .orchard(&pk);
+
+    let keys = [key(4), key(6)];
+    let coins = [
+        Coin {
+            amount: 100_000,
+            script: p2pkh(&keys[0]),
+        },
+        Coin {
+            amount: 30_000,
+            script: p2pkh(&keys[1]),
+        },
+    ];
+    let to = p2pkh(&key(5));
+    let sw = sapling::wallet(1, 200_000);
+    let s_recipient = sapling::wallet(2, 0);
+    let expsk = sw.key.expanded_spending_key();
+    let ow = orchard::wallet(1, 500_000);
+    let iw = orchard::ironwood_wallet(3, 300_000);
+    let i_recipient = orchard::wallet(2, 0);
+
+    let mut builder = Builder::new(branch_id, 3_600_000, 0);
+    assert_eq!(builder.tx_version(), TxVersion::V6);
+    for (i, (key, coin)) in keys.iter().zip(&coins).enumerate() {
+        let prevout = ZcashTxOut {
+            amount: coin.amount,
+            script: &coin.script,
+        };
+        builder
+            .add_transparent_input(key, [0x61 + i as u8; 32], i as u32, u32::MAX, prevout)
+            .unwrap();
+    }
+    builder.add_transparent_output(40_000, &to).unwrap();
+    builder.set_sapling_anchor(sw.anchor).unwrap();
+    builder
+        .add_sapling_spend(expsk, &sw.note, &sw.path, &random(30))
+        .unwrap();
+    builder
+        .add_sapling_output(
+            Some(expsk.ovk()),
+            &s_recipient.address,
+            150_000,
+            None,
+            &random(31),
+        )
+        .unwrap();
+    // the Orchard pool only empties: what stays goes back to its address
+    builder.set_orchard_anchor(ow.anchor).unwrap();
+    builder.add_orchard_spend(&ow.sk, ow.note, ow.path).unwrap();
+    builder
+        .add_orchard_output(
+            Some(ow.fvk.to_ovk(Scope::External)),
+            ow.address,
+            100_000,
+            NO_MEMO,
+        )
+        .unwrap();
+    // and the rest moves to the Ironwood pool
+    builder.set_ironwood_anchor(iw.anchor).unwrap();
+    builder
+        .add_ironwood_spend(&iw.sk, iw.note, iw.path)
+        .unwrap();
+    let ovk = Some(iw.fvk.to_ovk(Scope::External));
+    builder
+        .add_ironwood_output(ovk, i_recipient.address, 700_000, NO_MEMO)
+        .unwrap();
+    builder
+        .add_ironwood_output(ovk, iw.address, 105_000, NO_MEMO)
+        .unwrap();
+
+    // the four pools: 90 000 out of the transparent one, 50 000 out of
+    // Sapling, 400 000 out of Orchard, 505 000 into Ironwood, and the
+    // rest is the fee
+    assert_eq!(builder.transparent_balance(), 90_000);
+    assert_eq!(builder.sapling_balance(), 50_000);
+    assert_eq!(builder.orchard_balance(), Ok(400_000));
+    assert_eq!(builder.ironwood_balance(), Ok(-505_000));
+    assert_eq!(builder.fee(), Ok(35_000));
+    // two transparent inputs, one Sapling spend, two Orchard actions and
+    // two Ironwood ones
+    assert_eq!(builder.logical_actions(), 7);
+    assert_eq!(builder.conventional_fee(), 35_000);
+
+    let start = std::time::Instant::now();
+    let tx = builder.build(&provers, 35_000, &random(32)).unwrap();
+    std::eprintln!("full version 6 transaction built in {:?}", start.elapsed());
+    dump("full_v6", &tx, &coins);
+    dump_fvks("full_v6", &[&ow.fvk, &iw.fvk, &i_recipient.fvk]);
+    assert_eq!(tx_format(&tx.raw), Ok(TxFormat::V6));
+
+    // every signature, every proof, and the digests they are over
+    let sighash = verify_transparent(&tx, &coins, 1);
+    sapling::verify_sapling(&tx.raw, 2, 1, &sighash, 50_000);
+    let found = orchard::verify_orchard(
+        &tx.raw,
+        2,
+        1,
+        &sighash,
+        version,
+        400_000,
+        &[&ow.fvk, &iw.fvk, &i_recipient.fvk],
+    );
+    assert_eq!(found, 100_000);
+    let found = orchard::verify_ironwood(
+        &tx.raw,
+        2,
+        1,
+        &sighash,
+        2,
+        -505_000,
+        &[&ow.fvk, &iw.fvk, &i_recipient.fvk],
+    );
+    assert_eq!(found, 805_000);
+
+    let mut ins = [ZcashTxIn::default(); 2];
+    let mut outs = [ZcashTxOut::default(); 1];
+    let parsed = ZcashTx::parse_into(&tx.raw, &mut ins, &mut outs).unwrap();
+    assert_eq!(parsed.version, TxVersion::V6);
+    assert_eq!(parsed.consensus_branch_id, branch_id);
+    assert_eq!(parsed.conventional_fee(), Ok(35_000));
+    let prevouts: Vec<ZcashTxOut<'_>> = coins
+        .iter()
+        .map(|coin| ZcashTxOut {
+            amount: coin.amount,
+            script: &coin.script,
+        })
+        .collect();
+    // the signatures are in neither digest, and in version 6 neither are
+    // the anchors: another anchor is the same transaction, as far as its
+    // id and its signatures go
+    let reanchored = |bundle: &[u8], at: usize| {
+        let mut bytes = bundle.to_vec();
+        bytes[at] ^= 1;
+        bytes
+    };
+    let sapling = reanchored(parsed.sapling, 1 + 96 + 1 + 756 + 8);
+    let orchard = reanchored(parsed.orchard, 1 + 2 * 820 + 9);
+    let ironwood = reanchored(parsed.ironwood, 1 + 2 * 820 + 9);
+    let other = ZcashTx {
+        sapling: &sapling,
+        orchard: &orchard,
+        ironwood: &ironwood,
+        ..parsed
+    };
+    assert_eq!(other.txid().unwrap(), tx.txid);
+    assert_eq!(
+        other.sighash(None, SIGHASH_ALL, &prevouts).unwrap(),
+        sighash
+    );
+    assert_ne!(other.auth_digest().unwrap(), parsed.auth_digest().unwrap());
+    assert_eq!(other.sapling_bundle().unwrap().verify(&sighash), Ok(()));
+    let vk = crate::orchard::circuit::VerifyingKey::embedded(version);
+    for bundle in [other.orchard_bundle(), other.ironwood_bundle()] {
+        let bundle = bundle.unwrap().unwrap();
+        assert_eq!(bundle.verify_signatures(&sighash), Ok(()));
+        // (the proofs are for the anchors they were made with)
+        assert!(bundle.verify_proof(&vk).is_err());
     }
 }
 

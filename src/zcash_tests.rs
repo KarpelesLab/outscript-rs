@@ -606,3 +606,7 @@ fn zip317_conventional_fee() {
         assert_eq!(tx.conventional_fee().unwrap(), 5000 * actions.max(2));
     }
 }
+
+/// Version 6 transactions against the chain and the reference.
+#[path = "zcash_builder/chain_v6.rs"]
+mod chain_v6;

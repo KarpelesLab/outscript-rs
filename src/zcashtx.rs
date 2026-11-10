@@ -1,18 +1,75 @@
-//! Zcash v5 transactions (ZIP-225) with transparent inputs and outputs, and
-//! their ZIP-244 transaction ids and signature digests.
+//! Zcash v5 (ZIP-225) and v6 (ZIP 229) transactions with transparent inputs
+//! and outputs, and their ZIP-244 transaction ids, authorizing data
+//! commitments and signature digests.
 //!
-//! A [`ZcashTx`] borrows its transparent inputs and outputs, and the Sapling
-//! and Orchard bundles as raw bytes: shielded proofs and signatures are not
-//! produced here, but a transaction that carries them can still have its
-//! transparent inputs signed and its id computed, as their digests only
-//! hash the bundles' fields. With the `zcash-sapling` and `zcash-orchard`
-//! features, `ZcashTx::sapling_bundle` and `ZcashTx::orchard_bundle` give
-//! the typed views of the bundles, and (with `alloc`) the `zcash_builder`
-//! module builds whole transactions, shielded parts included.
+//! A [`ZcashTx`] borrows its transparent inputs and outputs, and the
+//! Sapling, Orchard and (in version 6) Ironwood bundles as raw bytes:
+//! shielded proofs and signatures are not produced here, but a transaction
+//! that carries them can still have its transparent inputs signed and its
+//! id computed, as their digests only hash the bundles' fields. With the
+//! `zcash-sapling` and `zcash-orchard` features, `ZcashTx::sapling_bundle`,
+//! `ZcashTx::orchard_bundle` and `ZcashTx::ironwood_bundle` give the typed
+//! views of the bundles, and (with `alloc`) the `zcash_builder` module
+//! builds whole transactions, shielded parts included.
 //!
 //! Parsing is strict where consensus is: compact sizes must be in their
-//! shortest form, the reserved Orchard flag bits must be zero, and the
-//! Sapling value balance within the money supply.
+//! shortest form, the reserved flag bits of the Orchard and Ironwood
+//! bundles must be zero, and the value balances within the money supply.
+//!
+//! # Transaction versions
+//!
+//! What follows is what the main network runs, as of November 2026, from
+//! the ZIPs (`zcash/zips` at commit `4699a8d5`), the reference
+//! implementation (`zcash_primitives` 0.31.0, `zcash_protocol` 0.11.0,
+//! `orchard` 0.16.0) and the chain itself.
+//!
+//! - **Version 5** (ZIP 225, version group id `0x26A7270A`), from NU5:
+//!   transparent, Sapling and Orchard parts. It stays valid under NU6.3
+//!   and NU7 (ZIP 229: "Version 4, version 5, and version 6 transactions
+//!   are all valid from NU6.3 activation onward"; ZIP 259: "version 5 and
+//!   version 6 transactions remain valid"), and version 5 transactions
+//!   are still mined under NU7. It cannot carry an Ironwood bundle.
+//! - **Version 6** (ZIP 229, status Final; version group id
+//!   `0xD884B698`), from NU6.3 (ZIP 258, Final: branch id `0x37A5165B`,
+//!   main network height 3 428 143): the fields of version 5, followed by
+//!   an **Ironwood bundle** encoded as the Orchard one. The Ironwood pool
+//!   is a second value pool of the Orchard protocol, with its own note
+//!   commitment tree, the same Action circuit, and notes of a new
+//!   plaintext version (ZIP 2005). In its flags the third bit is
+//!   `enableCrossAddress` (ZIP 2006); in the flags of the Orchard bundle
+//!   that bit stays reserved and zero, in both versions.
+//!
+//!   The digests are those of ZIP 244 with two changes: an Ironwood
+//!   digest is added last to the transaction id and to the authorizing
+//!   data commitment, and the Sapling, Orchard and Ironwood anchors move
+//!   from the former to the latter, with new personalizations for the
+//!   nodes that change (`ZTxIdSSpendNH_v6`, `ZTxAuthSapliH_v6`,
+//!   `ZTxIdOrchardH_v6`, `ZTxAuthOrchaH_v6`, and `ZTxIdIronwd_H_v6`,
+//!   `ZTxIdIrnActCH_v6`, `ZTxIdIrnActMH_v6`, `ZTxIdIrnActNH_v6`,
+//!   `ZTxAuthIrnwdH_v6`). The signature digests change only through
+//!   these.
+//! - **NU7** (ZIP 259, branch id `0x77190AD9`, main network height
+//!   3 543 405; the ZIP is still marked Proposed in the repository, but
+//!   the upgrade is active on the main network and in `zcash_protocol`)
+//!   "introduces no new transaction format": versions 5 and 6 are
+//!   unchanged under it, and version 4 becomes invalid (ZIP 2003).
+//! - **Version 4** and earlier (Sapling to Canopy formats, valid until
+//!   NU7) are not handled here: [`ZcashTx::parse_into`] rejects them with
+//!   [`Error::UnsupportedTxType`], and [`tx_format`] tells the format of
+//!   a serialized transaction from its header, so that a version 4 one
+//!   can be given to `sapling::bundle::BundleV4Ref`.
+//!
+//! Not deployed, and not implemented here: the withdrawn version 6 format
+//! of ZIPs 230 and 246 (ZSAs: burns, issuance), the `zip233Amount` and
+//! explicit fee fields, memo bundles (ZIP 231), the extensible format of
+//! ZIP 248 (Draft), and the version 7 of `zcash_protocol`
+//! (`0x74616368`, behind an unstable build flag).
+//!
+//! From NU6.3 on, consensus also requires of every transaction, whatever
+//! its version (ZIP 258): no Orchard action in a coinbase transaction, a
+//! non-negative `valueBalanceOrchard` (no new value enters the Orchard
+//! pool), and Orchard proofs for the cross-address restricted circuit.
+//! These are rules about the chain, which the parser does not apply.
 //!
 //! The transparent parts follow Bitcoin: P2PKH outputs, ECDSA signatures with
 //! a sighash type byte, and `push(sig) push(pubkey)` scriptSigs. What differs
@@ -56,9 +113,9 @@ use crate::prelude::*;
 use crate::pushbytes::push_bytes_to_slice;
 use crate::sink::{Counter, Sink, SliceSink};
 
-/// Consensus branch ids of the network upgrades that use v5 transactions,
-/// for [`ZcashTx::consensus_branch_id`]. A transaction is only valid for the
-/// upgrade in force when it is mined.
+/// Consensus branch ids of the network upgrades that use v5 or v6
+/// transactions, for [`ZcashTx::consensus_branch_id`]. A transaction is only
+/// valid for the upgrade in force when it is mined.
 pub mod branch {
     /// NU5 (May 2022).
     pub const NU5: u32 = 0xc2d6_d0b4;
@@ -68,14 +125,137 @@ pub mod branch {
     pub const NU6_1: u32 = 0x4dec_4df0;
     /// NU6.2 (2026).
     pub const NU6_2: u32 = 0x5437_f330;
-    /// NU6.3.
+    /// NU6.3 (2026, ZIP 258): the Ironwood pool and v6 transactions.
     pub const NU6_3: u32 = 0x37a5_165b;
+    /// NU7 (2026, ZIP 259): no new transaction format.
+    pub const NU7: u32 = 0x7719_0ad9;
 }
 
 /// The version field of a v5 transaction: 5, with the overwintered bit.
 pub const VERSION_V5: u32 = 0x8000_0005;
 /// The version group id of v5 transactions.
 pub const VERSION_GROUP_ID_V5: u32 = 0x26a7_270a;
+/// The version field of a v6 transaction: 6, with the overwintered bit.
+pub const VERSION_V6: u32 = 0x8000_0006;
+/// The version group id of v6 transactions (ZIP 229).
+pub const VERSION_GROUP_ID_V6: u32 = 0xd884_b698;
+
+/// The transaction formats [`ZcashTx`] handles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TxVersion {
+    /// Version 5 (ZIP 225): transparent, Sapling and Orchard parts.
+    #[default]
+    V5,
+    /// Version 6 (ZIP 229, from NU6.3): those of version 5 and an Ironwood
+    /// bundle, with the anchors moved from the transaction id to the
+    /// authorizing data commitment.
+    V6,
+}
+
+impl TxVersion {
+    /// The header field: the version with the overwintered bit.
+    pub const fn header(self) -> u32 {
+        match self {
+            TxVersion::V5 => VERSION_V5,
+            TxVersion::V6 => VERSION_V6,
+        }
+    }
+
+    /// The version group id.
+    pub const fn version_group_id(self) -> u32 {
+        match self {
+            TxVersion::V5 => VERSION_GROUP_ID_V5,
+            TxVersion::V6 => VERSION_GROUP_ID_V6,
+        }
+    }
+
+    /// The version wallets use under a consensus branch, or `None` for a
+    /// branch not known here (or older than NU5): version 5 from NU5 to
+    /// NU6.2, version 6 for NU6.3 and NU7. This is
+    /// `TxVersion::suggested_for_branch` of `zcash_primitives` 0.31.0.
+    ///
+    /// Consensus does not require version 6 under NU6.3 or NU7: version 5
+    /// stays valid (see [`valid_in_branch`](Self::valid_in_branch)). But
+    /// only version 6 can carry an Ironwood bundle, which is where
+    /// shielded payments go from NU6.3.
+    pub const fn for_branch_id(consensus_branch_id: u32) -> Option<Self> {
+        match consensus_branch_id {
+            branch::NU5 | branch::NU6 | branch::NU6_1 | branch::NU6_2 => Some(TxVersion::V5),
+            branch::NU6_3 | branch::NU7 => Some(TxVersion::V6),
+            _ => None,
+        }
+    }
+
+    /// Whether consensus accepts this version under a consensus branch, or
+    /// `None` for a branch not known here (or older than NU5): version 5
+    /// from NU5 on, version 6 from NU6.3 on. This is
+    /// `TxVersion::valid_in_branch` of `zcash_primitives` 0.31.0.
+    pub const fn valid_in_branch(self, consensus_branch_id: u32) -> Option<bool> {
+        match consensus_branch_id {
+            branch::NU5 | branch::NU6 | branch::NU6_1 | branch::NU6_2 => {
+                Some(matches!(self, TxVersion::V5))
+            }
+            branch::NU6_3 | branch::NU7 => Some(true),
+            _ => None,
+        }
+    }
+}
+
+/// The format of a serialized transaction, as its header states it: see
+/// [`tx_format`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxFormat {
+    /// Before Overwinter: no version group id (versions 1 and 2, and what
+    /// consensus then read as version 2).
+    Legacy(u32),
+    /// Version 3 (Overwinter).
+    V3,
+    /// Version 4 (Sapling to NU6.3; invalid from NU7): not parsed by
+    /// [`ZcashTx`]. Its Sapling fields are read by
+    /// `sapling::bundle::BundleV4Ref`.
+    V4,
+    /// Version 5: see [`TxVersion::V5`].
+    V5,
+    /// Version 6: see [`TxVersion::V6`].
+    V6,
+}
+
+impl TxFormat {
+    /// The version [`ZcashTx`] handles this format as, if it does.
+    pub const fn tx_version(self) -> Option<TxVersion> {
+        match self {
+            TxFormat::V5 => Some(TxVersion::V5),
+            TxFormat::V6 => Some(TxVersion::V6),
+            _ => None,
+        }
+    }
+}
+
+/// Tells the format of a serialized transaction from its header (the
+/// version, and for an overwintered transaction the version group id),
+/// without reading further. [`Error::UnsupportedTxType`] for a header that
+/// is none of the formats of the chain: a zero version, or a version and
+/// group id that do not go together.
+pub fn tx_format(data: &[u8]) -> Result<TxFormat, Error> {
+    let word = |at: usize| -> Result<u32, Error> {
+        let bytes = data.get(at..at + 4).ok_or(Error::UnexpectedEof)?;
+        Ok(u32::from_le_bytes(bytes.try_into().expect("4 bytes")))
+    };
+    let header = word(0)?;
+    if header >> 31 == 0 {
+        return match header {
+            0 => Err(Error::UnsupportedTxType),
+            version => Ok(TxFormat::Legacy(version)),
+        };
+    }
+    match (header, word(4)?) {
+        (0x8000_0003, 0x03c4_8270) => Ok(TxFormat::V3),
+        (0x8000_0004, 0x892f_2085) => Ok(TxFormat::V4),
+        (VERSION_V5, VERSION_GROUP_ID_V5) => Ok(TxFormat::V5),
+        (VERSION_V6, VERSION_GROUP_ID_V6) => Ok(TxFormat::V6),
+        _ => Err(Error::UnsupportedTxType),
+    }
+}
 
 /// Sign every input and output.
 pub const SIGHASH_ALL: u8 = 0x01;
@@ -105,7 +285,9 @@ pub mod zip317 {
     /// transparent inputs (as signed) and outputs take `tx_in_total_size`
     /// and `tx_out_total_size` bytes, the counts of entries not included,
     /// with the given numbers of Sapling spends, Sapling outputs and
-    /// Orchard actions.
+    /// Orchard actions. The actions of the Ironwood bundle of a version 6
+    /// transaction count as Orchard ones do (revision 1 of ZIP-317): give
+    /// the sum of both as `orchard_actions`.
     pub const fn logical_actions(
         tx_in_total_size: u64,
         tx_out_total_size: u64,
@@ -160,9 +342,13 @@ pub struct ZcashTxOut<'a> {
     pub script: &'a [u8],
 }
 
-/// A borrowed v5 transaction.
+/// A borrowed v5 or v6 transaction.
 #[derive(Debug, Clone, Copy)]
 pub struct ZcashTx<'a> {
+    /// The format of the transaction: version 5 by default.
+    /// [`TxVersion::for_branch_id`] gives the one wallets use under a
+    /// network upgrade.
+    pub version: TxVersion,
     /// The [`branch`] id of the network upgrade the transaction is for.
     pub consensus_branch_id: u32,
     /// Lock time, as in Bitcoin.
@@ -180,11 +366,18 @@ pub struct ZcashTx<'a> {
     /// The serialized Orchard bundle (ZIP-225 `nActionsOrchard` onwards), or
     /// empty for none.
     pub orchard: &'a [u8],
+    /// The serialized Ironwood bundle of a version 6 transaction (ZIP 229
+    /// `nActionsIronwood` onwards), or empty for none. It must be empty in
+    /// a version 5 transaction, which cannot carry one: its digests fail
+    /// with [`Error::InvalidData`] otherwise, and its serialization leaves
+    /// the bundle out.
+    pub ironwood: &'a [u8],
 }
 
 impl Default for ZcashTx<'_> {
     fn default() -> Self {
         ZcashTx {
+            version: TxVersion::V5,
             consensus_branch_id: branch::NU6_2,
             lock_time: 0,
             expiry_height: 0,
@@ -192,6 +385,7 @@ impl Default for ZcashTx<'_> {
             outputs: &[],
             sapling: &[],
             orchard: &[],
+            ironwood: &[],
         }
     }
 }
@@ -270,12 +464,15 @@ fn take<'a>(data: &mut &'a [u8], len: usize) -> Result<&'a [u8], Error> {
     Ok(bytes)
 }
 
-/// The fields of a Sapling bundle its digest covers.
+/// The fields of a Sapling bundle its digests cover.
 struct Sapling<'a> {
     spends: &'a [u8],
     outputs: &'a [u8],
     value_balance: &'a [u8],
     anchor: &'a [u8],
+    /// The spend proofs, spend authorization signatures, output proofs and
+    /// binding signature, in serialization order.
+    auth: &'a [u8],
 }
 
 const SAPLING_SPEND_LEN: usize = 96;
@@ -286,66 +483,146 @@ const SIG_LEN: usize = 64;
 /// The total supply in zatoshis, which bounds every amount and balance.
 const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
 
-/// Splits a serialized Sapling bundle into its fields, checking its length.
-fn parse_sapling(bundle: &[u8]) -> Result<Sapling<'_>, Error> {
-    let data = &mut &*bundle;
+/// A value balance, which must be within the money supply.
+fn value_balance(bytes: &[u8]) -> Result<i64, Error> {
+    let balance = i64::from_le_bytes(bytes.try_into().map_err(|_| Error::InvalidLength)?);
+    if !(-MAX_MONEY..=MAX_MONEY).contains(&balance) {
+        return Err(Error::InvalidAmount);
+    }
+    Ok(balance)
+}
+
+/// Reads a serialized Sapling bundle (the same in v5 and v6) off the front
+/// of `data`, split into its fields.
+fn take_sapling<'a>(data: &mut &'a [u8]) -> Result<Sapling<'a>, Error> {
     let (n_spends, spends) = take_items(data, SAPLING_SPEND_LEN)?;
     let (n_outputs, outputs) = take_items(data, SAPLING_OUTPUT_LEN)?;
-    let (mut value_balance, mut anchor): (&[u8], &[u8]) = (&[], &[]);
+    let (mut balance, mut anchor, mut auth): (&[u8], &[u8], &[u8]) = (&[], &[], &[]);
+    // the counts were just checked against the data: their sum fits
     if n_spends + n_outputs > 0 {
-        value_balance = take(data, 8)?;
-        let balance = i64::from_le_bytes(value_balance.try_into().expect("8 bytes"));
-        if !(-MAX_MONEY..=MAX_MONEY).contains(&balance) {
-            return Err(Error::InvalidAmount);
-        }
+        balance = take(data, 8)?;
+        value_balance(balance)?;
         if n_spends > 0 {
             anchor = take(data, 32)?;
         }
-        take(
+        auth = take(
             data,
             n_spends * (PROOF_LEN + SIG_LEN) + n_outputs * PROOF_LEN + SIG_LEN,
         )?;
     }
-    if !data.is_empty() {
-        return Err(Error::TrailingData);
-    }
     Ok(Sapling {
         spends,
         outputs,
-        value_balance,
+        value_balance: balance,
         anchor,
+        auth,
     })
 }
 
-/// The fields of an Orchard bundle its digest covers.
-struct Orchard<'a> {
-    actions: &'a [u8],
-    /// Flags, value balance and anchor, in serialization order.
-    trailer: &'a [u8],
-}
-
-fn parse_orchard(bundle: &[u8]) -> Result<Orchard<'_>, Error> {
+/// Splits a serialized Sapling bundle into its fields, checking its length.
+fn parse_sapling(bundle: &[u8]) -> Result<Sapling<'_>, Error> {
     let data = &mut &*bundle;
-    let (n_actions, actions) = take_items(data, ORCHARD_ACTION_LEN)?;
-    let mut trailer: &[u8] = &[];
-    if n_actions > 0 {
-        trailer = take(data, 1 + 8 + 32)?;
-        // two flags: the other bits are reserved and must be zero
-        if trailer[0] & !0b11 != 0 {
-            return Err(Error::InvalidData);
-        }
-        take_items(data, 1)?; // the proof
-        take(data, n_actions * SIG_LEN + SIG_LEN)?;
-    }
+    let sapling = take_sapling(data)?;
     if !data.is_empty() {
         return Err(Error::TrailingData);
     }
-    Ok(Orchard { actions, trailer })
+    Ok(sapling)
 }
 
-/// The ZIP-244 digest of a Sapling bundle.
-fn sapling_digest(bundle: &[u8]) -> Result<[u8; 32], Error> {
+/// The fields of an Orchard or Ironwood bundle its digests cover.
+struct Orchard<'a> {
+    actions: &'a [u8],
+    /// Flags and value balance, in serialization order.
+    flags_balance: &'a [u8],
+    anchor: &'a [u8],
+    proof: &'a [u8],
+    /// The spend authorization signatures and the binding signature.
+    signatures: &'a [u8],
+}
+
+/// How the digests cover the bundle of a pool of the Orchard protocol in a
+/// transaction version (ZIP 244, ZIP 229).
+struct ActionPool {
+    /// The flag bits that may be set.
+    flags: u8,
+    bundle: &'static [u8; 16],
+    compact: &'static [u8; 16],
+    memos: &'static [u8; 16],
+    noncompact: &'static [u8; 16],
+    auth: &'static [u8; 16],
+    /// Whether the anchor is authorizing data (v6) or effecting data (v5).
+    anchor_in_auth: bool,
+}
+
+const ORCHARD_V5: ActionPool = ActionPool {
+    flags: 0b011,
+    bundle: b"ZTxIdOrchardHash",
+    compact: b"ZTxIdOrcActCHash",
+    memos: b"ZTxIdOrcActMHash",
+    noncompact: b"ZTxIdOrcActNHash",
+    auth: b"ZTxAuthOrchaHash",
+    anchor_in_auth: false,
+};
+
+/// In v6 the Orchard actions are hashed as in v5: only the nodes whose
+/// content changes are renamed.
+const ORCHARD_V6: ActionPool = ActionPool {
+    bundle: b"ZTxIdOrchardH_v6",
+    auth: b"ZTxAuthOrchaH_v6",
+    anchor_in_auth: true,
+    ..ORCHARD_V5
+};
+
+const IRONWOOD_V6: ActionPool = ActionPool {
+    flags: 0b111,
+    bundle: b"ZTxIdIronwd_H_v6",
+    compact: b"ZTxIdIrnActCH_v6",
+    memos: b"ZTxIdIrnActMH_v6",
+    noncompact: b"ZTxIdIrnActNH_v6",
+    auth: b"ZTxAuthIrnwdH_v6",
+    anchor_in_auth: true,
+};
+
+/// Reads a serialized Orchard or Ironwood bundle off the front of `data`,
+/// split into its fields. Only the flag bits of `flags` may be set.
+fn take_orchard<'a>(data: &mut &'a [u8], flags: u8) -> Result<Orchard<'a>, Error> {
+    let (n_actions, actions) = take_items(data, ORCHARD_ACTION_LEN)?;
+    let (mut flags_balance, mut anchor, mut proof, mut signatures): (&[u8], &[u8], &[u8], &[u8]) =
+        (&[], &[], &[], &[]);
+    if n_actions > 0 {
+        flags_balance = take(data, 1 + 8)?;
+        // the other bits are reserved and must be zero
+        if flags_balance[0] & !flags != 0 {
+            return Err(Error::InvalidData);
+        }
+        value_balance(&flags_balance[1..])?;
+        anchor = take(data, 32)?;
+        proof = take_items(data, 1)?.1;
+        signatures = take(data, n_actions * SIG_LEN + SIG_LEN)?;
+    }
+    Ok(Orchard {
+        actions,
+        flags_balance,
+        anchor,
+        proof,
+        signatures,
+    })
+}
+
+fn parse_orchard<'a>(bundle: &'a [u8], pool: &ActionPool) -> Result<Orchard<'a>, Error> {
+    let data = &mut &*bundle;
+    let orchard = take_orchard(data, pool.flags)?;
+    if !data.is_empty() {
+        return Err(Error::TrailingData);
+    }
+    Ok(orchard)
+}
+
+/// The ZIP-244 digest of a Sapling bundle, for the transaction id of a v5
+/// transaction or (ZIP 229: without the anchor) of a v6 one.
+fn sapling_digest(bundle: &[u8], version: TxVersion) -> Result<[u8; 32], Error> {
     let bundle = parse_sapling(bundle)?;
+    let v6 = version == TxVersion::V6;
     Ok(digest(b"ZTxIdSaplingHash", |d| {
         if bundle.spends.is_empty() && bundle.outputs.is_empty() {
             return;
@@ -360,10 +637,17 @@ fn sapling_digest(bundle: &[u8]) -> Result<[u8; 32], Error> {
                     d.put(&spend[32..64]); // nullifier
                 }
             }));
-            d.put(&digest(b"ZTxIdSSpendNHash", |d| {
+            let noncompact: &[u8; 16] = if v6 {
+                b"ZTxIdSSpendNH_v6"
+            } else {
+                b"ZTxIdSSpendNHash"
+            };
+            d.put(&digest(noncompact, |d| {
                 for spend in spends {
                     d.put(&spend[..32]); // cv
-                    d.put(bundle.anchor);
+                    if !v6 {
+                        d.put(bundle.anchor);
+                    }
                     d.put(&spend[64..]); // rk
                 }
             }));
@@ -395,34 +679,64 @@ fn sapling_digest(bundle: &[u8]) -> Result<[u8; 32], Error> {
     }))
 }
 
-/// The ZIP-244 digest of an Orchard bundle.
-fn orchard_digest(bundle: &[u8]) -> Result<[u8; 32], Error> {
-    let bundle = parse_orchard(bundle)?;
-    Ok(digest(b"ZTxIdOrchardHash", |d| {
+/// The digest of the authorizing data of a Sapling bundle: in v6, the
+/// anchor (if there are spends) is part of it.
+fn sapling_auth_digest(bundle: &[u8], version: TxVersion) -> Result<[u8; 32], Error> {
+    let bundle = parse_sapling(bundle)?;
+    let (person, anchor): (&[u8; 16], &[u8]) = match version {
+        TxVersion::V5 => (b"ZTxAuthSapliHash", &[]),
+        TxVersion::V6 => (b"ZTxAuthSapliH_v6", bundle.anchor),
+    };
+    Ok(digest(person, |d| {
+        d.put(bundle.auth);
+        d.put(anchor);
+    }))
+}
+
+/// The ZIP-244 digest of an Orchard or Ironwood bundle, for the
+/// transaction id.
+fn orchard_digest(bundle: &[u8], pool: &ActionPool) -> Result<[u8; 32], Error> {
+    let bundle = parse_orchard(bundle, pool)?;
+    Ok(digest(pool.bundle, |d| {
         if bundle.actions.is_empty() {
             return;
         }
         let actions = bundle.actions.as_chunks::<ORCHARD_ACTION_LEN>().0;
-        d.put(&digest(b"ZTxIdOrcActCHash", |d| {
+        d.put(&digest(pool.compact, |d| {
             for action in actions {
                 d.put(&action[32..64]); // nullifier
                 d.put(&action[96..160]); // cmx, ephemeral key
                 d.put(&action[160..212]); // the compact part of the ciphertext
             }
         }));
-        d.put(&digest(b"ZTxIdOrcActMHash", |d| {
+        d.put(&digest(pool.memos, |d| {
             for action in actions {
                 d.put(&action[212..724]); // the memo
             }
         }));
-        d.put(&digest(b"ZTxIdOrcActNHash", |d| {
+        d.put(&digest(pool.noncompact, |d| {
             for action in actions {
                 d.put(&action[..32]); // cv
                 d.put(&action[64..96]); // rk
                 d.put(&action[724..]); // the rest of the ciphertext, out ciphertext
             }
         }));
-        d.put(bundle.trailer);
+        d.put(bundle.flags_balance);
+        if !pool.anchor_in_auth {
+            d.put(bundle.anchor);
+        }
+    }))
+}
+
+/// The digest of the authorizing data of an Orchard or Ironwood bundle.
+fn orchard_auth_digest(bundle: &[u8], pool: &ActionPool) -> Result<[u8; 32], Error> {
+    let bundle = parse_orchard(bundle, pool)?;
+    Ok(digest(pool.auth, |d| {
+        d.put(bundle.proof);
+        d.put(bundle.signatures);
+        if pool.anchor_in_auth {
+            d.put(bundle.anchor);
+        }
     }))
 }
 
@@ -451,9 +765,35 @@ impl<'a> ZcashTx<'a> {
         }
     }
 
+    fn ironwood(&self) -> &[u8] {
+        if self.ironwood.is_empty() {
+            NO_ORCHARD
+        } else {
+            self.ironwood
+        }
+    }
+
+    /// How the digests cover the Orchard bundle in this version.
+    fn orchard_pool(&self) -> &'static ActionPool {
+        match self.version {
+            TxVersion::V5 => &ORCHARD_V5,
+            TxVersion::V6 => &ORCHARD_V6,
+        }
+    }
+
+    /// The Ironwood bundle of a v6 transaction, as serialized, or `None`
+    /// for a v5 one, which must not have any.
+    fn ironwood_of_v6(&self) -> Result<Option<&[u8]>, Error> {
+        match self.version {
+            TxVersion::V6 => Ok(Some(self.ironwood())),
+            TxVersion::V5 if self.ironwood() == NO_ORCHARD => Ok(None),
+            TxVersion::V5 => Err(Error::InvalidData),
+        }
+    }
+
     fn write_header<S: Sink + ?Sized>(&self, s: &mut S) {
-        s.put(&VERSION_V5.to_le_bytes());
-        s.put(&VERSION_GROUP_ID_V5.to_le_bytes());
+        s.put(&self.version.header().to_le_bytes());
+        s.put(&self.version.version_group_id().to_le_bytes());
         s.put(&self.consensus_branch_id.to_le_bytes());
         s.put(&self.lock_time.to_le_bytes());
         s.put(&self.expiry_height.to_le_bytes());
@@ -473,6 +813,9 @@ impl<'a> ZcashTx<'a> {
         }
         s.put(self.sapling());
         s.put(self.orchard());
+        if self.version == TxVersion::V6 {
+            s.put(self.ironwood());
+        }
     }
 
     /// Writes the whole transaction to `s`.
@@ -509,10 +852,13 @@ impl<'a> ZcashTx<'a> {
         out
     }
 
-    /// Parses a serialized v5 transaction, placing its transparent inputs and
-    /// outputs in the given buffers, which must be large enough
+    /// Parses a serialized v5 or v6 transaction, placing its transparent
+    /// inputs and outputs in the given buffers, which must be large enough
     /// ([`Error::TooLarge`] otherwise). The scriptSigs and bundles are
     /// borrowed from `data`.
+    ///
+    /// A transaction of another format (version 4 and earlier) is
+    /// [`Error::UnsupportedTxType`]: see [`tx_format`].
     pub fn parse_into<'b>(
         data: &'a [u8],
         inputs: &'b mut [ZcashTxIn<'a>],
@@ -526,12 +872,11 @@ impl<'a> ZcashTx<'a> {
             let bytes = take(rest, 4)?;
             Ok(u32::from_le_bytes(bytes.try_into().expect("4 bytes")))
         };
-        if word()? != VERSION_V5 {
-            return Err(Error::UnsupportedTxType);
-        }
-        if word()? != VERSION_GROUP_ID_V5 {
-            return Err(Error::UnsupportedTxType);
-        }
+        let version = match (word()?, word()?) {
+            (VERSION_V5, VERSION_GROUP_ID_V5) => TxVersion::V5,
+            (VERSION_V6, VERSION_GROUP_ID_V6) => TxVersion::V6,
+            _ => return Err(Error::UnsupportedTxType),
+        };
         let consensus_branch_id = word()?;
         let lock_time = word()?;
         let expiry_height = word()?;
@@ -559,43 +904,38 @@ impl<'a> ZcashTx<'a> {
             *output = ZcashTxOut { amount, script };
         }
 
-        // the bundles: parsed to find their ends, kept as bytes
-        let sapling_start = data.len() - rest.len();
-        let sapling = &mut &**rest;
-        let (n_spends, _) = take_items(sapling, SAPLING_SPEND_LEN)?;
-        let (n_outputs, _) = take_items(sapling, SAPLING_OUTPUT_LEN)?;
-        if n_spends + n_outputs > 0 {
-            take(sapling, 8 + if n_spends > 0 { 32 } else { 0 })?;
-            take(
-                sapling,
-                n_spends * (PROOF_LEN + SIG_LEN) + n_outputs * PROOF_LEN + SIG_LEN,
-            )?;
-        }
-        let sapling_end = data.len() - sapling.len();
-        *rest = sapling;
-        let orchard = &mut &**rest;
-        let (n_actions, _) = take_items(orchard, ORCHARD_ACTION_LEN)?;
-        if n_actions > 0 {
-            take(orchard, 1 + 8 + 32)?;
-            take_items(orchard, 1)?;
-            take(orchard, n_actions * SIG_LEN + SIG_LEN)?;
-        }
-        let orchard_end = data.len() - orchard.len();
-        if orchard_end != data.len() {
+        // The bundles: parsed to find their ends, kept as bytes. What the
+        // digests require of them is required here, so that a transaction
+        // that parses has an id.
+        let mut bundle = |read: &mut dyn FnMut(&mut &'a [u8]) -> Result<(), Error>| {
+            let start = *rest;
+            read(rest)?;
+            Ok::<&'a [u8], Error>(&start[..start.len() - rest.len()])
+        };
+        let sapling = bundle(&mut |rest| take_sapling(rest).map(|_| ()))?;
+        let orchard_flags = match version {
+            TxVersion::V5 => ORCHARD_V5.flags,
+            TxVersion::V6 => ORCHARD_V6.flags,
+        };
+        let orchard = bundle(&mut |rest| take_orchard(rest, orchard_flags).map(|_| ()))?;
+        let ironwood = match version {
+            TxVersion::V5 => NO_ORCHARD,
+            TxVersion::V6 => bundle(&mut |rest| take_orchard(rest, IRONWOOD_V6.flags).map(|_| ()))?,
+        };
+        if !rest.is_empty() {
             return Err(Error::TrailingData);
         }
-        let sapling = &data[sapling_start..sapling_end];
-        let orchard = &data[sapling_end..orchard_end];
-        // What the digests and the typed views require of the bundles is
-        // required here, so that a transaction that parses has an id and
-        // its bundles are where every parser of this crate finds them.
-        parse_sapling(sapling)?;
-        parse_orchard(orchard)?;
+        // And what the typed views require, so that the bundles are where
+        // every parser of this crate finds them.
         #[cfg(feature = "zcash-sapling")]
         crate::sapling::bundle::BundleRef::parse(sapling)?;
         #[cfg(feature = "zcash-orchard")]
-        crate::orchard::bundle::BundleRef::parse(orchard)?;
+        {
+            crate::orchard::bundle::BundleRef::parse(orchard)?;
+            crate::orchard::bundle::BundleRef::parse_ironwood(ironwood)?;
+        }
         Ok(ZcashTx {
+            version,
             consensus_branch_id,
             lock_time,
             expiry_height,
@@ -603,6 +943,11 @@ impl<'a> ZcashTx<'a> {
             outputs,
             sapling: if sapling == NO_SAPLING { &[] } else { sapling },
             orchard: if orchard == NO_ORCHARD { &[] } else { orchard },
+            ironwood: if ironwood == NO_ORCHARD {
+                &[]
+            } else {
+                ironwood
+            },
         })
     }
 
@@ -629,6 +974,21 @@ impl<'a> ZcashTx<'a> {
         Ok(crate::orchard::bundle::BundleRef::parse(self.orchard)?)
     }
 
+    /// The typed view of the Ironwood bundle of a version 6 transaction, or
+    /// `None` when there is none: as
+    /// [`orchard_bundle`](Self::orchard_bundle), the two pools sharing
+    /// their encoding, signatures and circuit (the proof is verified with
+    /// the key of the NU6.3 circuit).
+    #[cfg(feature = "zcash-orchard")]
+    pub fn ironwood_bundle(&self) -> Result<Option<crate::orchard::bundle::BundleRef<'a>>, Error> {
+        if self.ironwood_of_v6()?.is_none() {
+            return Ok(None);
+        }
+        Ok(crate::orchard::bundle::BundleRef::parse_ironwood(
+            self.ironwood,
+        )?)
+    }
+
     /// The number of ZIP-317 logical actions of the transaction as it is
     /// (the transparent inputs count by their size, scriptSigs included:
     /// an unsigned transaction has fewer than it will once signed).
@@ -642,13 +1002,17 @@ impl<'a> ZcashTx<'a> {
             put_output(&mut outs, output);
         }
         let sapling = parse_sapling(self.sapling())?;
-        let orchard = parse_orchard(self.orchard())?;
+        let orchard = parse_orchard(self.orchard(), self.orchard_pool())?;
+        let ironwood = match self.ironwood_of_v6()? {
+            Some(ironwood) => parse_orchard(ironwood, &IRONWOOD_V6)?.actions.len(),
+            None => 0,
+        };
         Ok(zip317::logical_actions(
             ins.0 as u64,
             outs.0 as u64,
             (sapling.spends.len() / SAPLING_SPEND_LEN) as u64,
             (sapling.outputs.len() / SAPLING_OUTPUT_LEN) as u64,
-            (orchard.actions.len() / ORCHARD_ACTION_LEN) as u64,
+            ((orchard.actions.len() + ironwood) / ORCHARD_ACTION_LEN) as u64,
         ))
     }
 
@@ -710,10 +1074,15 @@ impl<'a> ZcashTx<'a> {
         Ok(id)
     }
 
-    /// The ZIP-244 digest tree with the given transparent digest.
+    /// The ZIP-244 digest tree with the given transparent digest: in v6
+    /// (ZIP 229), with the Ironwood digest last.
     fn tx_digest(&self, transparent: [u8; 32]) -> Result<[u8; 32], Error> {
-        let sapling = sapling_digest(self.sapling())?;
-        let orchard = orchard_digest(self.orchard())?;
+        let sapling = sapling_digest(self.sapling(), self.version)?;
+        let orchard = orchard_digest(self.orchard(), self.orchard_pool())?;
+        let ironwood = match self.ironwood_of_v6()? {
+            Some(ironwood) => Some(orchard_digest(ironwood, &IRONWOOD_V6)?),
+            None => None,
+        };
         let mut person = *b"ZcashTxHash_\0\0\0\0";
         person[12..].copy_from_slice(&self.consensus_branch_id.to_le_bytes());
         Ok(digest(&person, |d| {
@@ -721,10 +1090,43 @@ impl<'a> ZcashTx<'a> {
             d.put(&transparent);
             d.put(&sapling);
             d.put(&orchard);
+            if let Some(ironwood) = &ironwood {
+                d.put(ironwood);
+            }
         }))
     }
 
-    /// The ZIP-244 signature digest of transparent input `index` for
+    /// The authorizing data commitment of the transaction (ZIP 244, and
+    /// ZIP 229 for version 6), in the byte order of the digest: what the
+    /// `hashAuthDataRoot` of a block commits to, over the scriptSigs, the
+    /// shielded proofs and signatures and, in version 6, the anchors and
+    /// the Ironwood bundle.
+    pub fn auth_digest(&self) -> Result<[u8; 32], Error> {
+        let transparent = digest(b"ZTxAuthTransHash", |d| {
+            for input in self.inputs {
+                put_varint(d, input.script_sig.len());
+                d.put(input.script_sig);
+            }
+        });
+        let sapling = sapling_auth_digest(self.sapling(), self.version)?;
+        let orchard = orchard_auth_digest(self.orchard(), self.orchard_pool())?;
+        let ironwood = match self.ironwood_of_v6()? {
+            Some(ironwood) => Some(orchard_auth_digest(ironwood, &IRONWOOD_V6)?),
+            None => None,
+        };
+        let mut person = *b"ZTxAuthHash_\0\0\0\0";
+        person[12..].copy_from_slice(&self.consensus_branch_id.to_le_bytes());
+        Ok(digest(&person, |d| {
+            d.put(&transparent);
+            d.put(&sapling);
+            d.put(&orchard);
+            if let Some(ironwood) = &ironwood {
+                d.put(ironwood);
+            }
+        }))
+    }
+
+    /// The ZIP-244 (version 6: ZIP 229) signature digest of transparent input `index` for
     /// `hash_type`, given the outputs the inputs spend: `prevouts[i]` is what
     /// `inputs[i]` spends. With [`SIGHASH_ANYONECANPAY`], only the spent
     /// output of `index` is needed and `prevouts` may stop there.

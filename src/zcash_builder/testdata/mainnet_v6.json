@@ -1,0 +1,235 @@
+[
+ {
+  "txid": "33813831255e902f8895562d6dc3be360a849d6d8a89d68aca13299ca4e307b9",
+  "height": 3428149,
+  "upgrade": "Nu6_3",
+  "version": 6,
+  "inputs": 1,
+  "outputs": 2,
+  "coinbase": true,
+  "prevouts": [],
+  "auth_digest": "bd4c91586f0b6ae3d5cdc7ca0f428f0c699bb69d91b5b109ae5a588ff1e89d8e",
+  "shielded_sighash": "b907e3a49c2913ca8ad6898a6d9d840a36bec36d2d5695882f905e2531388133",
+  "input_sighashes": [],
+  "input_sighashes_by_type": [],
+  "sapling": null,
+  "orchard": null,
+  "ironwood": null
+ },
+ {
+  "txid": "e39eab2bad5e0d210d4a5894e5b69254d5ecd888c8edcc46e0bd49936f1ea64a",
+  "height": 3428147,
+  "upgrade": "Nu6_3",
+  "version": 6,
+  "inputs": 0,
+  "outputs": 1,
+  "coinbase": false,
+  "prevouts": [],
+  "auth_digest": "0cce9e418a6ed1427218916833ac5a65c4c234fa1db0ed7389318458061f90ad",
+  "shielded_sighash": "4aa61e6f9349bde046ccedc888d8ecd55492b6e594584a0d210d5ead2bab9ee3",
+  "input_sighashes": [],
+  "input_sighashes_by_type": [],
+  "sapling": null,
+  "orchard": {
+   "actions": 2,
+   "flags": 3,
+   "value_balance": 36636
+  },
+  "ironwood": null
+ },
+ {
+  "txid": "cce2882669a50ed536b27f81bfc3930dd6d8fa80523a6e10c1d379c96d471c0a",
+  "height": 3428153,
+  "upgrade": "Nu6_3",
+  "version": 6,
+  "inputs": 0,
+  "outputs": 0,
+  "coinbase": false,
+  "prevouts": [],
+  "auth_digest": "4744cfcda4a06b17c08ac8409fd5467cae0737f12c5166ba6068961f7e6afdd6",
+  "shielded_sighash": "0a1c476dc979d3c1106e3a5280fad8d60d93c3bf817fb236d50ea5692688e2cc",
+  "input_sighashes": [],
+  "input_sighashes_by_type": [],
+  "sapling": {
+   "spends": 1,
+   "outputs": 2,
+   "value_balance": 517019348
+  },
+  "orchard": null,
+  "ironwood": {
+   "actions": 2,
+   "flags": 7,
+   "value_balance": -516999348
+  }
+ },
+ {
+  "txid": "57d7d945f70c88853f800519dd3d2b8a2fd8cff990aa02e16e8f81472e34fe3d",
+  "height": 3428160,
+  "upgrade": "Nu6_3",
+  "version": 6,
+  "inputs": 0,
+  "outputs": 1,
+  "coinbase": false,
+  "prevouts": [],
+  "auth_digest": "08a051054f31e596a1139ca0ce4c9d0ea8b204f23d73b317db23f94ee1dfc2c6",
+  "shielded_sighash": "3dfe342e47818f6ee102aa90f9cfd82f8a2b3ddd1905803f85880cf745d9d757",
+  "input_sighashes": [],
+  "input_sighashes_by_type": [],
+  "sapling": {
+   "spends": 1,
+   "outputs": 2,
+   "value_balance": 250121076
+  },
+  "orchard": null,
+  "ironwood": null
+ },
+ {
+  "txid": "2b39d3da05120951f7441bc578ed388c52f79b6ad9c6bba99b4dfd6f14188283",
+  "height": 3543408,
+  "upgrade": "Nu7",
+  "version": 6,
+  "inputs": 1,
+  "outputs": 0,
+  "coinbase": false,
+  "prevouts": [
+   [
+    125168700,
+    "76a914f7e8a2486283fca4b433d2ddfe9149784f5918dd88ac"
+   ]
+  ],
+  "auth_digest": "b81fb38bc2d23a90a83ce28d854371b9b97fa8da77eb51434d897b813b9f7e03",
+  "shielded_sighash": "ff21785ddcc23853ce05dbdf9c052cd219b4118d3dc66b4cdabda4855089301e",
+  "input_sighashes": [
+   "a7ea12b26c927b2c8e26e4fee9aacbe91bb6fb4558d7539d2b200744b916dc91"
+  ],
+  "input_sighashes_by_type": [
+   [
+    "a7ea12b26c927b2c8e26e4fee9aacbe91bb6fb4558d7539d2b200744b916dc91",
+    "7aa8725fb0c83b9da30cbe401aa7b2b118e5edf4e06ebf870573af268f4acb70",
+    null,
+    "2b3d64964488a033d16aa067766156239e35da6c0927db314cf361f90017114c",
+    "5ffaf1e5802213f6e8f6276a9de2e72123695cea8a1e012f0c10d8b368d4056c",
+    null
+   ]
+  ],
+  "sapling": {
+   "spends": 0,
+   "outputs": 2,
+   "value_balance": -125153700
+  },
+  "orchard": null,
+  "ironwood": null
+ },
+ {
+  "txid": "a4f6190d6ce8e84f176789b397919373ecb53f7bbe49bd974f1b1e43e6b34e58",
+  "height": 3543411,
+  "upgrade": "Nu7",
+  "version": 5,
+  "inputs": 1,
+  "outputs": 2,
+  "coinbase": true,
+  "prevouts": [],
+  "auth_digest": "75d339bc454743a401bc93f3e4f88893a3ec616999de6167a7588cea78882111",
+  "shielded_sighash": "584eb3e6431e1b4f97bd49be7b3fb5ec73939197b38967174fe8e86c0d19f6a4",
+  "input_sighashes": [],
+  "input_sighashes_by_type": [],
+  "sapling": null,
+  "orchard": null,
+  "ironwood": null
+ },
+ {
+  "txid": "2be7cf251872c4b20ce779efa0cf021c0a1eee42010dccc38db70973b4b8d439",
+  "height": 3550069,
+  "upgrade": "Nu7",
+  "version": 6,
+  "inputs": 0,
+  "outputs": 0,
+  "coinbase": false,
+  "prevouts": [],
+  "auth_digest": "7bb134124d99d21a0f8c21e6449d66cbf6858ce67f73ba0feff2801217e1f541",
+  "shielded_sighash": "39d4b8b47309b78dc3cc0d0142ee1e0a1c02cfa0ef79e70cb2c4721825cfe72b",
+  "input_sighashes": [],
+  "input_sighashes_by_type": [],
+  "sapling": null,
+  "orchard": {
+   "actions": 2,
+   "flags": 3,
+   "value_balance": 200015000
+  },
+  "ironwood": {
+   "actions": 1,
+   "flags": 7,
+   "value_balance": -200000000
+  }
+ },
+ {
+  "txid": "cb69d2f5789dd8188e57ecb8f5da0f0d8a7a137d63f8a4254a1864cdb79c2a62",
+  "height": 3559706,
+  "upgrade": "Nu7",
+  "version": 6,
+  "inputs": 1,
+  "outputs": 2,
+  "coinbase": false,
+  "prevouts": [
+   [
+    19453437941,
+    "76a91413bbd8bc8df03a5a9cda88103f583aa8bc043e2488ac"
+   ]
+  ],
+  "auth_digest": "0d745f8b8d1bb181599eca85f58953693d873e52972919f2178176c9cc13e385",
+  "shielded_sighash": "484007a64076db38dec9e4d6ae3cd6142ba4da9520c1d7305880e6ab3c6aeb26",
+  "input_sighashes": [
+   "e91e56dfa9dd0bc9b26890134a686b8b3596cbc3a14db68c94b37faf615402b2"
+  ],
+  "input_sighashes_by_type": [
+   [
+    "e91e56dfa9dd0bc9b26890134a686b8b3596cbc3a14db68c94b37faf615402b2",
+    "e353e32f17e36bed2a6799381e2c10cdcdb9e0b113ceba34d72363806b0ba82c",
+    "6587650855defd865bf7a91ed5422c9f8c363b339b117270e26e9e3abc2dc0d1",
+    "803134defddd9ea152caa895ebd74c299fc063015ed3d4fb8b11488c33c62eca",
+    "07b54259a485200b87e5fc7e35aa1d198ca33fda0c8ea0f6f984fae31f5e1fb3",
+    "1fa2d59e53477c75c7febcbb1bdbc79d979b5e02c674293b017c02389159183c"
+   ]
+  ],
+  "sapling": null,
+  "orchard": null,
+  "ironwood": null
+ },
+ {
+  "txid": "fa1979afb977bae54096704fe9040a9a591d5609e0aefe5d9c859007d0520e7b",
+  "height": 3559736,
+  "upgrade": "Nu7",
+  "version": 6,
+  "inputs": 1,
+  "outputs": 1,
+  "coinbase": false,
+  "prevouts": [
+   [
+    21559881317,
+    "76a91413bbd8bc8df03a5a9cda88103f583aa8bc043e2488ac"
+   ]
+  ],
+  "auth_digest": "e9e4667bf355193a79377ee5a1987a82bf4c31ae113459cdcc322d900cb08ff5",
+  "shielded_sighash": "a01b7f75b78eb945dc280036ecdf3112bab48e29ab10fe2c39cfda9a7130c75e",
+  "input_sighashes": [
+   "ed97ea0c8affb0e91f6081e15bb1e059af22c4d7a43bc04dc4dc4e14d5e8728a"
+  ],
+  "input_sighashes_by_type": [
+   [
+    "ed97ea0c8affb0e91f6081e15bb1e059af22c4d7a43bc04dc4dc4e14d5e8728a",
+    "1be929d050cb8ea414db6ac2d5b639ffce39e45717f6ed84bece7655478cee17",
+    "acee8fadb82edecbcef12c895500abf49d798be5a58a295a55b13fc33a5351d8",
+    "3428fd95b2d672d609918a8202311142349f708be856c5f0a1e6841f91f207cb",
+    "45907684ed6623fd32909a69450ccd18c78ce78516408e599684aa2a9909bf72",
+    "9d23b3e15db0dc1ea40f9fbfe5b50527142477ecb1a9082fa0b63b606c2a643a"
+   ]
+  ],
+  "sapling": null,
+  "orchard": null,
+  "ironwood": {
+   "actions": 1,
+   "flags": 7,
+   "value_balance": -5372935
+  }
+ }
+]
