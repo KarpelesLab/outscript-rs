@@ -460,3 +460,224 @@ fn v1_message_sanitization() {
         64
     );
 }
+
+/// A second signer's seed.
+fn seed2() -> [u8; 32] {
+    [0x17; 32]
+}
+
+/// An unsigned wire transaction (no signatures at all) parses, and signing it
+/// creates the slots instead of indexing past them.
+#[test]
+fn sign_parsed_unsigned_tx() {
+    let (s, s2) = (seed(), seed2());
+    let from = SolanaKey(public_from_seed(&s));
+    let cosigner = SolanaKey(public_from_seed(&s2));
+    let to = SolanaKey::parse("83astBRguLMdt2h5U1Tpdq5tjFoJ6noeGwaY3mDLVcri").unwrap();
+    let blockhash = key(9);
+    let ixs = [
+        transfer_instruction(from, to, 1),
+        transfer_instruction(cosigner, to, 2),
+    ];
+    let legacy = new_solana_tx(from, blockhash, &ixs).unwrap();
+    let v0 = new_solana_tx_v0(from, blockhash, vec![], &ixs).unwrap();
+    for mut tx in [legacy, v0] {
+        assert_eq!(tx.signatures.len(), 2);
+        let message = match &tx.message_v0 {
+            Some(m) => m.to_bytes(),
+            None => tx.message.to_bytes(),
+        };
+        let mut unsigned = vec![0u8]; // no signatures
+        unsigned.extend_from_slice(&message);
+
+        let mut parsed = SolanaTx::from_bytes(&unsigned).unwrap();
+        assert!(parsed.signatures.is_empty());
+        assert_eq!(parsed.verify().err(), Some(Error::MissingSignatures));
+        assert_eq!(parsed.hash().err(), Some(Error::NoSignature));
+        assert_eq!(parsed.to_bytes().unwrap(), unsigned);
+
+        // the second signer alone: both slots exist, the first still empty
+        parsed.sign(&[s2]).unwrap();
+        assert_eq!(parsed.signatures.len(), 2);
+        assert!(parsed.signatures[0].is_empty());
+        assert_eq!(parsed.signatures[1].len(), 64);
+        assert_eq!(parsed.verify().err(), Some(Error::InvalidSignature));
+        parsed.sign(&[s]).unwrap();
+        parsed.verify().unwrap();
+
+        tx.sign(&[s, s2]).unwrap();
+        assert_eq!(parsed.signatures, tx.signatures);
+        let signed = tx.to_bytes().unwrap();
+        assert_eq!(parsed.to_bytes().unwrap(), signed);
+        SolanaTx::from_bytes(&signed).unwrap().verify().unwrap();
+
+        // a key that is no signer leaves the slots alone
+        let mut parsed = SolanaTx::from_bytes(&unsigned).unwrap();
+        assert_eq!(
+            parsed.sign(&[[0x55; 32]]).err(),
+            Some(Error::NotRequiredSigner)
+        );
+        assert!(parsed.signatures.is_empty());
+
+        // signature counts other than none or one per signer
+        let mut one = vec![1u8];
+        one.extend_from_slice(&[0; 64]);
+        one.extend_from_slice(&message);
+        assert_eq!(
+            SolanaTx::from_bytes(&one).err(),
+            Some(Error::MissingSignatures)
+        );
+        let mut three = vec![3u8];
+        three.extend_from_slice(&[0; 3 * 64]);
+        three.extend_from_slice(&message);
+        assert_eq!(SolanaTx::from_bytes(&three).err(), Some(Error::InvalidData));
+    }
+}
+
+/// Legacy and v0 transactions and messages must be consumed whole.
+#[test]
+fn rejects_trailing_bytes() {
+    let s = seed();
+    let from = SolanaKey(public_from_seed(&s));
+    let to = SolanaKey::parse("83astBRguLMdt2h5U1Tpdq5tjFoJ6noeGwaY3mDLVcri").unwrap();
+    let ix = transfer_instruction(from, to, 1);
+    let lookup = SolanaAddressTableLookup {
+        account_key: key(7),
+        writable_indexes: vec![1],
+        readonly_indexes: vec![2, 3],
+    };
+    let legacy = new_solana_tx(from, key(9), core::slice::from_ref(&ix)).unwrap();
+    let v0 = new_solana_tx_v0(from, key(9), vec![lookup], &[ix]).unwrap();
+    for mut tx in [legacy, v0] {
+        tx.sign(&[s]).unwrap();
+        let mut data = tx.to_bytes().unwrap();
+        SolanaTx::from_bytes(&data).unwrap();
+        data.push(0);
+        assert_eq!(SolanaTx::from_bytes(&data).err(), Some(Error::TrailingData));
+    }
+
+    let mut message = legacy_message().to_bytes();
+    SolanaMessage::from_bytes(&message).unwrap();
+    message.push(0);
+    assert_eq!(
+        SolanaMessage::from_bytes(&message).err(),
+        Some(Error::TrailingData)
+    );
+    let mut message = SolanaMessageV0 {
+        header: legacy_message().header,
+        account_keys: legacy_message().account_keys,
+        ..Default::default()
+    }
+    .to_bytes();
+    SolanaMessageV0::from_bytes(&message).unwrap();
+    message.push(0);
+    assert_eq!(
+        SolanaMessageV0::from_bytes(&message).err(),
+        Some(Error::TrailingData)
+    );
+}
+
+fn legacy_message() -> SolanaMessage {
+    SolanaMessage {
+        header: SolanaMessageHeader {
+            num_required_signatures: 1,
+            ..Default::default()
+        },
+        account_keys: vec![key(1), key(2)],
+        recent_blockhash: key(3),
+        instructions: vec![SolanaCompiledInstruction {
+            program_id_index: 1,
+            account_indices: vec![0],
+            data: vec![1, 2, 3],
+        }],
+    }
+}
+
+/// Lengths the compact-u16 cannot express are errors on the fallible paths,
+/// not panics.
+#[test]
+fn oversize_lengths_are_errors() {
+    let s = seed();
+    let from = SolanaKey(public_from_seed(&s));
+    let mut ix = transfer_instruction(from, key(2), 1);
+    ix.data = vec![0; 0xffff];
+    let mut tx = new_solana_tx(from, key(9), core::slice::from_ref(&ix)).unwrap();
+    tx.sign(&[s]).unwrap();
+    tx.verify().unwrap();
+    tx.to_bytes().unwrap();
+
+    ix.data.push(0);
+    let lookups = vec![SolanaAddressTableLookup::default()];
+    let legacy = new_solana_tx(from, key(9), core::slice::from_ref(&ix)).unwrap();
+    let v0 = new_solana_tx_v0(from, key(9), lookups, &[ix]).unwrap();
+    assert_eq!(legacy.message.try_to_bytes().err(), Some(Error::TooLarge));
+    let message_v0 = v0.message_v0.clone().unwrap();
+    assert_eq!(message_v0.try_to_bytes().err(), Some(Error::TooLarge));
+    for mut tx in [legacy, v0] {
+        assert_eq!(tx.sign(&[s]).err(), Some(Error::TooLarge));
+        assert_eq!(tx.verify().err(), Some(Error::TooLarge));
+        assert_eq!(tx.to_bytes().err(), Some(Error::TooLarge));
+    }
+
+    // v0 lookup indexes
+    let mut message_v0 = SolanaMessageV0 {
+        header: legacy_message().header,
+        account_keys: legacy_message().account_keys,
+        address_table_lookups: vec![SolanaAddressTableLookup {
+            readonly_indexes: vec![0; 0x1_0000],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert_eq!(message_v0.try_to_bytes().err(), Some(Error::TooLarge));
+    message_v0.address_table_lookups[0].readonly_indexes.pop();
+    message_v0.try_to_bytes().unwrap();
+
+    // more signature slots than the count can tell
+    let mut tx = new_solana_tx(from, key(9), &[]).unwrap();
+    tx.signatures = vec![Vec::new(); 0x1_0000];
+    assert_eq!(tx.to_bytes().err(), Some(Error::TooLarge));
+}
+
+/// 256 signers do not fit the header's one-byte count: an error, and not a
+/// header claiming none.
+#[test]
+fn signer_count_does_not_wrap() {
+    let signers = |n: u8| -> Vec<SolanaAccountMeta> {
+        (0..n)
+            .map(|i| SolanaAccountMeta {
+                pubkey: key(i),
+                is_signer: true,
+                is_writable: i % 2 == 0,
+            })
+            .collect()
+    };
+    // 253 signers and the fee payer, and the program
+    let most = SolanaInstruction {
+        program_id: key(254),
+        accounts: signers(253),
+        data: vec![],
+    };
+    let tx = new_solana_tx(key(255), key(9), &[most]).unwrap();
+    assert_eq!(tx.message.header.num_required_signatures, 254);
+    assert_eq!(tx.signatures.len(), 254);
+
+    // 255 signers and the fee payer: 256 accounts, all of them signers
+    let all = SolanaInstruction {
+        program_id: key(0),
+        accounts: signers(255),
+        data: vec![],
+    };
+    assert_eq!(
+        new_solana_tx(key(255), key(9), core::slice::from_ref(&all)).err(),
+        Some(Error::TooLarge)
+    );
+    assert_eq!(
+        new_solana_tx_v0(key(255), key(9), vec![], core::slice::from_ref(&all)).err(),
+        Some(Error::TooLarge)
+    );
+    assert_eq!(
+        new_solana_tx_v1(key(255), key(9), SolanaTxConfig::default(), &[all]).err(),
+        Some(Error::TooLarge)
+    );
+}

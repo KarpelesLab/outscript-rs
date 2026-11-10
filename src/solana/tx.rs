@@ -20,6 +20,15 @@ pub fn encode_compact_u16(v: usize) -> Vec<u8> {
     buf[..len].to_vec()
 }
 
+/// Appends a length in compact-u16 format, or fails with [`Error::TooLarge`]
+/// if it exceeds `0xffff`.
+fn put_len(buf: &mut Vec<u8>, v: usize) -> Result<(), Error> {
+    let v = u16::try_from(v).map_err(|_| Error::TooLarge)?;
+    let (bytes, len) = encode_compact_u16_to_array(v);
+    buf.extend_from_slice(&bytes[..len]);
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct SolanaAccountMeta {
     /// The account public key.
@@ -524,10 +533,13 @@ fn compile_accounts(
     for (i, k) in all.iter().enumerate() {
         index.insert(*k, i as u8);
     }
+    // With 256 accounts all of them may be signers, which the one-byte count
+    // of the header cannot tell.
+    let count = |n: usize| u8::try_from(n).map_err(|_| Error::TooLarge);
     let header = SolanaMessageHeader {
-        num_required_signatures: (1 + sw.len() + sr.len()) as u8,
-        num_readonly_signed: sr.len() as u8,
-        num_readonly_unsigned: nr.len() as u8,
+        num_required_signatures: count(1 + sw.len() + sr.len())?,
+        num_readonly_signed: count(sr.len())?,
+        num_readonly_unsigned: count(nr.len())?,
     };
     Ok((all, index, header))
 }
@@ -627,10 +639,10 @@ impl SolanaTx {
         if let Some(m) = &self.message_v1 {
             return m.to_bytes();
         }
-        Ok(match &self.message_v0 {
-            Some(m) => m.to_bytes(),
-            None => self.message.to_bytes(),
-        })
+        match &self.message_v0 {
+            Some(m) => m.try_to_bytes(),
+            None => self.message.try_to_bytes(),
+        }
     }
     fn header(&self) -> SolanaMessageHeader {
         if let Some(m) = &self.message_v1 {
@@ -653,6 +665,10 @@ impl SolanaTx {
 
     /// Signs the transaction message with the given Ed25519 seeds, matching each
     /// to its signature slot by public key.
+    ///
+    /// A transaction with fewer signature slots than required signers (one
+    /// parsed from an unsigned wire transaction with no signatures, say) gets
+    /// the missing slots, empty, before signing.
     pub fn sign(&mut self, seeds: &[[u8; 32]]) -> Result<(), Error> {
         let msg = self.message_bytes()?;
         let num_signers = self.header().num_required_signatures as usize;
@@ -666,6 +682,9 @@ impl SolanaTx {
                 .iter()
                 .position(|k| *k == pubkey);
             let idx = idx.ok_or(Error::NotRequiredSigner)?;
+            if self.signatures.len() < num_signers {
+                self.signatures.resize(num_signers, Vec::new());
+            }
             self.signatures[idx] = ed25519::sign(seed, &msg).to_vec();
         }
         Ok(())
@@ -724,7 +743,8 @@ impl SolanaTx {
             }
             return Ok(buf);
         }
-        let mut buf = encode_compact_u16(self.signatures.len());
+        let mut buf = Vec::new();
+        put_len(&mut buf, self.signatures.len())?;
         write_signatures(&mut buf, &self.signatures)?;
         buf.extend_from_slice(&msg);
         Ok(buf)
@@ -732,6 +752,11 @@ impl SolanaTx {
 
     /// Parses a transaction from bytes (legacy, v0 or v1; a v1 transaction is
     /// recognized by its leading [`SOLANA_V1_PREFIX`] byte).
+    ///
+    /// The whole input must be the transaction: trailing bytes are an error.
+    /// A legacy or v0 transaction carries either one signature per required
+    /// signer, or none at all (an unsigned transaction, which
+    /// [`sign`](Self::sign) gives its slots); any other count is rejected.
     pub fn from_bytes(data: &[u8]) -> Result<SolanaTx, Error> {
         if data.first() == Some(&SOLANA_V1_PREFIX) {
             return Self::from_bytes_v1(data);
@@ -762,6 +787,13 @@ impl SolanaTx {
             tx.message_v0 = Some(SolanaMessageV0::from_bytes(rest)?);
         } else {
             tx.message = SolanaMessage::from_bytes(rest)?;
+        }
+        let required = tx.header().num_required_signatures as usize;
+        if sig_count > required {
+            return Err(Error::InvalidData);
+        }
+        if sig_count != 0 && sig_count < required {
+            return Err(Error::MissingSignatures);
         }
         Ok(tx)
     }
@@ -809,23 +841,24 @@ fn write_message_common(
     account_keys: &[SolanaKey],
     recent_blockhash: &SolanaKey,
     instructions: &[SolanaCompiledInstruction],
-) {
+) -> Result<(), Error> {
     buf.push(header.num_required_signatures);
     buf.push(header.num_readonly_signed);
     buf.push(header.num_readonly_unsigned);
-    buf.extend_from_slice(&encode_compact_u16(account_keys.len()));
+    put_len(buf, account_keys.len())?;
     for k in account_keys {
         buf.extend_from_slice(&k.0);
     }
     buf.extend_from_slice(&recent_blockhash.0);
-    buf.extend_from_slice(&encode_compact_u16(instructions.len()));
+    put_len(buf, instructions.len())?;
     for ix in instructions {
         buf.push(ix.program_id_index);
-        buf.extend_from_slice(&encode_compact_u16(ix.account_indices.len()));
+        put_len(buf, ix.account_indices.len())?;
         buf.extend_from_slice(&ix.account_indices);
-        buf.extend_from_slice(&encode_compact_u16(ix.data.len()));
+        put_len(buf, ix.data.len())?;
         buf.extend_from_slice(&ix.data);
     }
+    Ok(())
 }
 
 /// Checks that the message header account counts are internally consistent with
@@ -941,7 +974,19 @@ fn read_message_common(
 
 impl SolanaMessage {
     /// Serializes the legacy message.
+    ///
+    /// # Panics
+    /// Panics if a count or length exceeds `0xffff` (more than 65535 account
+    /// keys or instructions, or an instruction with that many account indices
+    /// or data bytes), which the format cannot express. Use
+    /// [`try_to_bytes`](Self::try_to_bytes) to get an error instead.
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.try_to_bytes()
+            .expect("message length exceeds compact-u16")
+    }
+    /// Serializes the legacy message, failing with [`Error::TooLarge`] if a
+    /// count or length exceeds `0xffff`, which the format cannot express.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut buf = Vec::new();
         write_message_common(
             &mut buf,
@@ -949,10 +994,11 @@ impl SolanaMessage {
             &self.account_keys,
             &self.recent_blockhash,
             &self.instructions,
-        );
-        buf
+        )?;
+        Ok(buf)
     }
-    /// Parses a legacy message.
+    /// Parses a legacy message. The whole input must be the message: trailing
+    /// bytes are an error.
     pub fn from_bytes(data: &[u8]) -> Result<SolanaMessage, Error> {
         let mut pos = 0;
         let (header, account_keys, recent_blockhash, instructions) =
@@ -960,6 +1006,9 @@ impl SolanaMessage {
         // For the legacy format the addressable set is exactly the static
         // account key list.
         validate_instruction_indexes(&instructions, account_keys.len())?;
+        if pos != data.len() {
+            return Err(Error::TrailingData);
+        }
         Ok(SolanaMessage {
             header,
             account_keys,
@@ -971,7 +1020,20 @@ impl SolanaMessage {
 
 impl SolanaMessageV0 {
     /// Serializes the v0 message (with version prefix 0x80).
+    ///
+    /// # Panics
+    /// Panics if a count or length exceeds `0xffff` (see
+    /// [`SolanaMessage::to_bytes`]; here also the address table lookups and
+    /// their indexes). Use [`try_to_bytes`](Self::try_to_bytes) to get an
+    /// error instead.
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.try_to_bytes()
+            .expect("message length exceeds compact-u16")
+    }
+    /// Serializes the v0 message (with version prefix 0x80), failing with
+    /// [`Error::TooLarge`] if a count or length exceeds `0xffff`, which the
+    /// format cannot express.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut buf = vec![0x80];
         write_message_common(
             &mut buf,
@@ -979,18 +1041,19 @@ impl SolanaMessageV0 {
             &self.account_keys,
             &self.recent_blockhash,
             &self.instructions,
-        );
-        buf.extend_from_slice(&encode_compact_u16(self.address_table_lookups.len()));
+        )?;
+        put_len(&mut buf, self.address_table_lookups.len())?;
         for lookup in &self.address_table_lookups {
             buf.extend_from_slice(&lookup.account_key.0);
-            buf.extend_from_slice(&encode_compact_u16(lookup.writable_indexes.len()));
+            put_len(&mut buf, lookup.writable_indexes.len())?;
             buf.extend_from_slice(&lookup.writable_indexes);
-            buf.extend_from_slice(&encode_compact_u16(lookup.readonly_indexes.len()));
+            put_len(&mut buf, lookup.readonly_indexes.len())?;
             buf.extend_from_slice(&lookup.readonly_indexes);
         }
-        buf
+        Ok(buf)
     }
-    /// Parses a v0 message.
+    /// Parses a v0 message. The whole input must be the message: trailing
+    /// bytes are an error.
     pub fn from_bytes(data: &[u8]) -> Result<SolanaMessageV0, Error> {
         if data.is_empty() {
             return Err(Error::UnexpectedEof);
@@ -1047,6 +1110,9 @@ impl SolanaMessageV0 {
                 .map(|l| l.writable_indexes.len() + l.readonly_indexes.len())
                 .sum::<usize>();
         validate_instruction_indexes(&instructions, addressable)?;
+        if pos != data.len() {
+            return Err(Error::TrailingData);
+        }
         Ok(SolanaMessageV0 {
             header,
             account_keys,
