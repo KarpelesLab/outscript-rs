@@ -28,6 +28,11 @@ pub fn set_max_threads(threads: usize) {
     MAX_THREADS.store(threads, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Serializes the tests that change the number of threads, so that each
+/// really runs with the number it sets.
+#[cfg(all(test, feature = "std"))]
+pub(crate) static TEST_THREADS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The number of threads work is split over (see [`set_max_threads`]).
 #[cfg(feature = "std")]
 pub fn max_threads() -> usize {

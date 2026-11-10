@@ -824,6 +824,9 @@ fn batch_note_decryption_timing() {
         "2000 compact actions, 3 keys, one at a time: {:?}",
         t.elapsed()
     );
+    let _guard = crate::orchard::par::TEST_THREADS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for threads in [1, 0] {
         crate::orchard::set_max_threads(threads);
         let t = std::time::Instant::now();

@@ -26,7 +26,7 @@ pub mod plonk;
 mod poly;
 mod prover;
 #[cfg(test)]
-pub(crate) mod tests;
+mod tests;
 mod transcript;
 mod value;
 mod verifier;

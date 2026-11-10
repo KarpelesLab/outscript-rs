@@ -205,7 +205,7 @@ fn build_prove_sign_verify_insecure() {
 #[ignore = "slow in the test profile"]
 fn threads_do_not_change_the_bundle() {
     use crate::orchard::halo2::{max_threads, set_max_threads};
-    let _guard = crate::orchard::halo2::tests::THREADS
+    let _guard = crate::orchard::par::TEST_THREADS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let version = CircuitVersion::FixedPostNu6_2;

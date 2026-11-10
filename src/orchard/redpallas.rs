@@ -290,8 +290,8 @@ struct BatchItem {
 #[derive(Clone, Default)]
 pub struct BatchVerifier {
     items: alloc::vec::Vec<BatchItem>,
-    /// A signature that is not canonically encoded was queued.
-    failed: bool,
+    /// The number of signatures queued that are not canonically encoded.
+    malformed: usize,
 }
 
 #[cfg(feature = "alloc")]
@@ -312,7 +312,7 @@ impl BatchVerifier {
 
     /// The number of signatures queued.
     pub fn len(&self) -> usize {
-        self.items.len() + self.failed as usize
+        self.items.len() + self.malformed
     }
 
     /// Whether no signature was queued.
@@ -331,7 +331,7 @@ impl BatchVerifier {
             Affine::from_bytes(&signature.r),
             Fq::from_bytes(&signature.s),
         ) else {
-            self.failed = true;
+            self.malformed += 1;
             return;
         };
         self.items.push(BatchItem {
@@ -348,7 +348,7 @@ impl BatchVerifier {
     /// signatures could not predict.
     pub fn verify(self, random: &[u8; 64]) -> Result<(), Error> {
         use alloc::vec::Vec;
-        if self.failed {
+        if self.malformed != 0 {
             return Err(Error::InvalidSignature);
         }
         // sum z_i (R_i + [c_i] vk_i - [s_i] base_i) = 0, for random z_i

@@ -30,10 +30,14 @@
 //!
 //! # Proving
 //!
-//! [`ProvingKey::build`] generates the proving key (once: it takes a few
-//! seconds), [`ActionCircuit`] holds the witness of one action and
-//! [`create_proof`] proves a set of actions. The
+//! [`ProvingKey::build`] generates the proving key (once: it takes about
+//! a second of computation), [`ActionCircuit`] holds the witness of one
+//! action and [`create_proof`] proves a set of actions. The
 //! builder does all of it for a whole bundle.
+//!
+//! With the `std` feature, key generation, proving and verification use
+//! the threads of the machine (`orchard::set_max_threads` limits them);
+//! keys and proofs are the same, byte for byte, whatever their number.
 
 use alloc::vec::Vec;
 
@@ -549,7 +553,8 @@ pub struct ProvingKey {
 }
 
 impl ProvingKey {
-    /// Generates the proving key of a circuit version: slow (seconds), and
+    /// Generates the proving key of a circuit version: slow (about a
+    /// second of computation, spread over the threads there are), and
     /// large (tens of megabytes); build it once and keep it.
     pub fn build(version: CircuitVersion) -> Self {
         let params = Params::new(K);

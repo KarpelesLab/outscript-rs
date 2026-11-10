@@ -395,7 +395,10 @@ impl Builder {
     /// circuit version the builder was made for; `random` must be 64 fresh
     /// uniformly random bytes.
     ///
-    /// Proving takes seconds per action.
+    /// Proving takes about a second per action on one thread; with the
+    /// `std` feature it uses the threads of the machine (see
+    /// `orchard::set_max_threads`), and the bundle is the same whatever
+    /// their number.
     pub fn build(
         self,
         pk: &ProvingKey,

@@ -253,8 +253,8 @@ impl Subtree {
 /// hash on average. Of constant size.
 ///
 /// The path and the root it leads to are those of the tree after the last
-/// commitment given: [`IncrementalWitness::path`] is what
-/// [`witness`] computes from all the leaves.
+/// commitment given: [`IncrementalWitness::path`] is what `witness`
+/// (with `alloc`) computes from all the leaves.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IncrementalWitness {
     cmx: Fp,

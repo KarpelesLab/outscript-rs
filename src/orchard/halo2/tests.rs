@@ -165,16 +165,13 @@ fn small_circuit_proof_roundtrip() {
     }
 }
 
-/// Serializes the tests that change the number of threads, so that each
-/// really runs with the number it sets.
-#[cfg(feature = "std")]
-pub(crate) static THREADS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Parameters, keys and proofs do not depend on the number of threads.
 #[cfg(feature = "std")]
 #[test]
 fn threads_do_not_change_keys_or_proofs() {
-    let _guard = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = crate::orchard::par::TEST_THREADS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let run = |threads: usize| {
         set_max_threads(threads);
         assert_eq!(max_threads(), threads);
