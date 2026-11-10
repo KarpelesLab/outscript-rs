@@ -15,9 +15,6 @@
 //! dual-licensed MIT/Apache-2.0), so that circuits written for it port
 //! mechanically.
 
-// While the port is in progress.
-#![allow(dead_code)]
-
 pub mod circuit;
 mod commitment;
 #[cfg(test)]
@@ -35,9 +32,10 @@ mod value;
 mod verifier;
 
 pub use commitment::Params;
+#[cfg(test)]
+pub(crate) use keygen::keygen_vk_with_plan;
+pub(crate) use keygen::vk_from_parts;
 pub use keygen::{PinnedVerificationKey, ProvingKey, VerifyingKey, keygen_pk, keygen_vk};
-#[allow(unused_imports)]
-pub(crate) use keygen::{keygen_vk_with_plan, vk_from_parts};
 pub use prover::create_proof;
 pub use value::Value;
 pub use verifier::{BatchVerifier, verify_proof};

@@ -244,6 +244,7 @@ impl EvaluationDomain {
     }
 
     /// From coefficients to the values on the domain.
+    #[cfg(test)]
     pub(crate) fn coeff_to_lagrange(&self, mut a: Vec<Fp>) -> Vec<Fp> {
         assert_eq!(a.len(), self.n);
         fft(&mut a, self.omega, self.k);

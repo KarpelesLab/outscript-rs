@@ -31,7 +31,8 @@
 //! [`create_proof`] proves a set of actions. The
 //! builder does all of it for a whole bundle.
 
-// While the port is in progress.
+// The gadgets keep the interface of the reference they are ported from;
+// parts of it are only exercised by their own tests.
 #![allow(dead_code)]
 
 use alloc::vec::Vec;

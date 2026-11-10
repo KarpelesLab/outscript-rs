@@ -109,11 +109,6 @@ impl<'a> TranscriptRead<'a> {
     pub(crate) fn squeeze_challenge(&mut self) -> Fp {
         self.transcript.squeeze_challenge()
     }
-
-    /// Whether the whole proof has been read.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
 }
 
 /// A transcript writing a proof.

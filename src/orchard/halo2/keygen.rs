@@ -420,6 +420,7 @@ struct Synthesized {
     cs: ConstraintSystem,
     fixed: Vec<Vec<Fp>>,
     permutations: Vec<Vec<Fp>>,
+    #[cfg_attr(not(test), allow(dead_code))]
     selector_plan: Vec<SelectorPlan>,
 }
 
@@ -487,6 +488,7 @@ pub(crate) fn vk_from_parts<C: Circuit>(
 
 /// Generates the verifying key of a circuit, and the plan by which its
 /// selectors were merged (see [`vk_from_parts`]).
+#[cfg(test)]
 pub(crate) fn keygen_vk_with_plan<C: Circuit>(
     params: &Params,
     circuit: &C,
