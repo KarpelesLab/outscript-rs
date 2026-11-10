@@ -174,8 +174,10 @@ fn take_items<'a>(data: &mut &'a [u8], item_len: usize) -> Result<(usize, &'a [u
     let (count, n) = BtcVarInt::decode(data).ok_or(Error::UnexpectedEof)?;
     let count = usize::try_from(count.0).map_err(|_| Error::TooLarge)?;
     let len = count.checked_mul(item_len).ok_or(Error::TooLarge)?;
-    let items = data.get(n..n + len).ok_or(Error::UnexpectedEof)?;
-    *data = &data[n + len..];
+    // the count is whatever the data claims: `n + len` may not fit a usize
+    let end = n.checked_add(len).ok_or(Error::TooLarge)?;
+    let items = data.get(n..end).ok_or(Error::UnexpectedEof)?;
+    *data = &data[end..];
     Ok((count, items))
 }
 
@@ -732,5 +734,31 @@ impl<'a> ZcashTx<'a> {
         let n = self.sign_to_slice(keys, prevouts, &mut out)?;
         out.truncate(n);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A compact size is a claim: one that, added to its own length, does not
+    /// fit a `usize` is an error and not an overflow.
+    #[test]
+    fn take_items_count_cannot_overflow() {
+        let mut bytes = [0xffu8; 16];
+        bytes[9..].fill(0);
+        // 2^64-1 one-byte items
+        let data = &mut &bytes[..];
+        assert_eq!(take_items(data, 1), Err(Error::TooLarge));
+        assert_eq!(data.len(), 16);
+        // and counts whose byte length alone overflows
+        assert_eq!(take_items(&mut &bytes[..], 96), Err(Error::TooLarge));
+        // a count just past the data is an EOF
+        let short = [0x08u8, 1, 2, 3, 4, 5, 6, 7];
+        assert_eq!(take_items(&mut &short[..], 1), Err(Error::UnexpectedEof));
+        let exact = [0x02u8, 1, 2, 3];
+        let data = &mut &exact[..];
+        assert_eq!(take_items(data, 1), Ok((2, &exact[1..3])));
+        assert_eq!(*data, &exact[3..]);
     }
 }
