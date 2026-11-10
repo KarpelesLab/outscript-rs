@@ -60,8 +60,8 @@ jobs:
           - { name: zcash, flags: --no-default-features --features alloc,zcash }
           - { name: zcash-sapling, flags: "--no-default-features --features alloc,zcash-sapling" }
           - { name: zcash-orchard, flags: "--no-default-features --features alloc,zcash-orchard" }
-          - { name: zcash-sapling-prover, flags: "--no-default-features --features std,zcash-sapling-prover" }
-          - { name: zcash-orchard-prover, flags: "--no-default-features --features std,zcash-orchard-prover" }
+          - { name: zcash-sapling-prover, flags: "--no-default-features --features alloc,zcash-sapling-prover" }
+          - { name: zcash-orchard-prover, flags: "--no-default-features --features alloc,zcash-orchard-prover" }
           - { name: tron, flags: --no-default-features --features alloc,tron }
           - { name: monero, flags: --no-default-features --features alloc,monero }
           - { name: zano, flags: --no-default-features --features alloc,zano }
