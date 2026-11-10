@@ -231,3 +231,77 @@ fn redpallas_sign_and_verify() {
     );
     let _ = Fp::ZERO;
 }
+
+/// Signatures of both kinds verified together.
+#[cfg(feature = "alloc")]
+#[test]
+fn redpallas_batch_verification() {
+    use crate::orchard::redpallas::BatchVerifier;
+    let random = [0x77; 64];
+    let msgs: [[u8; 32]; 3] = [[1; 32], [2; 32], [3; 32]];
+    let spend: Vec<_> = (0u8..3)
+        .map(|i| {
+            let ask = SpendingKey::from_bytes([40 + i; 32]).unwrap().to_ask();
+            let rsk = ask.randomize(&Fq::from_u64(1000 + i as u64));
+            let sig = rsk.sign(&[i; 80], &msgs[i as usize]);
+            (rsk.verification_key(), sig)
+        })
+        .collect();
+    let bsk: SigningKey<Binding> = SigningKey::from_scalar(Fq::from_u64(0xdead_beef));
+    let binding = (bsk.verification_key(), bsk.sign(&[9; 80], &msgs[0]));
+
+    let batch = |skip: Option<usize>| {
+        let mut batch = BatchVerifier::new();
+        for (i, (vk, sig)) in spend.iter().enumerate() {
+            if skip != Some(i) {
+                batch.queue(vk, &msgs[i], sig);
+            }
+        }
+        batch.queue(&binding.0, &msgs[0], &binding.1);
+        batch
+    };
+    assert!(BatchVerifier::new().is_empty());
+    assert_eq!(BatchVerifier::new().verify(&random), Ok(()));
+    assert_eq!(batch(None).len(), 4);
+    assert_eq!(batch(None).verify(&random), Ok(()));
+    assert_eq!(batch(None).verify(&[0; 64]), Ok(()));
+    for i in 0..3 {
+        // one signature over another message, by another key, altered
+        let mut b = batch(Some(i));
+        b.queue(&spend[i].0, &msgs[(i + 1) % 3], &spend[i].1);
+        assert_eq!(b.verify(&random), Err(Error::InvalidSignature));
+        let mut b = batch(Some(i));
+        b.queue(&spend[(i + 1) % 3].0, &msgs[i], &spend[i].1);
+        assert_eq!(b.verify(&random), Err(Error::InvalidSignature));
+        for at in [3, 40] {
+            let mut bytes = spend[i].1.to_bytes();
+            bytes[at] ^= 4;
+            let mut b = batch(Some(i));
+            b.queue(&spend[i].0, &msgs[i], &Signature::from_bytes(&bytes));
+            assert_eq!(b.verify(&random), Err(Error::InvalidSignature));
+        }
+        // not canonically encoded
+        let mut bytes = spend[i].1.to_bytes();
+        bytes[32..].fill(0xff);
+        let mut b = batch(Some(i));
+        b.queue(&spend[i].0, &msgs[i], &Signature::from_bytes(&bytes));
+        assert_eq!(b.len(), 4);
+        assert_eq!(b.verify(&random), Err(Error::InvalidSignature));
+    }
+    // a signature of one kind does not pass for the other
+    let as_binding: VerificationKey<Binding> =
+        VerificationKey::from_bytes(&spend[0].0.to_bytes()).unwrap();
+    let mut b = BatchVerifier::new();
+    b.queue(
+        &as_binding,
+        &msgs[0],
+        &Signature::from_bytes(&spend[0].1.to_bytes()),
+    );
+    assert_eq!(b.verify(&random), Err(Error::InvalidSignature));
+    // two wrong signatures whose errors would cancel out with equal
+    // coefficients: swapped between two keys
+    let mut b = BatchVerifier::new();
+    b.queue(&spend[0].0, &msgs[0], &spend[1].1);
+    b.queue(&spend[1].0, &msgs[1], &spend[0].1);
+    assert_eq!(b.verify(&random), Err(Error::InvalidSignature));
+}

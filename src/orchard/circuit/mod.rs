@@ -22,7 +22,11 @@
 //! [`VerifyingKey::embedded`] gives the verifying key of a circuit version
 //! without generating it; `BundleRef::verify_proof`
 //! checks the proof of a parsed bundle, and [`verify_proof`] a proof for
-//! explicit public inputs ([`Instance`]).
+//! explicit public inputs ([`Instance`]). Many bundles (the transactions
+//! of a block) are verified faster together: [`BatchValidator`] and
+//! [`verify_bundles`] check their proofs and signatures at once.
+//! [`CircuitVersion::for_branch_id`] and [`CircuitVersion::for_height`]
+//! tell which version of the circuit a transaction is for.
 //!
 //! # Proving
 //!
@@ -47,6 +51,7 @@ use super::{Fp, Fq, pallas};
 
 mod action;
 pub(crate) mod add_chip;
+mod batch;
 pub(crate) mod commit_ivk;
 pub(crate) mod ecc;
 pub(crate) mod gadget;
@@ -59,6 +64,8 @@ pub(crate) mod utilities;
 mod tests;
 #[cfg(all(test, feature = "std"))]
 mod tests_build;
+
+pub use batch::{BatchValidator, verify_bundles};
 
 /// The size of the circuit: `2^11` rows.
 pub const K: u32 = 11;

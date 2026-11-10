@@ -8,6 +8,27 @@
 //! hashes are embedded: `b2sum -l 256`) and
 //! `src/circuit_data/circuit_proof_test_case_*.bin` (an instance and a
 //! proof for each version, copied to `testdata/`).
+//!
+//! The chain data is five transactions of the main network
+//! (`testdata/mainnet_tx_*.hex`, named after their ids), one or two for
+//! each circuit version:
+//!
+//! | id (start) | height    | upgrade | format | circuit            |
+//! |------------|-----------|---------|--------|--------------------|
+//! | `db84ddff` |           | NU5     | v5     | `InsecurePreNu6_2` |
+//! | `3ecd7b89` | 3 400 076 | NU6.2   | v5     | `FixedPostNu6_2`   |
+//! | `b0fd5d92` | 3 428 142 | NU6.2   | v5     | `FixedPostNu6_2`   |
+//! | `e39eab2b` | 3 428 147 | NU6.3   | v6     | `PostNu6_3`        |
+//! | `2be7cf25` | 3 550 069 | NU7     | v6     | `PostNu6_3`        |
+//!
+//! From NU6.3 wallets use version 6 transactions, which this crate does
+//! not parse: the tests below locate the Orchard bundle (which has the
+//! layout it has in version 5) in them, and the Ironwood bundle that
+//! follows it. None of these transactions has transparent inputs, so their
+//! signature hash for shielded inputs is their id (ZIP 244). The reference
+//! (`zcash_primitives` 0.31.0 and `orchard` 0.16.0: the scratch program
+//! `checktx`) computes the same ids from these files and accepts the
+//! proofs and signatures of all their bundles.
 
 use alloc::format;
 use alloc::vec::Vec;
@@ -235,8 +256,16 @@ fn mainnet_proof_verifies() {
         BundleRef::parse(&bytes).unwrap().unwrap().verify_proof(vk),
         Err(crate::orchard::Error::InvalidProof)
     );
+    // before NU6.2 the length of the proof was not a consensus rule: what
+    // follows the proof proper is ignored, a shorter one cannot verify
     let mut owned = bundle.to_owned();
     owned.proof.push(0);
+    let bytes = owned.to_bytes();
+    assert_eq!(
+        BundleRef::parse(&bytes).unwrap().unwrap().verify_proof(vk),
+        Ok(())
+    );
+    owned.proof.truncate(proof_size(2) - 1);
     let bytes = owned.to_bytes();
     assert_eq!(
         BundleRef::parse(&bytes).unwrap().unwrap().verify_proof(vk),
@@ -299,4 +328,241 @@ fn circuit_version_selection() {
     ] {
         assert_eq!(CircuitVersion::for_height(network, height), expected);
     }
+}
+
+/// The transactions of the main network made after NU6.2, with their ids.
+const TX_3ECD7B89: (&str, &str) = (
+    include_str!("../testdata/mainnet_tx_3ecd7b89.hex"),
+    "3ecd7b89d8fa204562d42bb72bb68c9cc09f45542a7659c9d0f87e3dbb92331e",
+);
+const TX_B0FD5D92: (&str, &str) = (
+    include_str!("../testdata/mainnet_tx_b0fd5d92.hex"),
+    "b0fd5d921bb44779124e2ba10128b5bfc8ea6c8e044e7802717cb43b7b671450",
+);
+const TX_E39EAB2B: (&str, &str) = (
+    include_str!("../testdata/mainnet_tx_e39eab2b.hex"),
+    "e39eab2bad5e0d210d4a5894e5b69254d5ecd888c8edcc46e0bd49936f1ea64a",
+);
+const TX_2BE7CF25: (&str, &str) = (
+    include_str!("../testdata/mainnet_tx_2be7cf25.hex"),
+    "2be7cf251872c4b20ce779efa0cf021c0a1eee42010dccc38db70973b4b8d439",
+);
+
+/// The signature hash for shielded inputs of a transaction without
+/// transparent inputs: its id, in the byte order of the digest.
+fn sighash_of_txid(txid: &str) -> [u8; 32] {
+    let mut id: [u8; 32] = hex::decode(txid).unwrap().try_into().unwrap();
+    id.reverse();
+    id
+}
+
+/// The serialized Orchard bundle of a version 5 transaction (checked to
+/// have the id given, and no transparent input), and its signature hash.
+fn v5_orchard((raw, txid): (&str, &str), branch: u32) -> (Vec<u8>, [u8; 32]) {
+    use crate::zcashtx::{SIGHASH_ALL, ZcashTx};
+    let raw = hex::decode(raw.trim()).unwrap();
+    let tx = ZcashTx::parse_into(&raw, &mut [], &mut []).unwrap();
+    assert_eq!(tx.consensus_branch_id, branch);
+    assert_eq!(hex::encode(tx.txid().unwrap()), txid);
+    let sighash = tx.sighash(None, SIGHASH_ALL, &[]).unwrap();
+    assert_eq!(sighash, sighash_of_txid(txid));
+    (tx.orchard.to_vec(), sighash)
+}
+
+/// The serialized Orchard and Ironwood bundles of a version 6 transaction
+/// without transparent inputs or Sapling parts, and its signature hash.
+/// The header and the transparent and Sapling parts are laid out as in
+/// version 5, the two bundles follow, each as the Orchard bundle of
+/// version 5 (`Transaction::read_v6` of `zcash_primitives` 0.31.0).
+fn v6_bundles((raw, txid): (&str, &str), branch: u32) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
+    let raw = hex::decode(raw.trim()).unwrap();
+    // version 6 with the overwintered bit, its version group id
+    assert_eq!(raw[..4], 0x8000_0006u32.to_le_bytes());
+    assert_eq!(raw[4..8], 0xd884_b698u32.to_le_bytes());
+    assert_eq!(raw[8..12], branch.to_le_bytes());
+    // lock time, expiry height; no transparent input
+    let mut rest = &raw[20..];
+    assert_eq!(rest[0], 0);
+    let outputs = rest[1] as usize;
+    assert!(outputs < 0xfd);
+    rest = &rest[2..];
+    for _ in 0..outputs {
+        let script = rest[8] as usize;
+        assert!(script < 0xfd);
+        rest = &rest[9 + script..];
+    }
+    // no Sapling spend or output
+    assert_eq!(rest[..2], [0, 0]);
+    rest = &rest[2..];
+    let both = rest;
+    BundleRef::read(&mut rest).unwrap().unwrap();
+    let orchard = &both[..both.len() - rest.len()];
+    (orchard.to_vec(), rest.to_vec(), sighash_of_txid(txid))
+}
+
+/// Checks a bundle of the chain: its proof with the key of `version` and
+/// with no other, and its signatures.
+fn check_chain_bundle(bytes: &[u8], sighash: &[u8; 32], version: CircuitVersion) {
+    let bundle = BundleRef::parse(bytes).unwrap().unwrap();
+    assert_eq!(bundle.action_count(), 2);
+    assert_eq!(bundle.proof().len(), proof_size(2));
+    assert_eq!(bundle.verify_signatures(sighash), Ok(()));
+    assert!(bundle.verify_signatures(&[0u8; 32]).is_err());
+    for vk in keys() {
+        let result = bundle.verify_proof(vk);
+        if vk.version() == version {
+            assert_eq!(result, Ok(()), "{version:?}");
+        } else {
+            assert_eq!(
+                result,
+                Err(crate::orchard::Error::InvalidProof),
+                "{version:?} with {:?}",
+                vk.version()
+            );
+        }
+    }
+}
+
+/// Two transactions mined under NU6.2 (the second in its last block):
+/// their proofs are for the corrected circuit.
+#[test]
+fn mainnet_nu6_2_bundles_verify() {
+    for tx in [TX_3ECD7B89, TX_B0FD5D92] {
+        let (bytes, sighash) = v5_orchard(tx, 0x5437_f330);
+        assert_eq!(
+            CircuitVersion::for_branch_id(0x5437_f330),
+            Some(CircuitVersion::FixedPostNu6_2)
+        );
+        check_chain_bundle(&bytes, &sighash, CircuitVersion::FixedPostNu6_2);
+        // from NU6.2 the proof must have its exact length
+        let mut owned = BundleRef::parse(&bytes).unwrap().unwrap().to_owned();
+        owned.proof.push(0);
+        let longer = owned.to_bytes();
+        assert_eq!(
+            BundleRef::parse(&longer)
+                .unwrap()
+                .unwrap()
+                .verify_proof(key(CircuitVersion::FixedPostNu6_2)),
+            Err(crate::orchard::Error::InvalidProof)
+        );
+    }
+}
+
+/// The Orchard bundles of two version 6 transactions, mined under NU6.3
+/// and under NU7: their proofs are for the NU6.3 circuit, with the
+/// cross-address restriction on.
+#[test]
+fn mainnet_nu6_3_and_nu7_orchard_bundles_verify() {
+    for (tx, branch) in [(TX_E39EAB2B, 0x37a5_165b), (TX_2BE7CF25, 0x7719_0ad9)] {
+        let (orchard, _, sighash) = v6_bundles(tx, branch);
+        assert_eq!(
+            CircuitVersion::for_branch_id(branch),
+            Some(CircuitVersion::PostNu6_3)
+        );
+        check_chain_bundle(&orchard, &sighash, CircuitVersion::PostNu6_3);
+        // the restriction is a public input of these proofs
+        let bundle = BundleRef::parse(&orchard).unwrap().unwrap();
+        let vk = key(CircuitVersion::PostNu6_3);
+        let mut instances = bundle.instances(vk.version()).unwrap();
+        assert!(instances.iter().all(|i| i.disable_cross_address));
+        assert_eq!(verify_proof(vk, &instances, bundle.proof()), Ok(()));
+        instances[1].disable_cross_address = false;
+        assert!(verify_proof(vk, &instances, bundle.proof()).is_err());
+    }
+}
+
+/// The Ironwood bundle of a transaction mined under NU7 (one action): the
+/// same circuit, without the cross-address restriction. The Ironwood pool
+/// is not otherwise handled by this crate: the bundle is read as an
+/// Orchard one, but for the `enableCrossAddress` bit of its flags.
+#[test]
+fn mainnet_ironwood_proof_verifies() {
+    let (_, mut ironwood, sighash) = v6_bundles(TX_2BE7CF25, 0x7719_0ad9);
+    // one action; spends, outputs and cross-address transfers enabled
+    assert_eq!(ironwood[0], 1);
+    let flags = 1 + crate::orchard::bundle::ACTION_SIZE;
+    assert_eq!(ironwood[flags], 0b111);
+    assert_eq!(
+        BundleRef::parse(&ironwood).err(),
+        Some(crate::orchard::Error::InvalidFlags)
+    );
+    ironwood[flags] = 0b011;
+    let bundle = BundleRef::parse(&ironwood).unwrap().unwrap();
+    assert_eq!(bundle.proof().len(), proof_size(1));
+    // (the signatures do not cover the flags directly: the hash does)
+    assert_eq!(bundle.verify_signatures(&sighash), Ok(()));
+
+    let vk = key(CircuitVersion::PostNu6_3);
+    let mut instances = bundle.instances(vk.version()).unwrap();
+    // read as an Orchard bundle of NU6.3, it would be restricted
+    assert!(verify_proof(vk, &instances, bundle.proof()).is_err());
+    instances[0].disable_cross_address = false;
+    assert_eq!(verify_proof(vk, &instances, bundle.proof()), Ok(()));
+    let fixed = key(CircuitVersion::FixedPostNu6_2);
+    assert!(verify_proof(fixed, &instances, bundle.proof()).is_err());
+}
+
+/// Bundles of the chain verified together: proofs and signatures.
+#[test]
+fn batch_validation_of_mainnet_bundles() {
+    let random = [0x3c; 64];
+    let (a, a_sighash) = v5_orchard(TX_3ECD7B89, 0x5437_f330);
+    let (b, b_sighash) = v5_orchard(TX_B0FD5D92, 0x5437_f330);
+    let (c, _, c_sighash) = v6_bundles(TX_E39EAB2B, 0x37a5_165b);
+    let (d, _, d_sighash) = v6_bundles(TX_2BE7CF25, 0x7719_0ad9);
+    let parse = |bytes: &[u8]| BundleRef::parse(bytes).unwrap().unwrap().to_owned();
+    let fixed = key(CircuitVersion::FixedPostNu6_2);
+    let post = key(CircuitVersion::PostNu6_3);
+
+    let valid = |vk: &VerifyingKey, bundles: &[(&crate::orchard::bundle::Bundle, [u8; 32])]| {
+        let bytes: Vec<Vec<u8>> = bundles.iter().map(|(b, _)| b.to_bytes()).collect();
+        let refs: Vec<(BundleRef<'_>, [u8; 32])> = bytes
+            .iter()
+            .zip(bundles.iter())
+            .map(|(bytes, (_, sighash))| (BundleRef::parse(bytes).unwrap().unwrap(), *sighash))
+            .collect();
+        verify_bundles(vk, &refs, &random)
+    };
+    let (a, b, c, d) = (parse(&a), parse(&b), parse(&c), parse(&d));
+
+    // an empty batch, one bundle, several
+    assert!(valid(fixed, &[]));
+    assert!(valid(fixed, &[(&a, a_sighash)]));
+    assert!(valid(fixed, &[(&a, a_sighash), (&b, b_sighash)]));
+    assert!(valid(post, &[(&c, c_sighash), (&d, d_sighash)]));
+    // the batch type, used directly
+    let bytes = [a.to_bytes(), b.to_bytes()];
+    let mut batch = BatchValidator::new(fixed, &random);
+    assert!(batch.is_empty());
+    batch.add_bundle(&BundleRef::parse(&bytes[0]).unwrap().unwrap(), &a_sighash);
+    batch.add_bundle(&BundleRef::parse(&bytes[1]).unwrap().unwrap(), &b_sighash);
+    assert_eq!(batch.len(), 2);
+    assert!(batch.validate());
+
+    // a bundle of another circuit version
+    assert!(!valid(fixed, &[(&a, a_sighash), (&c, c_sighash)]));
+    assert!(!valid(post, &[(&c, c_sighash), (&a, a_sighash)]));
+    // a wrong signature hash
+    assert!(!valid(fixed, &[(&a, a_sighash), (&b, a_sighash)]));
+    // a wrong spend authorization signature, a wrong binding signature
+    let mut bad = b.clone();
+    bad.actions[1].spend_auth_sig[5] ^= 1;
+    assert!(!valid(fixed, &[(&a, a_sighash), (&bad, b_sighash)]));
+    let mut bad = b.clone();
+    bad.binding_sig[40] ^= 1;
+    assert!(!valid(fixed, &[(&bad, b_sighash), (&a, a_sighash)]));
+    // a wrong proof, a wrong public input, a proof too long
+    let mut bad = b.clone();
+    bad.proof[1000] ^= 1;
+    assert!(!valid(fixed, &[(&a, a_sighash), (&bad, b_sighash)]));
+    let mut bad = a.clone();
+    bad.anchor[0] ^= 1;
+    assert!(!valid(fixed, &[(&bad, a_sighash), (&b, b_sighash)]));
+    let mut bad = a.clone();
+    bad.proof.push(0);
+    assert!(!valid(fixed, &[(&bad, a_sighash)]));
+    // keys that are not points
+    let mut bad = a.clone();
+    bad.actions[0].rk = [0xff; 32];
+    assert!(!valid(fixed, &[(&bad, a_sighash)]));
 }

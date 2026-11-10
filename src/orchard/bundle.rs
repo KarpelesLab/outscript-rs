@@ -355,25 +355,40 @@ impl<'a> BundleRef<'a> {
             .verify(sighash, &Signature::from_bytes(&self.binding_sig))
     }
 
-    /// Verifies the zero-knowledge proof of the bundle with the verifying
-    /// key of the circuit version in force at the height of the
-    /// transaction (see
-    /// [`CircuitVersion`](super::circuit::CircuitVersion)). The proof must
-    /// have exactly the length the number of actions implies.
-    ///
-    /// Together with [`BundleRef::verify_signatures`] this covers what a
-    /// bundle proves by itself; that the anchor is a root of the note
-    /// commitment tree and that the nullifiers are unspent is for the
-    /// caller to check against the chain.
+    /// Adds the binding signature and every spend authorization signature
+    /// of the bundle over `sighash` to `batch`, to verify them together
+    /// with others (see [`BundleRef::verify_signatures`], which this
+    /// replaces once the batch is verified). Fails, leaving the batch
+    /// untouched, if a key of the bundle is not validly encoded.
+    #[cfg(feature = "alloc")]
+    pub fn queue_signatures(
+        &self,
+        sighash: &[u8; 32],
+        batch: &mut super::redpallas::BatchVerifier,
+    ) -> Result<(), Error> {
+        let binding = self.binding_validating_key()?;
+        let mut keys = alloc::vec::Vec::with_capacity(self.action_count());
+        for action in self.actions() {
+            keys.push(action.validating_key().ok_or(Error::InvalidEncoding)?);
+        }
+        for (action, rk) in self.actions().zip(keys.iter()) {
+            batch.queue(rk, sighash, &Signature::from_bytes(&action.spend_auth_sig));
+        }
+        batch.queue(&binding, sighash, &Signature::from_bytes(&self.binding_sig));
+        Ok(())
+    }
+
+    /// The public inputs of the actions of the bundle, for the circuit
+    /// `version`.
     #[cfg(feature = "zcash-orchard-prover")]
-    pub fn verify_proof(&self, vk: &super::circuit::VerifyingKey) -> Result<(), Error> {
+    pub(crate) fn instances(
+        &self,
+        version: super::circuit::CircuitVersion,
+    ) -> Result<alloc::vec::Vec<super::circuit::Instance>, Error> {
         use super::Fp;
         use super::pallas::Affine;
-        if self.proof.len() != super::circuit::proof_size(self.action_count()) {
-            return Err(Error::InvalidProof);
-        }
         let anchor = Fp::from_bytes(&self.anchor).ok_or(Error::InvalidEncoding)?;
-        let disable_cross_address = vk.version().supports_cross_address_restriction();
+        let disable_cross_address = version.supports_cross_address_restriction();
         let mut instances = alloc::vec::Vec::with_capacity(self.action_count());
         for action in self.actions() {
             let point = |bytes: &[u8; 32]| {
@@ -392,6 +407,43 @@ impl<'a> BundleRef<'a> {
                 disable_cross_address,
             });
         }
+        Ok(instances)
+    }
+
+    /// Whether the proof has a length consensus accepts for the circuit
+    /// `version`: exactly what the number of actions implies from NU6.2
+    /// on. Before NU6.2 the length was not a consensus rule (bytes after
+    /// the proof proper were ignored, as `orchard` 0.16 still does for
+    /// that version, and ZIP 257 states), so anything not shorter passes.
+    #[cfg(feature = "zcash-orchard-prover")]
+    pub(crate) fn proof_length_is_valid(&self, version: super::circuit::CircuitVersion) -> bool {
+        let expected = super::circuit::proof_size(self.action_count());
+        match version {
+            super::circuit::CircuitVersion::InsecurePreNu6_2 => self.proof.len() >= expected,
+            _ => self.proof.len() == expected,
+        }
+    }
+
+    /// Verifies the zero-knowledge proof of the bundle with the verifying
+    /// key of the circuit version in force at the height of the
+    /// transaction (see
+    /// [`CircuitVersion`](super::circuit::CircuitVersion)). From NU6.2 on
+    /// the proof must have exactly the length the number of actions
+    /// implies; before, consensus accepted longer ones, and so does this.
+    ///
+    /// Together with [`BundleRef::verify_signatures`] this covers what a
+    /// bundle proves by itself; that the anchor is a root of the note
+    /// commitment tree and that the nullifiers are unspent is for the
+    /// caller to check against the chain.
+    ///
+    /// Several bundles are verified faster together: see
+    /// [`BatchValidator`](super::circuit::BatchValidator).
+    #[cfg(feature = "zcash-orchard-prover")]
+    pub fn verify_proof(&self, vk: &super::circuit::VerifyingKey) -> Result<(), Error> {
+        if !self.proof_length_is_valid(vk.version()) {
+            return Err(Error::InvalidProof);
+        }
+        let instances = self.instances(vk.version())?;
         super::circuit::verify_proof(vk, &instances, self.proof).map_err(|_| Error::InvalidProof)
     }
 

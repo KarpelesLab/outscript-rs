@@ -4,6 +4,9 @@
 //!
 //! The two uses differ only in their base point, which the type parameter
 //! of the keys and signatures selects: [`SpendAuth`] or [`Binding`].
+//!
+//! Many signatures (of both kinds, by any keys, over any messages) are
+//! verified faster together, with a `BatchVerifier` (feature `alloc`).
 
 use core::marker::PhantomData;
 
@@ -260,5 +263,126 @@ impl<T: SigType> Signature<T> {
         out[..32].copy_from_slice(&self.r);
         out[32..].copy_from_slice(&self.s);
         out
+    }
+}
+
+/// One signature of a batch: `[s] base = r + [c] vk` is to hold.
+#[cfg(feature = "alloc")]
+#[derive(Clone, Copy)]
+struct BatchItem {
+    base: Affine,
+    vk: Affine,
+    r: Affine,
+    s: Fq,
+    c: Fq,
+}
+
+/// Verifies many RedPallas signatures at once: a random linear combination
+/// of their verification equations, checked with a single multi-scalar
+/// multiplication, several times faster than verifying them one by one.
+///
+/// A batch accepts exactly when every signature in it is valid (but for a
+/// chance of about `2^-250` over the randomness given to
+/// [`BatchVerifier::verify`]): Pallas has prime order, so there are no
+/// signatures a batch and [`VerificationKey::verify`] disagree on. A
+/// rejected batch does not tell which signature is wrong.
+#[cfg(feature = "alloc")]
+#[derive(Clone, Default)]
+pub struct BatchVerifier {
+    items: alloc::vec::Vec<BatchItem>,
+    /// A signature that is not canonically encoded was queued.
+    failed: bool,
+}
+
+#[cfg(feature = "alloc")]
+impl core::fmt::Debug for BatchVerifier {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BatchVerifier")
+            .field("signatures", &self.items.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl BatchVerifier {
+    /// An empty batch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The number of signatures queued.
+    pub fn len(&self) -> usize {
+        self.items.len() + self.failed as usize
+    }
+
+    /// Whether no signature was queued.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Adds `signature` by `vk` over `msg` to the batch.
+    pub fn queue<T: SigType>(
+        &mut self,
+        vk: &VerificationKey<T>,
+        msg: &[u8],
+        signature: &Signature<T>,
+    ) {
+        let (Some(r), Some(s)) = (
+            Affine::from_bytes(&signature.r),
+            Fq::from_bytes(&signature.s),
+        ) else {
+            self.failed = true;
+            return;
+        };
+        self.items.push(BatchItem {
+            base: T::BASE,
+            vk: vk.point,
+            r,
+            s,
+            c: h_star(&[&signature.r, &vk.bytes, msg]),
+        });
+    }
+
+    /// Whether every signature queued is valid (an empty batch is).
+    /// `random` must be 64 uniformly random bytes that whoever made the
+    /// signatures could not predict.
+    pub fn verify(self, random: &[u8; 64]) -> Result<(), Error> {
+        use alloc::vec::Vec;
+        if self.failed {
+            return Err(Error::InvalidSignature);
+        }
+        // sum z_i (R_i + [c_i] vk_i - [s_i] base_i) = 0, for random z_i
+        let mut scalars: Vec<Fq> = Vec::with_capacity(2 * self.items.len() + 2);
+        let mut points: Vec<Affine> = Vec::with_capacity(2 * self.items.len() + 2);
+        // (the bases are few: one for each kind of signature)
+        let mut bases: Vec<(Affine, Fq)> = Vec::with_capacity(2);
+        for (i, item) in self.items.iter().enumerate() {
+            let mut h = Blake2bMac::try_new_with_salt_personal(&[], 64, &[], b"outscript_rpbtch")
+                .expect("valid BLAKE2b parameters");
+            h.update(random);
+            h.update(&(i as u64).to_le_bytes());
+            let mut out = [0u8; 64];
+            h.finalize_into(&mut out);
+            let z = Fq::from_uniform_bytes(&out);
+            scalars.push(z);
+            points.push(item.r);
+            scalars.push(z * item.c);
+            points.push(item.vk);
+            let term = (z * item.s).neg();
+            match bases.iter_mut().find(|(base, _)| *base == item.base) {
+                Some((_, scalar)) => *scalar += term,
+                None => bases.push((item.base, term)),
+            }
+        }
+        for (base, scalar) in bases {
+            scalars.push(scalar);
+            points.push(base);
+        }
+        // everything here is public
+        if bool::from(Point::msm_vartime(&scalars, &points).is_identity()) {
+            Ok(())
+        } else {
+            Err(Error::InvalidSignature)
+        }
     }
 }
