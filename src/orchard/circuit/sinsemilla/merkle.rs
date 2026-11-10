@@ -15,10 +15,12 @@ pub(crate) mod chip;
 
 /// The depth of the Orchard note commitment tree
 /// (`orchard::constants::MERKLE_DEPTH_ORCHARD`).
+#[cfg(test)]
 pub(crate) const MERKLE_DEPTH_ORCHARD: usize = 32;
 
 /// The number of bits of a node of the Orchard note commitment tree
 /// (`orchard::constants::sinsemilla::L_ORCHARD_MERKLE`).
+#[cfg(test)]
 pub(crate) const L_ORCHARD_MERKLE: usize = 255;
 
 /// Gadget representing a Merkle path that proves a leaf exists in a Merkle

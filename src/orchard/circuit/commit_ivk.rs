@@ -4,8 +4,6 @@
 //! viewing key `ivk` to the full viewing key `(ak, nk)` and the randomness
 //! `rivk`.
 
-#![allow(dead_code)]
-
 use core::iter;
 
 use super::ecc::chip::{EccChip, T_P};

@@ -62,6 +62,7 @@ impl EccPoint {
     }
 
     /// Returns the value of this curve point, if known.
+    #[cfg(test)]
     pub(crate) fn point(&self) -> Value<pallas::Affine> {
         self.x.value().zip(self.y.value()).map(|(x, y)| {
             if bool::from(x.is_zero()) && bool::from(y.is_zero()) {
@@ -83,6 +84,7 @@ impl EccPoint {
     }
 
     /// Whether the point is the identity, if known.
+    #[cfg(test)]
     pub(crate) fn is_identity(&self) -> Value<bool> {
         self.x.value().map(|x| bool::from(x.is_zero()))
     }
@@ -106,6 +108,7 @@ impl NonIdentityEccPoint {
     }
 
     /// Returns the value of this curve point, if known.
+    #[cfg(test)]
     pub(crate) fn point(&self) -> Value<pallas::Affine> {
         self.x.value().zip(self.y.value()).map(|(x, y)| {
             assert!(!bool::from(x.is_zero()) && !bool::from(y.is_zero()));
@@ -305,6 +308,7 @@ struct EccBaseFieldElemFixed {
 }
 
 impl EccBaseFieldElemFixed {
+    #[cfg(test)]
     fn base_field_elem(&self) -> AssignedCell<Fp> {
         self.base_field_elem.clone()
     }
@@ -362,6 +366,7 @@ impl EccChip {
     /// Witnesses the given constant point as a private input to the circuit.
     /// This allows the point to be the identity, mapped to (0, 0) in
     /// affine coordinates.
+    #[cfg(test)]
     pub(crate) fn witness_point_from_constant(
         &self,
         layouter: &mut Layouter<'_>,
@@ -384,6 +389,7 @@ impl EccChip {
 
     /// Witnesses the given constant point as a private input to the circuit.
     /// This returns an error if the point is the identity.
+    #[cfg(test)]
     pub(crate) fn witness_point_non_id_from_constant(
         &self,
         layouter: &mut Layouter<'_>,
@@ -432,6 +438,7 @@ impl EccChip {
     /// Performs incomplete point addition, returning `a + b`.
     ///
     /// This returns an error in exceptional cases.
+    #[cfg(test)]
     pub(crate) fn add_incomplete(
         &self,
         layouter: &mut Layouter<'_>,

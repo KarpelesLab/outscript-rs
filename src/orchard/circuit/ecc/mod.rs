@@ -108,6 +108,7 @@ impl NonIdentityPoint {
     }
 
     /// Constructs a new point with the given fixed value.
+    #[cfg(test)]
     pub(crate) fn new_from_constant(
         chip: EccChip,
         layouter: &mut Layouter<'_>,
@@ -118,6 +119,7 @@ impl NonIdentityPoint {
     }
 
     /// Constrains this point to be equal in value to another point.
+    #[cfg(test)]
     pub(crate) fn constrain_equal<Other: Into<Point> + Clone>(
         &self,
         layouter: &mut Layouter<'_>,
@@ -165,6 +167,7 @@ impl NonIdentityPoint {
     /// The arguments are type-constrained not to be the identity point,
     /// and since exceptional cases return an Error, the result also cannot
     /// be the identity point.
+    #[cfg(test)]
     pub(crate) fn add_incomplete(
         &self,
         layouter: &mut Layouter<'_>,
@@ -231,6 +234,7 @@ impl Point {
     }
 
     /// Constructs a new point with the given fixed value.
+    #[cfg(test)]
     pub(crate) fn new_from_constant(
         chip: EccChip,
         layouter: &mut Layouter<'_>,
@@ -259,12 +263,6 @@ impl Point {
     /// Extracts the x-coordinate of a point.
     pub(crate) fn extract_p(&self) -> X {
         X::from_inner(self.chip, EccChip::extract_p(&self.inner))
-    }
-
-    /// Wraps the given point (obtained directly from an instruction) in a
-    /// gadget.
-    pub(crate) fn from_inner(chip: EccChip, inner: EccPoint) -> Self {
-        Point { chip, inner }
     }
 
     /// Returns `self + other` using complete addition.

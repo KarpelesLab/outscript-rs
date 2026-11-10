@@ -74,11 +74,13 @@ pub(crate) struct LookupRangeCheckConfig {
 
 impl LookupRangeCheckConfig {
     /// The advice column of the running sums.
+    #[cfg(test)]
     pub(crate) fn running_sum(&self) -> Column<Advice> {
         self.running_sum
     }
 
     /// The table column of the values `[0..2^K)`.
+    #[cfg(test)]
     pub(crate) fn table_idx(&self) -> TableColumn {
         self.table_idx
     }
@@ -353,6 +355,7 @@ impl LookupRangeCheckConfig {
     ///
     /// # Panics
     /// Panics if NUM_BITS is equal to or larger than K.
+    #[cfg(test)]
     pub(crate) fn copy_short_check(
         &self,
         layouter: &mut Layouter<'_>,

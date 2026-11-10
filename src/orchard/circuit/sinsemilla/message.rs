@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 
 use crate::orchard::Fp;
 use crate::orchard::halo2::Value;
-use crate::orchard::halo2::circuit::{AssignedCell, Cell};
+use crate::orchard::halo2::circuit::AssignedCell;
 use crate::orchard::sinsemilla::{C, K};
 
 /// The number of bits of an element of the Pallas base field
@@ -61,11 +61,6 @@ impl MessagePiece {
     /// The number of K-bit words in this message piece.
     pub(crate) fn num_words(&self) -> usize {
         self.num_words
-    }
-
-    /// The cell of this message piece.
-    pub(crate) fn cell(&self) -> Cell {
-        self.cell_value.cell()
     }
 
     /// The value of this message piece.

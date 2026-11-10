@@ -6,8 +6,6 @@
 //! the Halo 2 chip that enforces that commitment inside the Orchard Action
 //! circuit.
 
-#![allow(dead_code)]
-
 use core::iter;
 
 use super::ecc::chip::{EccChip, NonIdentityEccPoint, T_P};
@@ -1367,7 +1365,9 @@ pub(crate) struct NoteCommitConfig {
     rho: RhoCanonicity,
     psi: PsiCanonicity,
     y_canon: YCanonicity,
+    #[cfg(test)]
     advices: [Column<Advice>; 10],
+    #[cfg(test)]
     sinsemilla_config: SinsemillaConfig,
 }
 
@@ -1384,7 +1384,7 @@ impl NoteCommitChip {
     pub(crate) fn configure(
         meta: &mut ConstraintSystem,
         advices: [Column<Advice>; 10],
-        sinsemilla_config: SinsemillaConfig,
+        #[cfg_attr(not(test), allow(unused_variables))] sinsemilla_config: SinsemillaConfig,
     ) -> NoteCommitConfig {
         // Useful constants
         let two = Fp::from_u64(2);
@@ -1491,7 +1491,9 @@ impl NoteCommitChip {
             rho,
             psi,
             y_canon,
+            #[cfg(test)]
             advices,
+            #[cfg(test)]
             sinsemilla_config,
         }
     }

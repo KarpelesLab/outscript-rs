@@ -35,10 +35,6 @@
 //! [`create_proof`] proves a set of actions. The
 //! builder does all of it for a whole bundle.
 
-// The gadgets keep the interface of the reference they are ported from;
-// parts of it are only exercised by their own tests.
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 use purecrypto::zeroize::Zeroize;
@@ -395,6 +391,7 @@ struct EmbeddedKey {
 }
 
 impl EmbeddedKey {
+    #[cfg(test)]
     fn from_vk(vk: &halo2::VerifyingKey, plan: &[halo2::plonk::SelectorPlan]) -> Self {
         let mut plan = plan.to_vec();
         plan.sort_by_key(|p| p.selector);
@@ -406,6 +403,7 @@ impl EmbeddedKey {
     }
 
     /// One byte for each count; three bytes per selector; 32 per point.
+    #[cfg(test)]
     fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(self.plan.len() as u8);

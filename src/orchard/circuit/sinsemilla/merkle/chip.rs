@@ -31,13 +31,9 @@ pub(crate) struct MerkleConfig {
 
 impl MerkleConfig {
     /// Returns the cond_swap_config of this config.
+    #[cfg(test)]
     pub(crate) fn cond_swap_config(&self) -> &CondSwapConfig {
         &self.cond_swap_config
-    }
-
-    /// Returns the Sinsemilla config of this config.
-    pub(crate) fn sinsemilla_config(&self) -> &SinsemillaConfig {
-        &self.sinsemilla_config
     }
 }
 
@@ -380,18 +376,6 @@ impl MerkleChip {
         let config = self.config().cond_swap_config.clone();
         let chip = CondSwapChip::construct(config);
         chip.swap(layouter, pair, swap)
-    }
-
-    /// `SinsemillaInstructions::witness_message_piece`, delegated to the
-    /// Sinsemilla chip.
-    pub(crate) fn witness_message_piece(
-        &self,
-        layouter: &mut Layouter<'_>,
-        value: Value<Fp>,
-        num_words: usize,
-    ) -> Result<message::MessagePiece, Error> {
-        self.sinsemilla_chip()
-            .witness_message_piece(layouter, value, num_words)
     }
 
     /// `SinsemillaInstructions::hash_to_point`, delegated to the Sinsemilla

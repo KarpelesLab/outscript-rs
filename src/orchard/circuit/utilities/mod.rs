@@ -7,9 +7,15 @@
 use alloc::vec::Vec;
 use core::ops::Range;
 
-use crate::orchard::halo2::circuit::{AssignedCell, Layouter};
-use crate::orchard::halo2::plonk::{Advice, Column, Expression};
-use crate::orchard::halo2::{Error, Value};
+#[cfg(test)]
+use crate::orchard::halo2::Error;
+use crate::orchard::halo2::Value;
+use crate::orchard::halo2::circuit::AssignedCell;
+#[cfg(test)]
+use crate::orchard::halo2::circuit::Layouter;
+use crate::orchard::halo2::plonk::Expression;
+#[cfg(test)]
+use crate::orchard::halo2::plonk::{Advice, Column};
 use crate::orchard::{Fp, Fq};
 
 pub(crate) mod cond_swap;
@@ -60,6 +66,7 @@ impl FieldBits for Fq {
 
 /// Load a variable (`UtilitiesInstructions::load_private`): one region
 /// holding `value` in `column` at offset 0.
+#[cfg(test)]
 pub(crate) fn load_private(
     layouter: &mut Layouter<'_>,
     column: Column<Advice>,

@@ -25,7 +25,7 @@ use self::chip::{RunningSum, SinsemillaChip};
 use crate::orchard::circuit::ecc;
 use crate::orchard::circuit::ecc::chip::{EccChip, NonIdentityEccPoint, OrchardFixedBasesFull};
 use crate::orchard::circuit::utilities::{FieldValue, RangeConstrained};
-use crate::orchard::halo2::circuit::{AssignedCell, Layouter};
+use crate::orchard::halo2::circuit::Layouter;
 use crate::orchard::halo2::{Error, Value};
 use crate::orchard::sinsemilla::K;
 use crate::orchard::{Fp, constants, pallas};
@@ -199,18 +199,6 @@ impl HashDomain {
         self.sinsemilla_chip
             .hash_to_point(layouter, self.Q, message.inner)
     }
-
-    /// $\mathsf{SinsemillaHash}$ from
-    /// [§ 5.4.1.9](https://zips.z.cash/protocol/protocol.pdf#concretesinsemillahash).
-    pub(crate) fn hash(
-        &self,
-        layouter: &mut Layouter<'_>,
-        message: Message,
-    ) -> Result<(AssignedCell<Fp>, Vec<RunningSum>), Error> {
-        assert_eq!(self.sinsemilla_chip, message.chip);
-        let (p, zs) = self.hash_to_point(layouter, message)?;
-        Ok((SinsemillaChip::extract(&p), zs))
-    }
 }
 
 /// Gadget representing a domain in which $\mathsf{SinsemillaCommit}$ and
@@ -235,18 +223,6 @@ impl CommitDomain {
             ecc_chip,
             R: ecc::FixedPoint::from_inner(ecc_chip, domain.r()),
         }
-    }
-
-    /// Evaluates the blinding factor equal to $\[r\] R$ where `R` is the
-    /// fixed base of the `CommitDomain`.
-    pub(crate) fn blinding_factor(
-        &self,
-        layouter: &mut Layouter<'_>,
-        r: ecc::ScalarFixed,
-    ) -> Result<ecc::Point, Error> {
-        // [r] R
-        let (blind, _) = self.R.mul(layouter.namespace(), r)?;
-        Ok(blind)
     }
 
     /// $\mathsf{SinsemillaCommit}$ from

@@ -125,6 +125,7 @@ pub(crate) fn lagrange_coeffs_of_table(window_table: &[[pallas::Affine; H]]) -> 
 /// For each window, we interpolate the $x$-coordinate.
 /// Here, we pre-compute and store the coefficients of the interpolation
 /// polynomial.
+#[cfg(test)]
 pub(crate) fn compute_lagrange_coeffs(base: pallas::Affine, num_windows: usize) -> Vec<[Fp; H]> {
     lagrange_coeffs_of_table(&compute_window_table(base, num_windows))
 }

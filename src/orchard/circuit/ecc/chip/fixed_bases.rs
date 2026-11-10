@@ -45,7 +45,9 @@ pub(crate) enum OrchardBaseFieldBases {
     /// The nullifier base.
     NullifierK,
     /// The spend authorization base (same generator and tables as
-    /// [`OrchardFixedBasesFull::SpendAuthG`]).
+    /// [`OrchardFixedBasesFull::SpendAuthG`]): the Action circuit does not
+    /// multiply it by a base field element; kept to test the gadget.
+    #[cfg(test)]
     SpendAuthGBase,
 }
 
@@ -54,7 +56,9 @@ pub(crate) enum OrchardBaseFieldBases {
 pub(crate) enum OrchardShortScalarBases {
     /// The value base of the value commitment.
     ValueCommitV,
-    /// The spend authorization base, on 22 windows.
+    /// The spend authorization base, on 22 windows: the Action circuit
+    /// does not multiply it by a short scalar; kept to test the gadget.
+    #[cfg(test)]
     SpendAuthGShort,
 }
 
@@ -102,6 +106,7 @@ impl FixedPoint for OrchardBaseFieldBases {
     fn generator(&self) -> pallas::Affine {
         match self {
             Self::NullifierK => NULLIFIER_K,
+            #[cfg(test)]
             Self::SpendAuthGBase => SPEND_AUTH_G,
         }
     }
@@ -109,6 +114,7 @@ impl FixedPoint for OrchardBaseFieldBases {
     fn z(&self) -> &'static [u64] {
         match self {
             Self::NullifierK => &NULLIFIER_K_Z,
+            #[cfg(test)]
             Self::SpendAuthGBase => &SPEND_AUTH_G_Z,
         }
     }
@@ -118,6 +124,7 @@ impl FixedPoint for OrchardShortScalarBases {
     fn generator(&self) -> pallas::Affine {
         match self {
             Self::ValueCommitV => VALUE_COMMIT_V,
+            #[cfg(test)]
             Self::SpendAuthGShort => SPEND_AUTH_G,
         }
     }
@@ -125,6 +132,7 @@ impl FixedPoint for OrchardShortScalarBases {
     fn z(&self) -> &'static [u64] {
         match self {
             Self::ValueCommitV => &VALUE_COMMIT_V_Z_SHORT,
+            #[cfg(test)]
             Self::SpendAuthGShort => &SPEND_AUTH_G_Z_SHORT,
         }
     }
@@ -179,6 +187,7 @@ const SPEND_AUTH_G_Z: [u64; NUM_WINDOWS] = [
 ];
 
 /// Short signed z-values of `SPEND_AUTH_G`.
+#[cfg(test)]
 #[rustfmt::skip]
 const SPEND_AUTH_G_Z_SHORT: [u64; NUM_WINDOWS_SHORT] = [
     49707, 15701, 45931, 163127, 41654, 212130, 34473, 25205, 4118, 10240, 12264, 22866, 203610,

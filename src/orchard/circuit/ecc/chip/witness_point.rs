@@ -109,6 +109,7 @@ impl Config {
         Ok((x_var, y_var))
     }
 
+    #[cfg(test)]
     fn assign_xy_from_constant(
         &self,
         value: (Fp, Fp),
@@ -141,6 +142,7 @@ impl Config {
     }
 
     /// Assigns a constant point that can be the identity.
+    #[cfg(test)]
     pub(super) fn constant_point(
         &self,
         value: pallas::Affine,
@@ -176,6 +178,7 @@ impl Config {
     }
 
     /// Assigns a constant nonidentity point.
+    #[cfg(test)]
     pub(super) fn constant_point_non_id(
         &self,
         value: pallas::Affine,

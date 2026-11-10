@@ -4,8 +4,6 @@
 //! Action circuit, and its `AddInstruction` trait is replaced by the
 //! inherent `add` of [`AddChip`].
 
-#![allow(dead_code)]
-
 use super::add_chip::AddChip;
 use super::ecc::chip::{EccChip, NullifierK, OrchardFixedBasesFull, ValueCommitV};
 use super::ecc::{

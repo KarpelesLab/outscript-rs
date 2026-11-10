@@ -84,6 +84,7 @@ impl<const WINDOW_NUM_BITS: usize> RunningSumConfig<WINDOW_NUM_BITS> {
     ///
     /// `strict` = true constrains the final running sum to be zero, i.e.
     /// constrains alpha to be within WINDOW_NUM_BITS * num_windows bits.
+    #[cfg(test)]
     pub(crate) fn witness_decompose(
         &self,
         region: &mut Region<'_, '_>,
