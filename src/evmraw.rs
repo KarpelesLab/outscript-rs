@@ -2,8 +2,8 @@
 //! streams its RLP encoding straight into keccak-256 or a caller buffer.
 //!
 //! Supports legacy (with or without EIP-155 replay protection), EIP-2930 and
-//! EIP-1559 transactions with an empty access list — the same subset as
-//! `EvmTx`.
+//! EIP-1559 transactions with an empty access list (`EvmTx`, which needs
+//! `alloc`, also carries access lists).
 
 pub use crate::Error;
 
@@ -183,14 +183,25 @@ impl RawEvmTx<'_> {
 
     /// Signs the transaction, returning the signature with `v` in the form the
     /// transaction type requires.
+    ///
+    /// Fails with [`Error::Overflow`] for a legacy transaction whose chain id
+    /// is so large that the EIP-155 `v` (`chain_id * 2 + 35 + recid`) does not
+    /// fit a `u64`.
     pub fn sign(&self, key: &SecpPrivateKey) -> Result<EvmSignature, Error> {
-        let (r, s, recid) = key.sign_recoverable(&self.signing_hash()?);
-        let recid = recid as u64;
-        let v = match self.tx_type {
-            EvmTxType::Legacy if self.chain_id == 0 => 27 + recid,
-            EvmTxType::Legacy => self.chain_id * 2 + 35 + recid,
-            _ => recid,
+        // the base of v, before the recovery id (0 or 1) is added
+        let base = match self.tx_type {
+            EvmTxType::Legacy if self.chain_id == 0 => 27,
+            EvmTxType::Legacy => {
+                self.chain_id
+                    .checked_mul(2)
+                    .and_then(|v| v.checked_add(36))
+                    .ok_or(Error::Overflow)?
+                    - 1
+            }
+            _ => 0,
         };
+        let (r, s, recid) = key.sign_recoverable(&self.signing_hash()?);
+        let v = base + recid as u64;
         Ok(EvmSignature { v, r, s })
     }
 
@@ -343,5 +354,44 @@ mod tests {
             data: &[],
         };
         assert_eq!(blob.signing_hash(), Err(Error::UnsupportedTxType));
+    }
+
+    /// A legacy `v` that does not fit a `u64` is an error, not a wrapped
+    /// value naming another chain.
+    #[test]
+    fn sign_rejects_chain_id_overflowing_v() {
+        let key = SecpPrivateKey::from_bytes(&h(
+            "eb696a065ef48a2192da5b28b694f87544b30fae8327c4510137a922f32c6dcf",
+        ))
+        .unwrap();
+        let tx = |tx_type, chain_id| RawEvmTx {
+            tx_type,
+            chain_id,
+            nonce: 0,
+            max_priority_fee_per_gas: 0,
+            max_fee_per_gas: 1,
+            gas: 21000,
+            to: None,
+            value: [0; 32],
+            data: &[],
+        };
+        let max_ok = (u64::MAX - 36) / 2;
+        for chain_id in [u64::MAX, u64::MAX / 2, max_ok + 1] {
+            assert_eq!(
+                tx(EvmTxType::Legacy, chain_id).sign(&key),
+                Err(Error::Overflow)
+            );
+            // typed transactions carry the chain id itself
+            let typed = tx(EvmTxType::Eip1559, chain_id);
+            let sig = typed.sign(&key).unwrap();
+            assert!(sig.v <= 1);
+        }
+        let legacy = tx(EvmTxType::Legacy, max_ok);
+        let sig = legacy.sign(&key).unwrap();
+        assert_eq!((sig.v - 35) / 2, max_ok);
+        assert_eq!(
+            legacy.recover_sender(&sig),
+            Ok(h("2aeb8add8337360e088b7d9ce4e857b9be60f3a7"))
+        );
     }
 }

@@ -45,6 +45,10 @@ pub struct EvmTx {
     pub r: BigInt,
     /// Signature s.
     pub s: BigInt,
+    /// The access list of an EIP-2930 or EIP-1559 transaction, as its RLP
+    /// entries: each a list of a 20-byte address and a list of 32-byte
+    /// storage keys. Empty for none; must be empty for a legacy transaction.
+    pub access_list: Vec<RlpItem>,
 }
 
 impl Default for EvmTx {
@@ -63,18 +67,99 @@ impl Default for EvmTx {
             y: BigInt::from(0),
             r: BigInt::from(0),
             s: BigInt::from(0),
+            access_list: Vec::new(),
         }
     }
 }
 
+/// The `to` field: empty for `"0x"` (contract creation), otherwise exactly 20
+/// bytes from 40 hex digits. Anything else is an error: a truncated address
+/// must never be padded into a different one.
 fn to_item(to: &str) -> Result<RlpItem, Error> {
-    RlpItem::hex_str(to).map_err(Error::from)
+    let body = to.strip_prefix("0x").ok_or(Error::InvalidAddress)?;
+    if body.is_empty() {
+        return Ok(RlpItem::Bytes(Vec::new()));
+    }
+    let mut addr = [0u8; 20];
+    hex::decode_to_slice(body, &mut addr).map_err(|_| Error::InvalidAddress)?;
+    Ok(RlpItem::Bytes(addr.to_vec()))
+}
+
+/// Checks that every access-list entry is `[address, [storage key, ...]]`
+/// with a 20-byte address and 32-byte keys.
+fn check_access_list(entries: &[RlpItem]) -> Result<(), Error> {
+    for entry in entries {
+        let Some([RlpItem::Bytes(address), RlpItem::List(keys)]) = entry.as_list() else {
+            return Err(Error::InvalidData);
+        };
+        if address.len() != 20 {
+            return Err(Error::InvalidData);
+        }
+        for key in keys {
+            match key {
+                RlpItem::Bytes(k) if k.len() == 32 => {}
+                _ => return Err(Error::InvalidData),
+            }
+        }
+    }
+    Ok(())
+}
+
+// --- parsed fields ---
+
+/// A byte-string field; a list is malformed.
+fn field_bytes(item: &RlpItem) -> Result<&[u8], Error> {
+    item.as_bytes().ok_or(Error::InvalidData)
+}
+
+/// An integer field: a byte string without a leading zero byte.
+fn field_int(item: &RlpItem) -> Result<&[u8], Error> {
+    let b = field_bytes(item)?;
+    if b.first() == Some(&0) {
+        return Err(Error::NonCanonical);
+    }
+    Ok(b)
+}
+
+fn field_u64(item: &RlpItem) -> Result<u64, Error> {
+    rlp::decode_uint64_checked(field_int(item)?).map_err(Error::from)
+}
+
+/// An integer field of at most 256 bits.
+fn field_u256(item: &RlpItem) -> Result<BigInt, Error> {
+    let b = field_int(item)?;
+    if b.len() > 32 {
+        return Err(Error::TooLarge);
+    }
+    Ok(BigInt::from_bytes_be(Sign::Plus, b))
+}
+
+/// The `to` field: empty (contract creation) or a 20-byte address.
+fn field_to(item: &RlpItem) -> Result<String, Error> {
+    let b = field_bytes(item)?;
+    if !b.is_empty() && b.len() != 20 {
+        return Err(Error::InvalidAddress);
+    }
+    Ok(format!("0x{}", hex::encode(b)))
+}
+
+/// A signature's `r` or `s`: an integer of at most 32 bytes.
+fn field_sig(item: &RlpItem) -> Result<BigInt, Error> {
+    let b = field_int(item)?;
+    if b.len() > 32 {
+        return Err(Error::InvalidSignature);
+    }
+    Ok(BigInt::from_bytes_be(Sign::Plus, b))
 }
 
 impl EvmTx {
     /// Returns the RLP fields for the transaction (excluding signature fields).
     pub fn rlp_fields(&self) -> Result<Vec<RlpItem>, Error> {
         let bi = |v: &BigInt| RlpItem::bigint(v).map_err(Error::from);
+        if self.tx_type == EvmTxType::Legacy && !self.access_list.is_empty() {
+            return Err(Error::InvalidData);
+        }
+        check_access_list(&self.access_list)?;
         Ok(match self.tx_type {
             EvmTxType::Legacy => vec![
                 RlpItem::uint(self.nonce),
@@ -92,7 +177,7 @@ impl EvmTx {
                 to_item(&self.to)?,
                 bi(&self.value)?,
                 RlpItem::Bytes(self.data.clone()),
-                RlpItem::List(vec![]),
+                RlpItem::List(self.access_list.clone()),
             ],
             EvmTxType::Eip1559 => vec![
                 RlpItem::uint(self.chain_id),
@@ -103,7 +188,7 @@ impl EvmTx {
                 to_item(&self.to)?,
                 bi(&self.value)?,
                 RlpItem::Bytes(self.data.clone()),
-                RlpItem::List(vec![]),
+                RlpItem::List(self.access_list.clone()),
             ],
             EvmTxType::Eip4844 => return Err(Error::UnsupportedTxType),
         })
@@ -151,99 +236,73 @@ impl EvmTx {
     }
 
     /// Parses a transaction from its binary encoding.
+    ///
+    /// The encoding must be well formed, so that the parsed transaction
+    /// serializes back to the same bytes: integer fields have no leading zero
+    /// byte, `to` is empty or 20 bytes, `r` and `s` are at most 32 bytes, and
+    /// the access list of a typed transaction (kept in
+    /// [`access_list`](Self::access_list)) is a list of
+    /// `[address, [storage key, ...]]` entries.
     pub fn parse_transaction(buf: &[u8]) -> Result<EvmTx, Error> {
-        if buf.is_empty() {
-            return Err(Error::UnexpectedEof);
+        let (tx_type, payload) = match buf.first() {
+            None => return Err(Error::UnexpectedEof),
+            Some(&b) if b >= 0x80 => (EvmTxType::Legacy, buf),
+            Some(1) => (EvmTxType::Eip2930, &buf[1..]),
+            Some(2) => (EvmTxType::Eip1559, &buf[1..]),
+            Some(_) => return Err(Error::UnsupportedTxType),
+        };
+        let dec = rlp::decode(payload).map_err(Error::from)?;
+        let [RlpItem::List(list)] = dec.as_slice() else {
+            return Err(Error::InvalidData);
+        };
+        let unsigned_len = match tx_type {
+            EvmTxType::Legacy => 6,
+            EvmTxType::Eip2930 => 8,
+            _ => 9,
+        };
+        let signed = match list.len() {
+            n if n == unsigned_len => false,
+            n if n == unsigned_len + 3 => true,
+            _ => return Err(Error::InvalidFieldCount),
+        };
+        let mut fields = list.iter();
+        let mut next = || fields.next().ok_or(Error::InvalidFieldCount);
+        let mut tx = EvmTx {
+            tx_type,
+            signed,
+            ..Default::default()
+        };
+        if tx_type != EvmTxType::Legacy {
+            tx.chain_id = field_u64(next()?)?;
         }
-        let mut tx = EvmTx::default();
-        if buf[0] >= 0x80 {
-            // legacy
-            let dec = rlp::decode(buf).map_err(Error::from)?;
-            if dec.len() != 1 {
-                return Err(Error::InvalidData);
-            }
-            let list = dec[0].as_list().ok_or(Error::InvalidData)?;
-            let ln = list.len();
-            if ln != 6 && ln != 9 {
-                return Err(Error::InvalidFieldCount);
-            }
-            let b = |i: usize| -> &[u8] { list[i].as_bytes().unwrap_or(&[]) };
-            tx.tx_type = EvmTxType::Legacy;
-            tx.nonce = rlp::decode_uint64_checked(b(0)).map_err(Error::from)?;
-            tx.gas_fee_cap = BigInt::from_bytes_be(Sign::Plus, b(1));
-            tx.gas = rlp::decode_uint64_checked(b(2)).map_err(Error::from)?;
-            tx.to = format!("0x{}", hex::encode(b(3)));
-            tx.value = BigInt::from_bytes_be(Sign::Plus, b(4));
-            tx.data = b(5).to_vec();
-            if ln == 9 {
-                tx.signed = true;
-                tx.y = BigInt::from_bytes_be(Sign::Plus, b(6));
-                tx.r = BigInt::from_bytes_be(Sign::Plus, b(7));
-                tx.s = BigInt::from_bytes_be(Sign::Plus, b(8));
-                // Derive chain id from v (EIP-155) so SignBytes reconstructs
-                // the same preimage during sender recovery.
-                if let Some(v) = tx.y.to_u64()
-                    && v >= 35
-                {
-                    let bit = 1 - (v & 1);
-                    tx.chain_id = (v - 35 - bit) / 2;
-                }
-            }
-            return Ok(tx);
+        tx.nonce = field_u64(next()?)?;
+        if tx_type == EvmTxType::Eip1559 {
+            tx.gas_tip_cap = field_u256(next()?)?;
         }
-        let payload = &buf[1..];
-        match buf[0] {
-            1 | 2 => {
-                let dec = rlp::decode(payload).map_err(Error::from)?;
-                if dec.len() != 1 {
-                    return Err(Error::InvalidData);
-                }
-                let list = dec[0].as_list().ok_or(Error::InvalidData)?;
-                let b = |i: usize| -> &[u8] { list[i].as_bytes().unwrap_or(&[]) };
-                if buf[0] == 1 {
-                    let ln = list.len();
-                    if ln != 8 && ln != 11 {
-                        return Err(Error::InvalidFieldCount);
-                    }
-                    tx.tx_type = EvmTxType::Eip2930;
-                    tx.chain_id = rlp::decode_uint64_checked(b(0)).map_err(Error::from)?;
-                    tx.nonce = rlp::decode_uint64_checked(b(1)).map_err(Error::from)?;
-                    tx.gas_fee_cap = BigInt::from_bytes_be(Sign::Plus, b(2));
-                    tx.gas = rlp::decode_uint64_checked(b(3)).map_err(Error::from)?;
-                    tx.to = format!("0x{}", hex::encode(b(4)));
-                    tx.value = BigInt::from_bytes_be(Sign::Plus, b(5));
-                    tx.data = b(6).to_vec();
-                    if ln == 11 {
-                        tx.signed = true;
-                        tx.y = BigInt::from_bytes_be(Sign::Plus, b(8));
-                        tx.r = BigInt::from_bytes_be(Sign::Plus, b(9));
-                        tx.s = BigInt::from_bytes_be(Sign::Plus, b(10));
-                    }
-                } else {
-                    let ln = list.len();
-                    if ln != 9 && ln != 12 {
-                        return Err(Error::InvalidFieldCount);
-                    }
-                    tx.tx_type = EvmTxType::Eip1559;
-                    tx.chain_id = rlp::decode_uint64_checked(b(0)).map_err(Error::from)?;
-                    tx.nonce = rlp::decode_uint64_checked(b(1)).map_err(Error::from)?;
-                    tx.gas_tip_cap = BigInt::from_bytes_be(Sign::Plus, b(2));
-                    tx.gas_fee_cap = BigInt::from_bytes_be(Sign::Plus, b(3));
-                    tx.gas = rlp::decode_uint64_checked(b(4)).map_err(Error::from)?;
-                    tx.to = format!("0x{}", hex::encode(b(5)));
-                    tx.value = BigInt::from_bytes_be(Sign::Plus, b(6));
-                    tx.data = b(7).to_vec();
-                    if ln == 12 {
-                        tx.signed = true;
-                        tx.y = BigInt::from_bytes_be(Sign::Plus, b(9));
-                        tx.r = BigInt::from_bytes_be(Sign::Plus, b(10));
-                        tx.s = BigInt::from_bytes_be(Sign::Plus, b(11));
-                    }
-                }
-                Ok(tx)
-            }
-            _ => Err(Error::UnsupportedTxType),
+        tx.gas_fee_cap = field_u256(next()?)?;
+        tx.gas = field_u64(next()?)?;
+        tx.to = field_to(next()?)?;
+        tx.value = field_u256(next()?)?;
+        tx.data = field_bytes(next()?)?.to_vec();
+        if tx_type != EvmTxType::Legacy {
+            let access_list = next()?.as_list().ok_or(Error::InvalidData)?;
+            check_access_list(access_list)?;
+            tx.access_list = access_list.to_vec();
         }
+        if signed {
+            tx.y = BigInt::from_bytes_be(Sign::Plus, field_int(next()?)?);
+            tx.r = field_sig(next()?)?;
+            tx.s = field_sig(next()?)?;
+            // Derive chain id from v (EIP-155) so SignBytes reconstructs
+            // the same preimage during sender recovery.
+            if tx_type == EvmTxType::Legacy
+                && let Some(v) = tx.y.to_u64()
+                && v >= 35
+            {
+                tx.chain_id = (v - 35) / 2;
+            }
+        }
+        Ok(tx)
     }
 
     /// Parses from bytes (alias for `parse_transaction`).
@@ -252,7 +311,9 @@ impl EvmTx {
     }
 
     /// Returns `(r, s, recovery_id)` for the signed transaction, normalizing the
-    /// legacy EIP-155 `v` and setting `chain_id`.
+    /// legacy `v` and checking it against `chain_id`: an EIP-155 `v` must be
+    /// for this chain id, and a pre-EIP-155 `v` (27/28) needs chain id 0.
+    /// Otherwise the signed bytes would be those of another transaction.
     fn signature_parts(&self) -> Result<([u8; 32], [u8; 32], u8), Error> {
         if !self.signed {
             return Err(Error::NotSigned);
@@ -262,14 +323,17 @@ impl EvmTx {
         let mut v = self.y.to_u64().ok_or(Error::InvalidV)?;
         if self.tx_type == EvmTxType::Legacy {
             if v >= 35 {
-                // EIP-155: v = chainId*2 + 35 + recid; recid = 1 - (v & 1).
-                v = 1 - (v & 1);
+                // EIP-155: v = chainId*2 + 35 + recid.
+                if (v - 35) / 2 != self.chain_id {
+                    return Err(Error::InvalidV);
+                }
+                v = (v - 35) % 2;
             } else {
                 // Pre-EIP-155 legacy: v is the standard 27/28 (map to recovery
                 // 0/1), or already a raw 0/1 recovery id. Anything else is invalid
                 // and would otherwise be rejected below or panic in recovery.
                 v = match v {
-                    27 | 28 => v - 27,
+                    27 | 28 if self.chain_id == 0 => v - 27,
                     0 | 1 => v,
                     _ => return Err(Error::InvalidV),
                 };
@@ -297,7 +361,21 @@ impl EvmTx {
     }
 
     /// Signs the transaction with the given key.
+    ///
+    /// Fails with [`Error::Overflow`] for a legacy transaction whose chain id
+    /// is so large that the EIP-155 `v` (`chain_id * 2 + 35 + recid`) does not
+    /// fit a `u64`.
     pub fn sign(&mut self, key: &SecpPrivateKey) -> Result<(), Error> {
+        let eip155_base = if self.tx_type == EvmTxType::Legacy && self.chain_id != 0 {
+            let max_v = self
+                .chain_id
+                .checked_mul(2)
+                .and_then(|v| v.checked_add(36))
+                .ok_or(Error::Overflow)?;
+            Some(max_v - 1)
+        } else {
+            None
+        };
         let buf = self.sign_bytes()?;
         let digest = keccak256_once(&buf);
         let (r, s, recid) = key.sign_recoverable(&digest);
@@ -305,14 +383,10 @@ impl EvmTx {
         self.r = BigInt::from_bytes_be(Sign::Plus, &r);
         self.s = BigInt::from_bytes_be(Sign::Plus, &s);
         let v = recid as u64;
-        self.y = if self.tx_type == EvmTxType::Legacy {
-            if self.chain_id == 0 {
-                BigInt::from(27 + v)
-            } else {
-                BigInt::from(self.chain_id * 2 + 35 + v)
-            }
-        } else {
-            BigInt::from(v)
+        self.y = match (self.tx_type, eip155_base) {
+            (EvmTxType::Legacy, Some(base)) => BigInt::from(base + v),
+            (EvmTxType::Legacy, None) => BigInt::from(27 + v),
+            _ => BigInt::from(v),
         };
         Ok(())
     }
@@ -529,6 +603,389 @@ mod tests {
         let encoded = crate::rlp::RlpItem::List(fields).encode();
         assert!(EvmTx::parse_transaction(&encoded).is_err());
     }
+
+    const TO: &str = "0x2aeb8add8337360e088b7d9ce4e857b9be60f3a7";
+    const SENDER: &str = "0x2AeB8ADD8337360E088B7D9ce4e857b9BE60f3a7";
+
+    fn bytes(b: &[u8]) -> RlpItem {
+        RlpItem::Bytes(b.to_vec())
+    }
+
+    /// The unsigned fields of a well-formed legacy transaction.
+    fn legacy_fields() -> Vec<RlpItem> {
+        vec![
+            bytes(&[0x01]),       // nonce
+            bytes(&[0x02]),       // gas price
+            bytes(&[0x52, 0x08]), // gas
+            bytes(&[0x11; 20]),   // to
+            bytes(&[0x03]),       // value
+            bytes(&[]),           // data
+        ]
+    }
+
+    fn parse_list(prefix: &[u8], fields: Vec<RlpItem>) -> Result<EvmTx, Error> {
+        let mut buf = prefix.to_vec();
+        buf.extend_from_slice(&RlpItem::List(fields).encode());
+        EvmTx::parse_transaction(&buf)
+    }
+
+    /// Deeply nested lists must fail cleanly instead of overflowing the stack.
+    #[test]
+    fn parse_rejects_deep_nesting() {
+        // 20,000 nested lists: each wraps the previous one's encoding
+        let mut nested = vec![0xc0u8];
+        for _ in 0..20_000 {
+            let len = nested.len();
+            let mut outer = if len <= 55 {
+                vec![0xc0 + len as u8]
+            } else {
+                let be = (len as u64).to_be_bytes();
+                let be = &be[be.iter().position(|&b| b != 0).unwrap()..];
+                let mut h = vec![0xf7 + be.len() as u8];
+                h.extend_from_slice(be);
+                h
+            };
+            outer.extend_from_slice(&nested);
+            nested = outer;
+        }
+        for prefix in [&[][..], &[0x01], &[0x02]] {
+            let mut buf = prefix.to_vec();
+            buf.extend_from_slice(&nested);
+            assert_eq!(
+                EvmTx::parse_transaction(&buf).map(drop),
+                Err(Error::Rlp(rlp::Error::TooDeep))
+            );
+        }
+    }
+
+    /// A typed transaction with an access list, built field by field here
+    /// (not through `rlp_fields`), must survive parse -> to_bytes unchanged.
+    #[test]
+    fn access_list_roundtrip() {
+        let access_list = RlpItem::List(vec![
+            RlpItem::List(vec![
+                bytes(&[0xaa; 20]),
+                RlpItem::List(vec![bytes(&[0x01; 32]), bytes(&[0x02; 32])]),
+            ]),
+            RlpItem::List(vec![bytes(&[0xbb; 20]), RlpItem::List(vec![])]),
+        ]);
+        for tx_type in [1u8, 2] {
+            let mut fields = vec![
+                RlpItem::uint(1),  // chain id
+                RlpItem::uint(42), // nonce
+            ];
+            if tx_type == 2 {
+                fields.push(RlpItem::uint(1_000_000_000)); // tip
+            }
+            fields.extend([
+                RlpItem::uint(30_000_000_000),
+                RlpItem::uint(60_000),
+                bytes(&hex::decode(&TO[2..]).unwrap()),
+                RlpItem::uint(1_000_000),
+                bytes(&[1, 2, 3]),
+                access_list.clone(),
+            ]);
+            let mut unsigned = vec![tx_type];
+            unsigned.extend_from_slice(&rlp::encode_list(&fields));
+            let (r, s, recid) = key().sign_recoverable(&keccak256_once(&unsigned));
+            fields.push(RlpItem::uint(recid as u64));
+            fields.push(RlpItem::bigint(&BigInt::from_bytes_be(Sign::Plus, &r)).unwrap());
+            fields.push(RlpItem::bigint(&BigInt::from_bytes_be(Sign::Plus, &s)).unwrap());
+            let mut signed = vec![tx_type];
+            signed.extend_from_slice(&rlp::encode_list(&fields));
+
+            let tx = EvmTx::parse_transaction(&signed).unwrap();
+            assert_eq!(tx.access_list.len(), 2);
+            assert_eq!(tx.to_bytes().unwrap(), signed);
+            assert_eq!(tx.hash().unwrap(), keccak256_once(&signed));
+            assert_eq!(tx.sign_bytes().unwrap(), unsigned);
+            assert_eq!(tx.sender_address().unwrap(), SENDER);
+
+            // the unsigned form round-trips too
+            let tx = EvmTx::parse_transaction(&unsigned).unwrap();
+            assert!(!tx.signed);
+            assert_eq!(tx.to_bytes().unwrap(), unsigned);
+
+            // and so does the JSON form, type and access list included
+            let tx = EvmTx::parse_transaction(&signed).unwrap();
+            let j = serde_json::to_string(&tx).unwrap();
+            assert!(j.contains("\"accessList\""), "{j}");
+            let back: EvmTx = serde_json::from_str(&j).unwrap();
+            assert_eq!(back.tx_type, tx.tx_type);
+            assert_eq!(back.to_bytes().unwrap(), signed);
+        }
+    }
+
+    #[test]
+    fn access_list_shape_is_checked() {
+        let base = |access_list: RlpItem| {
+            let mut f = vec![RlpItem::uint(1)];
+            f.extend(legacy_fields());
+            f.push(access_list);
+            parse_list(&[0x01], f).map(drop)
+        };
+        assert_eq!(base(RlpItem::List(vec![])), Ok(()));
+        // not a list
+        assert_eq!(base(bytes(&[])), Err(Error::InvalidData));
+        // an entry that is not [address, keys]
+        assert_eq!(
+            base(RlpItem::List(vec![bytes(&[0xaa; 20])])),
+            Err(Error::InvalidData)
+        );
+        let entry = |addr: &[u8], key: &[u8]| {
+            RlpItem::List(vec![RlpItem::List(vec![
+                bytes(addr),
+                RlpItem::List(vec![bytes(key)]),
+            ])])
+        };
+        assert_eq!(base(entry(&[0xaa; 20], &[1; 32])), Ok(()));
+        assert_eq!(base(entry(&[0xaa; 19], &[1; 32])), Err(Error::InvalidData));
+        assert_eq!(base(entry(&[0xaa; 20], &[1; 31])), Err(Error::InvalidData));
+
+        // when building: a malformed list, or any list on a legacy transaction
+        let mut tx = EvmTx {
+            tx_type: EvmTxType::Eip1559,
+            to: TO.into(),
+            access_list: vec![bytes(&[1])],
+            ..Default::default()
+        };
+        assert_eq!(tx.sign_bytes(), Err(Error::InvalidData));
+        assert_eq!(tx.sign(&key()), Err(Error::InvalidData));
+        tx.access_list = vec![RlpItem::List(vec![
+            bytes(&[0xaa; 20]),
+            RlpItem::List(vec![]),
+        ])];
+        tx.sign(&key()).unwrap();
+        assert_eq!(tx.sender_address().unwrap(), SENDER);
+        tx.tx_type = EvmTxType::Legacy;
+        assert_eq!(tx.sign_bytes(), Err(Error::InvalidData));
+    }
+
+    #[test]
+    fn parse_rejects_malformed_fields() {
+        assert!(parse_list(&[], legacy_fields()).is_ok());
+        let with = |i: usize, item: RlpItem| {
+            let mut f = legacy_fields();
+            f[i] = item;
+            parse_list(&[], f).map(drop)
+        };
+        // a list where a scalar is expected
+        for i in 0..6 {
+            assert_eq!(with(i, RlpItem::List(vec![])), Err(Error::InvalidData));
+        }
+        // integers with a leading zero byte
+        for i in [0, 1, 2, 4] {
+            assert_eq!(with(i, bytes(&[0x00, 0x01])), Err(Error::NonCanonical));
+            assert_eq!(with(i, bytes(&[0x00])), Err(Error::NonCanonical));
+        }
+        // integers wider than 256 bits
+        assert_eq!(with(1, bytes(&[1; 33])), Err(Error::TooLarge));
+        assert_eq!(with(4, bytes(&[1; 33])), Err(Error::TooLarge));
+        // `to` is empty or 20 bytes
+        assert_eq!(with(3, bytes(&[])), Ok(()));
+        assert_eq!(with(3, bytes(&[0x11; 19])), Err(Error::InvalidAddress));
+        assert_eq!(with(3, bytes(&[0x11; 21])), Err(Error::InvalidAddress));
+
+        // signature fields
+        let signed = |v: RlpItem, r: RlpItem, s: RlpItem| {
+            let mut f = legacy_fields();
+            f.extend([v, r, s]);
+            parse_list(&[], f).map(drop)
+        };
+        let ok = || bytes(&[0x22; 32]);
+        assert_eq!(signed(bytes(&[27]), ok(), ok()), Ok(()));
+        assert_eq!(
+            signed(bytes(&[27]), bytes(&[0x22; 33]), ok()),
+            Err(Error::InvalidSignature)
+        );
+        assert_eq!(
+            signed(bytes(&[27]), ok(), bytes(&[0x22; 33])),
+            Err(Error::InvalidSignature)
+        );
+        let mut zero_led = [0x22u8; 32];
+        zero_led[0] = 0;
+        assert_eq!(
+            signed(bytes(&[27]), bytes(&zero_led), ok()),
+            Err(Error::NonCanonical)
+        );
+        assert_eq!(
+            signed(bytes(&[0, 27]), ok(), ok()),
+            Err(Error::NonCanonical)
+        );
+        assert_eq!(
+            signed(RlpItem::List(vec![]), ok(), ok()),
+            Err(Error::InvalidData)
+        );
+        // wrong field counts, and trailing data
+        let mut f = legacy_fields();
+        f.push(bytes(&[27]));
+        assert_eq!(parse_list(&[], f).map(drop), Err(Error::InvalidFieldCount));
+        let mut buf = RlpItem::List(legacy_fields()).encode();
+        buf.push(0x80);
+        assert_eq!(
+            EvmTx::parse_transaction(&buf).map(drop),
+            Err(Error::InvalidData)
+        );
+    }
+
+    /// A recipient that is not exactly 20 bytes must never be padded into
+    /// another address and signed.
+    #[test]
+    fn to_must_be_a_full_address() {
+        let tx = |to: &str| EvmTx {
+            chain_id: 1,
+            gas: 21000,
+            to: to.into(),
+            ..Default::default()
+        };
+        for bad in [
+            "0x2aeb8add8337360e088b7d9ce4e857b9be60f3a", // 39 digits
+            "0x2aeb8add8337360e088b7d9ce4e857b9be60f3",  // 19 bytes
+            "0x2aeb8add8337360e088b7d9ce4e857b9be60f3a700", // 21 bytes
+            "0x2aeb8add8337360e088b7d9ce4e857b9be60f3ag", // not hex
+            "2aeb8add8337360e088b7d9ce4e857b9be60f3a7",  // no prefix
+            "0x0",
+            "",
+        ] {
+            let mut t = tx(bad);
+            assert_eq!(t.sign_bytes(), Err(Error::InvalidAddress), "{bad:?}");
+            assert_eq!(t.sign(&key()), Err(Error::InvalidAddress), "{bad:?}");
+            assert!(!t.signed);
+            assert_eq!(t.to_bytes(), Err(Error::InvalidAddress), "{bad:?}");
+            if !bad.is_empty() {
+                let j = format!("{{\"to\":\"{bad}\"}}");
+                assert!(serde_json::from_str::<EvmTx>(&j).is_err(), "{bad:?}");
+            }
+        }
+        // a full address and contract creation are accepted
+        let mut t = tx(TO);
+        t.sign(&key()).unwrap();
+        let parsed = EvmTx::parse_transaction(&t.to_bytes().unwrap()).unwrap();
+        assert_eq!(parsed.to, TO);
+        let mut t = tx("0x");
+        t.sign(&key()).unwrap();
+        let parsed = EvmTx::parse_transaction(&t.to_bytes().unwrap()).unwrap();
+        assert_eq!(parsed.to, "0x");
+        assert!(serde_json::from_str::<EvmTx>(&format!("{{\"to\":\"{TO}\"}}")).is_ok());
+    }
+
+    #[test]
+    fn sign_rejects_chain_id_overflowing_v() {
+        for chain_id in [u64::MAX, u64::MAX / 2, (u64::MAX - 36) / 2 + 1] {
+            let mut tx = EvmTx {
+                chain_id,
+                to: TO.into(),
+                ..Default::default()
+            };
+            assert_eq!(tx.sign(&key()), Err(Error::Overflow), "{chain_id}");
+            assert!(!tx.signed);
+            // a typed transaction carries the chain id itself
+            tx.tx_type = EvmTxType::Eip1559;
+            tx.sign(&key()).unwrap();
+            assert_eq!(tx.sender_address().unwrap(), SENDER);
+        }
+        // the largest chain id whose v fits
+        let mut tx = EvmTx {
+            chain_id: (u64::MAX - 36) / 2,
+            to: TO.into(),
+            ..Default::default()
+        };
+        tx.sign(&key()).unwrap();
+        assert_eq!(tx.sender_address().unwrap(), SENDER);
+        let parsed = EvmTx::parse_transaction(&tx.to_bytes().unwrap()).unwrap();
+        assert_eq!(parsed.chain_id, tx.chain_id);
+        assert_eq!(parsed.sender_address().unwrap(), SENDER);
+    }
+
+    /// JSON with a signature is a signed transaction, of the type it names.
+    #[test]
+    fn json_keeps_signature_and_type() {
+        for (tx_type, chain_id) in [
+            (EvmTxType::Legacy, 0),
+            (EvmTxType::Legacy, 1),
+            (EvmTxType::Eip2930, 5),
+            (EvmTxType::Eip1559, 1),
+        ] {
+            let mut tx = EvmTx {
+                tx_type,
+                chain_id,
+                nonce: 7,
+                gas_tip_cap: BigInt::from(1_000_000_000u64),
+                gas_fee_cap: BigInt::from(20_000_000_000u64),
+                gas: 21000,
+                to: TO.into(),
+                value: BigInt::from(10u64).pow(18),
+                data: vec![1, 2, 3],
+                ..Default::default()
+            };
+            // unsigned stays unsigned
+            let j = serde_json::to_string(&tx).unwrap();
+            let back: EvmTx = serde_json::from_str(&j).unwrap();
+            assert!(!back.signed);
+            assert_eq!(back.to_bytes().unwrap(), tx.to_bytes().unwrap());
+
+            tx.sign(&key()).unwrap();
+            let j = serde_json::to_string(&tx).unwrap();
+            let back: EvmTx = serde_json::from_str(&j).unwrap();
+            assert!(back.signed, "{tx_type:?}");
+            assert_eq!(back.tx_type, tx_type);
+            assert_eq!(back.to_bytes().unwrap(), tx.to_bytes().unwrap());
+            assert_eq!(back.hash().unwrap(), tx.hash().unwrap());
+            assert_eq!(back.sender_address().unwrap(), SENDER);
+        }
+
+        // without "type" the fee fields decide, as before
+        let j = r#"{"gas":"0x5208","maxFeePerGas":"0x2","maxPriorityFeePerGas":"0x1","to":"0x"}"#;
+        let tx: EvmTx = serde_json::from_str(j).unwrap();
+        assert_eq!(tx.tx_type, EvmTxType::Eip1559);
+        assert!(!tx.signed);
+        let tx: EvmTx = serde_json::from_str(r#"{"gasPrice":"0x2"}"#).unwrap();
+        assert_eq!(tx.tx_type, EvmTxType::Legacy);
+        assert!(serde_json::from_str::<EvmTx>(r#"{"type":"0x3"}"#).is_err());
+
+        // a legacy transaction's chain id comes from v when not given
+        let mut tx = EvmTx {
+            chain_id: 137,
+            to: TO.into(),
+            ..Default::default()
+        };
+        tx.sign(&key()).unwrap();
+        let j = serde_json::to_string(&tx).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("chainId");
+        obj.remove("type");
+        let back: EvmTx = serde_json::from_value(v).unwrap();
+        assert_eq!(back.chain_id, 137);
+        assert_eq!(back.sender_address().unwrap(), SENDER);
+    }
+
+    /// A legacy `v` must agree with the chain id the signed bytes are built
+    /// from.
+    #[test]
+    fn legacy_v_must_match_chain_id() {
+        let mut tx = EvmTx {
+            chain_id: 1,
+            to: TO.into(),
+            ..Default::default()
+        };
+        tx.sign(&key()).unwrap();
+        assert_eq!(tx.sender_address().unwrap(), SENDER);
+        tx.chain_id = 2;
+        assert_eq!(tx.sender_address(), Err(Error::InvalidV));
+        tx.chain_id = 0;
+        assert_eq!(tx.sender_address(), Err(Error::InvalidV));
+
+        // a pre-EIP-155 v needs chain id 0
+        let mut tx = EvmTx {
+            to: TO.into(),
+            ..Default::default()
+        };
+        tx.sign(&key()).unwrap();
+        assert_eq!(tx.sender_address().unwrap(), SENDER);
+        tx.chain_id = 1;
+        assert_eq!(tx.sender_address(), Err(Error::InvalidV));
+    }
 }
 
 // --- JSON (serde) ---
@@ -593,11 +1050,76 @@ struct EvmTxJson {
     r: String,
     #[serde(default)]
     s: String,
+    /// The EIP-2718 type, e.g. `"0x2"`. Optional on input: without it the
+    /// type is inferred from the fee fields.
+    #[serde(rename = "type", default, skip_serializing_if = "String::is_empty")]
+    tx_type: String,
+    #[serde(
+        rename = "accessList",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    access_list: Option<Vec<AccessListEntryJson>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AccessListEntryJson {
+    address: String,
+    #[serde(rename = "storageKeys", default)]
+    storage_keys: Vec<String>,
+}
+
+/// The JSON form of an access list; `None` when empty.
+fn access_list_to_json(entries: &[RlpItem]) -> Result<Option<Vec<AccessListEntryJson>>, Error> {
+    check_access_list(entries)?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let hex0x = |item: &RlpItem| format!("0x{}", hex::encode(item.as_bytes().unwrap_or(&[])));
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some([address, RlpItem::List(keys)]) = entry.as_list() else {
+            return Err(Error::InvalidData);
+        };
+        out.push(AccessListEntryJson {
+            address: hex0x(address),
+            storage_keys: keys.iter().map(hex0x).collect(),
+        });
+    }
+    Ok(Some(out))
+}
+
+/// `"0x"` followed by exactly `2 * N` hex digits.
+fn fixed_hex<const N: usize>(s: &str) -> Result<RlpItem, Error> {
+    let mut out = [0u8; N];
+    let body = s.strip_prefix("0x").ok_or(Error::InvalidData)?;
+    hex::decode_to_slice(body, &mut out).map_err(|_| Error::InvalidData)?;
+    Ok(RlpItem::Bytes(out.to_vec()))
+}
+
+fn access_list_from_json(entries: &[AccessListEntryJson]) -> Result<Vec<RlpItem>, Error> {
+    entries
+        .iter()
+        .map(|e| {
+            let keys = e
+                .storage_keys
+                .iter()
+                .map(|k| fixed_hex::<32>(k))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(RlpItem::List(vec![
+                fixed_hex::<20>(&e.address)?,
+                RlpItem::List(keys),
+            ]))
+        })
+        .collect()
 }
 
 impl Serialize for EvmTx {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error;
         let mut obj = EvmTxJson {
+            tx_type: hex0x_u64(u64::from(self.tx_type.type_value())),
+            access_list: access_list_to_json(&self.access_list).map_err(S::Error::custom)?,
             gas: hex0x_u64(self.gas),
             input: format!("0x{}", hex::encode(&self.data)),
             nonce: hex0x_u64(self.nonce),
@@ -606,7 +1128,7 @@ impl Serialize for EvmTx {
             chain_id: hex0x_u64(self.chain_id),
             ..Default::default()
         };
-        if self.tx_type == EvmTxType::Legacy {
+        if matches!(self.tx_type, EvmTxType::Legacy | EvmTxType::Eip2930) {
             obj.gas_price = hex0x_big(&self.gas_fee_cap);
         } else {
             obj.gas_fee_cap = hex0x_big(&self.gas_fee_cap);
@@ -630,12 +1152,34 @@ impl<'de> Deserialize<'de> for EvmTx {
         if !o.gas.is_empty() {
             tx.gas = parse_u64_auto(&o.gas).map_err(D::Error::custom)?;
         }
-        if !o.gas_fee_cap.is_empty() && !o.gas_tip_cap.is_empty() {
-            tx.gas_fee_cap = parse_big_auto(&o.gas_fee_cap).map_err(D::Error::custom)?;
-            tx.gas_tip_cap = parse_big_auto(&o.gas_tip_cap).map_err(D::Error::custom)?;
-            tx.tx_type = EvmTxType::Eip1559;
+        let typed = !o.tx_type.is_empty();
+        tx.tx_type = if typed {
+            match parse_u64_auto(&o.tx_type).map_err(D::Error::custom)? {
+                0 => EvmTxType::Legacy,
+                1 => EvmTxType::Eip2930,
+                2 => EvmTxType::Eip1559,
+                _ => return Err(D::Error::custom(crate::Error::UnsupportedTxType)),
+            }
+        } else if !o.gas_fee_cap.is_empty() && !o.gas_tip_cap.is_empty() {
+            // no type given: fee cap and tip mean EIP-1559
+            EvmTxType::Eip1559
+        } else {
+            EvmTxType::Legacy
+        };
+        if tx.tx_type == EvmTxType::Eip1559 {
+            if !o.gas_fee_cap.is_empty() {
+                tx.gas_fee_cap = parse_big_auto(&o.gas_fee_cap).map_err(D::Error::custom)?;
+            }
+            if !o.gas_tip_cap.is_empty() {
+                tx.gas_tip_cap = parse_big_auto(&o.gas_tip_cap).map_err(D::Error::custom)?;
+            }
         } else if !o.gas_price.is_empty() {
             tx.gas_fee_cap = parse_big_auto(&o.gas_price).map_err(D::Error::custom)?;
+        } else if typed && !o.gas_fee_cap.is_empty() {
+            tx.gas_fee_cap = parse_big_auto(&o.gas_fee_cap).map_err(D::Error::custom)?;
+        }
+        if let Some(access_list) = &o.access_list {
+            tx.access_list = access_list_from_json(access_list).map_err(D::Error::custom)?;
         }
         if !o.input.is_empty() {
             let h = o
@@ -648,6 +1192,8 @@ impl<'de> Deserialize<'de> for EvmTx {
             tx.nonce = parse_u64_auto(&o.nonce).map_err(D::Error::custom)?;
         }
         if !o.to.is_empty() {
+            // "0x" or a full 20-byte address, never a shorter one
+            to_item(&o.to).map_err(D::Error::custom)?;
             tx.to = o.to;
         }
         if !o.value.is_empty() {
@@ -664,6 +1210,19 @@ impl<'de> Deserialize<'de> for EvmTx {
         }
         if !o.s.is_empty() {
             tx.s = parse_big_auto(&o.s).map_err(D::Error::custom)?;
+        }
+        // A signature makes this a signed transaction: `hash` and `to_bytes`
+        // must cover it.
+        tx.signed = tx.r.sign() != Sign::NoSign && tx.s.sign() != Sign::NoSign;
+        // A legacy transaction's chain id is in its EIP-155 v when the JSON
+        // does not give it.
+        if tx.signed
+            && tx.tx_type == EvmTxType::Legacy
+            && o.chain_id.is_empty()
+            && let Some(v) = tx.y.to_u64()
+            && v >= 35
+        {
+            tx.chain_id = (v - 35) / 2;
         }
         Ok(tx)
     }
