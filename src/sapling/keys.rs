@@ -799,5 +799,30 @@ mod tests {
         let s = ivk.encode(Network::Regtest, &mut buf).unwrap();
         assert_eq!(s.len(), IncomingViewingKey::MAX_ENCODED_LEN);
         assert_eq!(format!("{ivk:?}"), "IncomingViewingKey(..)");
+
+        // The first `ivk` of `sapling_key_components.json`, encoded with the
+        // `bech32` crate (0.11) under the prefixes of zcashd's
+        // `chainparams.cpp` (`bech32HRPs[SAPLING_INCOMING_VIEWING_KEY]`).
+        // zcashd defines the prefixes but has no encoder of its own for
+        // this key type; the layout is that of its other Sapling keys.
+        let ivk = IncomingViewingKey::from_bytes(
+            &hex::decode("b70b7cd0ed03cbdfd7ada9502ee245b13e569d54a5719d2daa0f5f1451479204")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let expected = [
+            "zivks1ku9he58dq09al4ad49gzacj9kyl9d82554ce6td2pa03g528jgzqhh38dg",
+            "zivktestsapling1ku9he58dq09al4ad49gzacj9kyl9d82554ce6td2pa03g528jgzqyq6d78",
+            "zivkregtestsapling1ku9he58dq09al4ad49gzacj9kyl9d82554ce6td2pa03g528jgzqsnuqkh",
+        ];
+        for (network, expected) in Network::ALL.into_iter().zip(expected) {
+            assert_eq!(ivk.encode(network, &mut buf), Ok(expected));
+            assert_eq!(
+                IncomingViewingKey::decode(expected),
+                Ok((network, ivk.clone()))
+            );
+        }
     }
 }

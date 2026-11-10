@@ -978,4 +978,57 @@ mod tests {
         assert_eq!(with_cursor(&[2]), Err(Error::InvalidLength));
         assert_eq!(with_cursor(&[]), Err(Error::UnexpectedEof));
     }
+
+    /// A witness of the depth-32 tree against `librustzcash`: the
+    /// serialization `write_incremental_witness` gives after each append,
+    /// the tree's, the roots and the final path
+    /// (`testdata/sapling_witness_reference.json`).
+    #[test]
+    fn librustzcash_witness() {
+        let json: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/sapling_witness_reference.json")).unwrap();
+        let leaf = |i: u64| {
+            let mut n = [0u8; 32];
+            n[..8].copy_from_slice(&(1000 + i).to_le_bytes());
+            n
+        };
+        let position = json["position"].as_u64().unwrap();
+        let mut tree = Frontier::<DEPTH>::new();
+        for i in 0..position {
+            tree.append(&leaf(i)).unwrap();
+        }
+        let mut witness = tree.append_witnessed(&leaf(position)).unwrap();
+        let steps = json["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 13);
+        let mut buf = [0u8; MAX_WITNESS_LEN];
+        for (i, step) in steps.iter().enumerate() {
+            if i > 0 {
+                let next = leaf(position + i as u64);
+                tree.append(&next).unwrap();
+                witness.append(&next).unwrap();
+            }
+            let hex_of = |name: &str| step[name].as_str().unwrap();
+            assert_eq!(witness.tree_size(), step["size"].as_u64().unwrap());
+            let n = witness.write(&mut buf).unwrap();
+            assert_eq!(hex::encode(&buf[..n]), hex_of("witness"), "step {i}");
+            let n = tree.write(&mut buf).unwrap();
+            assert_eq!(hex::encode(&buf[..n]), hex_of("tree"), "step {i}");
+            assert_eq!(hex::encode(witness.root()), hex_of("root"), "step {i}");
+
+            // read back, it is the same witness
+            let read = Witness::<DEPTH>::read(&hex::decode(hex_of("witness")).unwrap()).unwrap();
+            assert_eq!(read.position(), position);
+            assert_eq!(read.tree_size(), witness.tree_size());
+            if i % 4 == 0 {
+                assert_eq!(read.path(), witness.path());
+            }
+        }
+        let path = witness.path();
+        let expected = json["final_path"].as_array().unwrap();
+        assert_eq!(expected.len(), DEPTH);
+        for (sibling, expected) in path.siblings.iter().zip(expected) {
+            assert_eq!(hex::encode(sibling), expected.as_str().unwrap());
+        }
+        assert_eq!(path.verify(&leaf(position), &tree.root()), Ok(()));
+    }
 }
