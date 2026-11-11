@@ -413,32 +413,39 @@ way java-tron does, so its ids match the network's. Everything runs without
 
 ```rust
 use outscript::tron::{address_from_pubkey, address_from_str};
-use outscript::trontx::{
-    TronContract, TronTransfer, TronTriggerSmartContract, TronTx, trc20_transfer_data,
-};
+use outscript::trontx::{TronTx, trc20_transfer_data};
 
 let me = address_from_pubkey(&key.public_key());
 let to = address_from_str("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t")?;
 
-// 1 TRX; the reference block is a recent block's height and id
+// 1 TRX (in sun); the reference block is a recent block's height and id
 let tx = TronTx {
     expiration: now_ms + 60_000,
     timestamp: now_ms,
-    ..TronTx::new(TronContract::Transfer(TronTransfer { owner: me, to, amount: 1_000_000 }))
+    ..TronTx::transfer(me, to, 1_000_000)?
 }
 .with_ref_block(block_height, &block_id);
-let sig = tx.sign(&key);
-let txid = tx.txid();
-let raw = tx.encode_signed(&[sig]);   // the Transaction message, for broadcasthex
+let sig = tx.sign(&key)?;
+let txid = tx.txid()?;
+let raw = tx.encode_signed(&[sig])?;  // the Transaction message, for broadcast
 
 // a TRC-20 transfer is a smart-contract call; fee_limit bounds the energy
 let data = trc20_transfer_data(&to, 5_000_000);          // 5 USDT (6 decimals)
-let call = TronTriggerSmartContract::new(me, usdt_contract, &data);
 let tx = TronTx {
-    fee_limit: 30_000_000,
-    ..TronTx::new(TronContract::TriggerSmartContract(call))
-};
+    expiration: now_ms + 60_000,
+    timestamp: now_ms,
+    ..TronTx::trc20_transfer(me, usdt_contract, &data, 30_000_000)?
+}
+.with_ref_block(block_height, &block_id);
 ```
+
+Other contracts go through `TronTx::new` with a `TronContract` (a TRC-10
+transfer, any smart-contract call, or a contract as its raw protobuf
+parameter). The integer fields are `int64` on the wire (`int32` for the
+permission id and the contract type), so `txid`, `sign`, `signer` and every
+encoder return `Error::TooLarge` for a value above the signed maximum rather
+than the id or signature of a transaction the network would read as negative;
+`TronTx::validate` checks the same up front.
 
 Nodes build transactions too (`createtransaction` and friends return a
 `raw_data_hex`). `TronTx::parse` reads that back, so a wallet can show what it

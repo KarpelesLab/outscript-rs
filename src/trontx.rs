@@ -20,27 +20,39 @@
 //! ```
 //! use outscript::crypto::secp256k1::SecpPrivateKey;
 //! use outscript::tron::{address_from_pubkey, address_from_str};
-//! use outscript::trontx::{TronContract, TronTransfer, TronTx};
+//! use outscript::trontx::TronTx;
 //!
 //! let key = SecpPrivateKey::from_bytes(&[7u8; 32]).unwrap();
-//! let transfer = TronTransfer {
-//!     owner: address_from_pubkey(&key.public_key()),
-//!     to: address_from_str("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t").unwrap(),
-//!     amount: 1_000_000, // sun: 1 TRX
-//! };
+//! let me = address_from_pubkey(&key.public_key());
+//! let to = address_from_str("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t").unwrap();
 //! let tx = TronTx {
 //!     expiration: 1_791_005_213_610, // ms; nodes accept up to 24h ahead
 //!     timestamp: 1_791_005_153_610,
-//!     ..TronTx::new(TronContract::Transfer(transfer))
+//!     ..TronTx::transfer(me, to, 1_000_000).unwrap() // sun: 1 TRX
 //! }
 //! .with_ref_block(86_777_507, &[0x5c; 32]); // a recent block's height and id
 //!
-//! let sig = tx.sign(&key);
-//! assert_eq!(tx.signer(&sig), Ok(transfer.owner));
+//! let sig = tx.sign(&key).unwrap();
+//! assert_eq!(tx.signer(&sig), Ok(me));
 //! let mut raw = [0u8; 256];
 //! let len = tx.encode_signed_to_slice(&[sig], &mut raw).unwrap(); // broadcast these
 //! assert_eq!(len, tx.signed_len(1));
 //! ```
+//!
+//! # Integer ranges
+//!
+//! The fields are unsigned here but `int64` (amounts, times, fee limit, token
+//! id) or `int32` (permission id, contract type) on the wire, where a larger
+//! value would read back as a negative number: a transaction the network and
+//! [`TronTx::parse`] reject. Every method that identifies, signs or encodes a
+//! transaction therefore checks the ranges ([`TronTx::validate`]) and fails
+//! with [`Error::TooLarge`]; none of them can produce the id, a signature or
+//! the bytes of such a transaction.
+//!
+//! Up to 0.2.8 [`TronTx::txid`], [`TronTx::sign`], `TronTx::raw_data` and
+//! `TronTx::encode_signed` were infallible and did not check. They now
+//! return a `Result`: add `?` (or `unwrap()` where the values are known to be
+//! in range).
 
 pub use crate::Error;
 
@@ -371,15 +383,16 @@ impl<'a> TronContract<'a> {
         put_uint(s, 5, u64::from(permission_id));
     }
 
-    /// The integer fields of the contract, all `int64` on the wire.
-    fn check_int64(&self) -> Result<(), Error> {
+    /// Checks the integer fields of the contract: amounts and the token id
+    /// are `int64` on the wire, the contract type an `int32`.
+    fn check_ints(&self) -> Result<(), Error> {
         let fits = match self {
             TronContract::Transfer(c) => c.amount <= I64_MAX,
             TronContract::TransferAsset(c) => c.amount <= I64_MAX,
             TronContract::TriggerSmartContract(c) => {
                 c.call_value <= I64_MAX && c.call_token_value <= I64_MAX && c.token_id <= I64_MAX
             }
-            TronContract::Other(_) => true,
+            TronContract::Other(c) => u64::from(c.contract_type) <= I32_MAX,
         };
         if fits { Ok(()) } else { Err(Error::TooLarge) }
     }
@@ -479,7 +492,21 @@ pub fn trc20_transfer_data(to: &TronAddress, amount: u128) -> [u8; 68] {
 
 // --- transactions ---
 
+/// A raw address must start with the address prefix.
+fn check_address(address: &TronAddress) -> Result<(), Error> {
+    if address[0] == ADDRESS_PREFIX {
+        Ok(())
+    } else {
+        Err(Error::InvalidAddress)
+    }
+}
+
 /// A Tron transaction's `raw_data`: what is identified and signed.
+///
+/// The integer fields are `int64` or `int32` on the wire: values above
+/// `i64::MAX` (or `i32::MAX` for the permission id and the contract type)
+/// can be stored here but not identified, signed or encoded. See
+/// [`validate`](Self::validate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TronTx<'a> {
     /// Bytes 6 and 7 of the reference block's height, big-endian.
@@ -499,7 +526,8 @@ pub struct TronTx<'a> {
     /// The contract.
     pub contract: TronContract<'a>,
     /// The permission the signers act under: 0 for the owner permission, 2
-    /// and up for an active permission of a multi-signature account.
+    /// and up for an active permission of a multi-signature account. An
+    /// `int32` on the wire: at most `i32::MAX`.
     pub permission_id: u32,
 }
 
@@ -518,6 +546,59 @@ impl<'a> TronTx<'a> {
             contract,
             permission_id: 0,
         }
+    }
+
+    /// A TRX transfer of `amount` sun (a millionth of a TRX) from `owner`
+    /// to `to`, with every other field zero or empty: as for
+    /// [`new`](Self::new), set the reference block and the expiration.
+    ///
+    /// Fails with [`Error::InvalidAddress`] if an address does not start
+    /// with the address prefix, and with [`Error::TooLarge`] if the amount
+    /// exceeds `i64::MAX`.
+    pub fn transfer(owner: TronAddress, to: TronAddress, amount: u64) -> Result<Self, Error> {
+        check_address(&owner)?;
+        check_address(&to)?;
+        let tx = TronTx::new(TronContract::Transfer(TronTransfer { owner, to, amount }));
+        tx.validate()?;
+        Ok(tx)
+    }
+
+    /// A TRC-20 transfer: `owner` calls the token contract `token` with the
+    /// `transfer(address,uint256)` calldata `data`, which names the
+    /// recipient and the amount (see [`trc20_transfer_data`]), burning at
+    /// most `fee_limit` sun as energy. Every other field is zero or empty:
+    /// as for [`new`](Self::new), set the reference block and the expiration.
+    ///
+    /// ```
+    /// use outscript::tron::address_from_str;
+    /// use outscript::trontx::{TronTx, trc20_transfer_data};
+    ///
+    /// let me = address_from_str("TYBwyJDsfFgt9toLTMuJuZCKrJG4ZCDNCB").unwrap();
+    /// let to = address_from_str("TDt9YtfuttvxD2Jv8F8v4JEDbnBBb1jVNt").unwrap();
+    /// let usdt = address_from_str("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t").unwrap();
+    /// let data = trc20_transfer_data(&to, 5_000_000); // 5 USDT (6 decimals)
+    /// let tx = TronTx::trc20_transfer(me, usdt, &data, 30_000_000).unwrap();
+    /// assert_eq!(tx.fee_limit, 30_000_000);
+    /// ```
+    ///
+    /// Fails with [`Error::InvalidAddress`] if an address does not start
+    /// with the address prefix, and with [`Error::TooLarge`] if the fee
+    /// limit exceeds `i64::MAX`.
+    pub fn trc20_transfer(
+        owner: TronAddress,
+        token: TronAddress,
+        data: &'a [u8; 68],
+        fee_limit: u64,
+    ) -> Result<Self, Error> {
+        check_address(&owner)?;
+        check_address(&token)?;
+        let call = TronTriggerSmartContract::new(owner, token, data);
+        let tx = TronTx {
+            fee_limit,
+            ..TronTx::new(TronContract::TriggerSmartContract(call))
+        };
+        tx.validate()?;
+        Ok(tx)
     }
 
     /// Sets the reference block from a recent block's height and id (the id
@@ -540,21 +621,29 @@ impl<'a> TronTx<'a> {
         put_uint(s, 18, self.fee_limit);
     }
 
-    /// Checks that the transaction can be encoded faithfully: its integer
-    /// fields (expiration, timestamp, fee limit and the contract's amounts)
-    /// are `int64` on the wire, so a value above `i64::MAX` would be read as
-    /// negative and fails with [`Error::TooLarge`].
+    /// Checks that the transaction can be encoded faithfully. Its integer
+    /// fields are signed on the wire, so a value above the signed maximum
+    /// would be read as negative, by the network and by
+    /// [`parse`](Self::parse): expiration, timestamp, fee limit and the
+    /// contract's amounts and token id are `int64` (at most `i64::MAX`), the
+    /// permission id and the contract type `int32` (at most `i32::MAX`).
+    /// Anything larger fails with [`Error::TooLarge`].
     ///
-    /// [`raw_data_to_slice`](Self::raw_data_to_slice) and
-    /// [`encode_signed_to_slice`](Self::encode_signed_to_slice) check this
-    /// themselves. The infallible [`txid`](Self::txid), [`sign`](Self::sign)
-    /// and `Vec` encoders do not: call this first when the amounts are not
-    /// known to be in range.
+    /// Every method that identifies, signs or encodes the transaction
+    /// ([`txid`](Self::txid), [`sign`](Self::sign), [`signer`](Self::signer),
+    /// [`raw_data_to_slice`](Self::raw_data_to_slice),
+    /// [`encode_signed_to_slice`](Self::encode_signed_to_slice) and the `Vec`
+    /// encoders) checks this itself, so there is no need to call it first;
+    /// it is there to check a transaction early.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.expiration > I64_MAX || self.timestamp > I64_MAX || self.fee_limit > I64_MAX {
+        if self.expiration > I64_MAX
+            || self.timestamp > I64_MAX
+            || self.fee_limit > I64_MAX
+            || u64::from(self.permission_id) > I32_MAX
+        {
             return Err(Error::TooLarge);
         }
-        self.contract.check_int64()
+        self.contract.check_ints()
     }
 
     /// The length of the serialized `raw_data`.
@@ -565,8 +654,8 @@ impl<'a> TronTx<'a> {
     }
 
     /// Serializes the `raw_data` into `out`, returning the number of bytes
-    /// written. Fails with [`Error::TooLarge`] if an integer field exceeds
-    /// `i64::MAX` (see [`validate`](Self::validate)).
+    /// written. Fails with [`Error::TooLarge`] if an integer field is out of
+    /// range (see [`validate`](Self::validate)).
     pub fn raw_data_to_slice(&self, out: &mut [u8]) -> Result<usize, Error> {
         self.validate()?;
         let mut s = SliceSink::new(out);
@@ -574,31 +663,40 @@ impl<'a> TronTx<'a> {
         s.finish().ok_or(Error::BufferTooSmall)
     }
 
-    /// Serializes the `raw_data`.
+    /// Serializes the `raw_data`. Fails with [`Error::TooLarge`] if an
+    /// integer field is out of range (see [`validate`](Self::validate)).
     #[cfg(feature = "alloc")]
-    pub fn raw_data(&self) -> Vec<u8> {
+    pub fn raw_data(&self) -> Result<Vec<u8>, Error> {
         let mut out = vec![0u8; self.raw_data_len()];
-        let mut s = SliceSink::new(&mut out);
-        self.write_raw(&mut s);
-        s.finish().expect("buffer sized by raw_data_len");
-        out
+        self.raw_data_to_slice(&mut out)?;
+        Ok(out)
     }
 
     /// The transaction id: SHA-256 of the `raw_data`. This is what is signed.
-    pub fn txid(&self) -> [u8; 32] {
+    /// Fails with [`Error::TooLarge`] if an integer field is out of range
+    /// (see [`validate`](Self::validate)): such a transaction has no id.
+    pub fn txid(&self) -> Result<[u8; 32], Error> {
+        self.validate()?;
+        Ok(self.raw_hash())
+    }
+
+    /// SHA-256 of the fields as they would be written, unchecked.
+    fn raw_hash(&self) -> [u8; 32] {
         let mut h = HashSink(Sha256::new());
         self.write_raw(&mut h);
         h.0.finalize()
     }
 
-    /// Signs the transaction.
-    pub fn sign(&self, key: &SecpPrivateKey) -> TronSignature {
-        sign_txid(&self.txid(), key)
+    /// Signs the transaction. Fails with [`Error::TooLarge`] if an integer
+    /// field is out of range (see [`validate`](Self::validate)): such a
+    /// transaction is never signed.
+    pub fn sign(&self, key: &SecpPrivateKey) -> Result<TronSignature, Error> {
+        Ok(sign_txid(&self.txid()?, key))
     }
 
     /// The address that produced `sig` for this transaction.
     pub fn signer(&self, sig: &TronSignature) -> Result<TronAddress, Error> {
-        recover_signer(&self.txid(), sig)
+        recover_signer(&self.txid()?, sig)
     }
 
     /// The length of the `Transaction` message with `signatures` signatures.
@@ -608,7 +706,7 @@ impl<'a> TronTx<'a> {
 
     /// Writes the `Transaction` message (`raw_data` and `sigs`), as nodes
     /// broadcast it, into `out`, returning the number of bytes written.
-    /// Fails with [`Error::TooLarge`] if an integer field exceeds `i64::MAX`
+    /// Fails with [`Error::TooLarge`] if an integer field is out of range
     /// (see [`validate`](Self::validate)).
     pub fn encode_signed_to_slice(
         &self,
@@ -616,26 +714,20 @@ impl<'a> TronTx<'a> {
         out: &mut [u8],
     ) -> Result<usize, Error> {
         self.validate()?;
-        self.write_signed(sigs, out).ok_or(Error::BufferTooSmall)
-    }
-
-    /// Writes the `Transaction` message, or `None` if `out` is too small.
-    fn write_signed(&self, sigs: &[TronSignature], out: &mut [u8]) -> Option<usize> {
         let mut s = SliceSink::new(out);
         put_delimited(&mut s, 1, false, |s| self.write_raw(s));
         for sig in sigs {
             put_bytes(&mut s, 2, sig);
         }
-        s.finish()
+        s.finish().ok_or(Error::BufferTooSmall)
     }
 
     /// The `Transaction` message: see [`encode_signed_to_slice`](Self::encode_signed_to_slice).
     #[cfg(feature = "alloc")]
-    pub fn encode_signed(&self, sigs: &[TronSignature]) -> Vec<u8> {
+    pub fn encode_signed(&self, sigs: &[TronSignature]) -> Result<Vec<u8>, Error> {
         let mut out = vec![0u8; self.signed_len(sigs.len())];
-        self.write_signed(sigs, &mut out)
-            .expect("buffer sized by signed_len");
-        out
+        self.encode_signed_to_slice(sigs, &mut out)?;
+        Ok(out)
     }
 
     /// Parses a serialized `raw_data` (a node's `raw_data_hex`), borrowing
@@ -687,7 +779,8 @@ impl<'a> TronTx<'a> {
             contract,
             permission_id,
         };
-        if tx.txid() != sha256_once(raw_data) {
+        // the parsed integers are in range, so this is the id
+        if tx.raw_hash() != sha256_once(raw_data) {
             return Err(Error::NonCanonical);
         }
         Ok(tx)
@@ -924,7 +1017,7 @@ mod tests {
             assert_eq!(tx.raw_data_len(), raw.len());
             let n = tx.raw_data_to_slice(&mut out).unwrap();
             assert_eq!(&out[..n], &raw[..]);
-            assert_eq!(tx.txid(), txid);
+            assert_eq!(tx.txid(), Ok(txid));
             assert_eq!(
                 tx.raw_data_to_slice(&mut out[..raw.len() - 1]),
                 Err(Error::BufferTooSmall)
@@ -965,7 +1058,7 @@ mod tests {
             timestamp: v.timestamp,
             ..TronTx::new(v.contract)
         };
-        assert_eq!(hex::encode(tx.txid()), v.txid);
+        assert_eq!(hex::encode(tx.txid().unwrap()), v.txid);
         let mut out = [0u8; 256];
         let n = tx.raw_data_to_slice(&mut out).unwrap();
         assert_eq!(hex::encode(&out[..n]), v.raw_data);
@@ -1007,7 +1100,7 @@ mod tests {
             }))
         }
         .with_ref_block(86_777_507, &[0x5c; 32]);
-        let mut sig = tx.sign(&key);
+        let mut sig = tx.sign(&key).unwrap();
         assert!(sig[64] <= 1);
         assert_eq!(tx.signer(&sig), Ok(me));
         sig[64] += 27;
@@ -1149,6 +1242,25 @@ mod tests {
                 tx.encode_signed_to_slice(&[[0; 65]], &mut out).map(drop),
                 res
             );
+            // no id, signature or recovery for a transaction out of range
+            assert_eq!(tx.txid().map(drop), res);
+            assert_eq!(tx.sign(&key()).map(drop), res);
+            if let Ok(sig) = tx.sign(&key()) {
+                assert_eq!(tx.signer(&sig), Ok(me));
+            } else {
+                assert_eq!(tx.signer(&[0; 65]), Err(Error::TooLarge));
+            }
+            #[cfg(feature = "alloc")]
+            {
+                assert_eq!(tx.raw_data().map(drop), res);
+                assert_eq!(tx.encode_signed(&[[0; 65]]).map(drop), res);
+                if res.is_ok() {
+                    let n = tx.raw_data_to_slice(&mut out).unwrap();
+                    assert_eq!(tx.raw_data().unwrap(), &out[..n]);
+                    let n = tx.encode_signed_to_slice(&[[0; 65]], &mut out).unwrap();
+                    assert_eq!(tx.encode_signed(&[[0; 65]]).unwrap(), &out[..n]);
+                }
+            }
             if res.is_ok() {
                 let n = tx.raw_data_to_slice(&mut out).unwrap();
                 assert_eq!(TronTx::parse(&out[..n]), Ok(tx));
@@ -1205,6 +1317,80 @@ mod tests {
             }
             assert_eq!(check(tx), Err(Error::TooLarge));
         }
+
+        // the int32 fields: the permission id and the contract type
+        let mut tx = transfer(1);
+        tx.permission_id = i32::MAX as u32;
+        assert_eq!(check(tx), Ok(()));
+        tx.permission_id = i32::MAX as u32 + 1;
+        assert_eq!(check(tx), Err(Error::TooLarge));
+        tx.permission_id = u32::MAX;
+        assert_eq!(check(tx), Err(Error::TooLarge));
+        let other = |contract_type| {
+            TronTx::new(TronContract::Other(TronOtherContract {
+                contract_type,
+                type_url: "type.googleapis.com/protocol.VoteWitnessContract",
+                parameter: &[0x0a, 0x01, 0x41],
+            }))
+            .with_ref_block(1, &[1; 32])
+        };
+        assert_eq!(check(other(i32::MAX as u32)), Ok(()));
+        assert_eq!(check(other(i32::MAX as u32 + 1)), Err(Error::TooLarge));
+    }
+
+    /// The constructors build what the struct literals do, and check their
+    /// arguments.
+    #[test]
+    fn constructors() {
+        let me = address_from_pubkey(&key().public_key());
+        let to = address_from_str("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t").unwrap();
+        let mut foreign = to;
+        foreign[0] = 0xa0;
+
+        let tx = TronTx::transfer(me, to, 1_000_000).unwrap();
+        assert_eq!(
+            tx,
+            TronTx::new(TronContract::Transfer(TronTransfer {
+                owner: me,
+                to,
+                amount: 1_000_000
+            }))
+        );
+        assert!(TronTx::transfer(me, to, i64::MAX as u64).is_ok());
+        assert_eq!(
+            TronTx::transfer(me, to, i64::MAX as u64 + 1),
+            Err(Error::TooLarge)
+        );
+        assert_eq!(TronTx::transfer(foreign, to, 1), Err(Error::InvalidAddress));
+        assert_eq!(TronTx::transfer(me, foreign, 1), Err(Error::InvalidAddress));
+
+        // the mainnet USDT transfer, rebuilt
+        let v = &vectors()[1];
+        let TronContract::TriggerSmartContract(call) = v.contract else {
+            unreachable!()
+        };
+        let recipient = address_from_str("TYBwyJDsfFgt9toLTMuJuZCKrJG4ZCDNCB").unwrap();
+        let data = trc20_transfer_data(&recipient, 29_834_716);
+        let tx = TronTx {
+            ref_block_bytes: [0x1e, 0x8d],
+            ref_block_hash: h("3f4b4b92c1944c90"),
+            expiration: v.expiration,
+            timestamp: v.timestamp,
+            ..TronTx::trc20_transfer(call.owner, call.contract, &data, v.fee_limit).unwrap()
+        };
+        assert_eq!(hex::encode(tx.txid().unwrap()), v.txid);
+        assert_eq!(
+            TronTx::trc20_transfer(me, to, &data, i64::MAX as u64 + 1),
+            Err(Error::TooLarge)
+        );
+        assert_eq!(
+            TronTx::trc20_transfer(foreign, to, &data, 1),
+            Err(Error::InvalidAddress)
+        );
+        assert_eq!(
+            TronTx::trc20_transfer(me, foreign, &data, 1),
+            Err(Error::InvalidAddress)
+        );
     }
 
     #[test]
