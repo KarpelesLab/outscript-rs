@@ -157,6 +157,8 @@ mod mnemonic;
 mod ringct;
 mod scan;
 #[cfg(feature = "alloc")]
+mod slow_hash;
+#[cfg(feature = "alloc")]
 mod tx;
 
 #[cfg(test)]
@@ -207,6 +209,8 @@ pub use scan::{
     derive_subaddress_public_key, derive_view_tag, encrypt_amount, encrypt_amount_legacy,
     encrypt_payment_id,
 };
+#[cfg(feature = "alloc")]
+pub use slow_hash::cn_slow_hash;
 #[cfg(feature = "alloc")]
 pub use tx::{
     Bulletproof, EcdhInfo, Input, Mlsag, Output, RCT_TYPE_BULLETPROOF, RCT_TYPE_BULLETPROOF_PLUS,

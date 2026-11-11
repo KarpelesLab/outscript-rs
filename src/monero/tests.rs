@@ -1267,6 +1267,8 @@ fn slide_scalar_vectors() {
 #[cfg(feature = "alloc")]
 mod build;
 #[cfg(feature = "alloc")]
+mod files;
+#[cfg(feature = "alloc")]
 mod legacy;
 #[cfg(feature = "alloc")]
 mod wallet;
