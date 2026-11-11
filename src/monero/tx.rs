@@ -272,39 +272,39 @@ pub struct Transaction {
 }
 
 /// A cursor over untrusted bytes.
-struct Reader<'a> {
-    data: &'a [u8],
+pub(super) struct Reader<'a> {
+    pub(super) data: &'a [u8],
 }
 
 impl<'a> Reader<'a> {
-    fn bytes(&mut self, n: usize) -> Result<&'a [u8], Error> {
+    pub(super) fn bytes(&mut self, n: usize) -> Result<&'a [u8], Error> {
         let (head, tail) = self.data.split_at_checked(n).ok_or(Error::UnexpectedEof)?;
         self.data = tail;
         Ok(head)
     }
 
-    fn u8(&mut self) -> Result<u8, Error> {
+    pub(super) fn u8(&mut self) -> Result<u8, Error> {
         self.bytes(1)?.first().copied().ok_or(Error::UnexpectedEof)
     }
 
-    fn varint(&mut self) -> Result<u64, Error> {
+    pub(super) fn varint(&mut self) -> Result<u64, Error> {
         let (value, n) = read_varint(self.data)?;
         self.bytes(n)?;
         Ok(value)
     }
 
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+    pub(super) fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
         <[u8; N]>::try_from(self.bytes(N)?).map_err(|_| Error::UnexpectedEof)
     }
 
-    fn key(&mut self) -> Result<[u8; 32], Error> {
+    pub(super) fn key(&mut self) -> Result<[u8; 32], Error> {
         self.array()
     }
 
     /// Checks that `count` elements of at least `min_len` bytes each can
     /// still follow, so that a count read from the data never drives an
     /// allocation larger than the data itself.
-    fn check_count(&self, count: u64, min_len: usize) -> Result<usize, Error> {
+    pub(super) fn check_count(&self, count: u64, min_len: usize) -> Result<usize, Error> {
         let count = usize::try_from(count).map_err(|_| Error::UnexpectedEof)?;
         let need = count.checked_mul(min_len).ok_or(Error::UnexpectedEof)?;
         if need > self.data.len() {
@@ -314,19 +314,19 @@ impl<'a> Reader<'a> {
     }
 
     /// A varint count of elements of at least `min_len` bytes each.
-    fn count(&mut self, min_len: usize) -> Result<usize, Error> {
+    pub(super) fn count(&mut self, min_len: usize) -> Result<usize, Error> {
         let count = self.varint()?;
         self.check_count(count, min_len)
     }
 
     /// `count` keys.
-    fn keys(&mut self, count: usize) -> Result<Vec<[u8; 32]>, Error> {
+    pub(super) fn keys(&mut self, count: usize) -> Result<Vec<[u8; 32]>, Error> {
         let count = self.check_count(count as u64, 32)?;
         (0..count).map(|_| self.key()).collect()
     }
 
     /// A vector of keys with its length.
-    fn key_vec(&mut self) -> Result<Vec<[u8; 32]>, Error> {
+    pub(super) fn key_vec(&mut self) -> Result<Vec<[u8; 32]>, Error> {
         let count = self.count(32)?;
         self.keys(count)
     }
@@ -839,7 +839,16 @@ impl Transaction {
     /// signatures and proofs are not validated.
     pub fn parse(data: &[u8]) -> Result<Self, Error> {
         let mut r = Reader { data };
-        let prefix = TransactionPrefix::read(&mut r)?;
+        let tx = Self::read(&mut r)?;
+        if !r.data.is_empty() {
+            return Err(Error::TrailingData);
+        }
+        Ok(tx)
+    }
+
+    /// Decodes a transaction from the front of `r`.
+    pub(super) fn read(r: &mut Reader<'_>) -> Result<Self, Error> {
+        let prefix = TransactionPrefix::read(r)?;
         let mut tx = Transaction {
             prefix,
             ..Default::default()
@@ -856,14 +865,11 @@ impl Transaction {
         } else {
             let inputs = tx.prefix.inputs.len();
             let outputs = tx.prefix.outputs.len();
-            tx.rct = RctSignatures::read_base(&mut r, inputs, outputs)?;
+            tx.rct = RctSignatures::read_base(r, inputs, outputs)?;
             if tx.rct.rct_type != RCT_TYPE_NULL {
                 let ring_size = tx.prefix.ring_size();
-                tx.rct.read_prunable(&mut r, inputs, outputs, ring_size)?;
+                tx.rct.read_prunable(r, inputs, outputs, ring_size)?;
             }
-        }
-        if !r.data.is_empty() {
-            return Err(Error::TrailingData);
         }
         Ok(tx)
     }

@@ -151,6 +151,8 @@ mod clsag;
 mod decoys;
 mod extra;
 mod fee;
+#[cfg(feature = "alloc")]
+mod files;
 mod keys;
 mod legacy_sig;
 mod mnemonic;
@@ -192,6 +194,12 @@ pub use extra::{push_additional_public_keys, push_nonce, push_payment_id, push_t
 pub use fee::{
     FEE_QUANTIZATION_MASK, RING_SIZE, calculate_fee_from_weight, estimate_fee, estimate_tx_size,
     estimate_tx_weight,
+};
+#[cfg(feature = "alloc")]
+pub use files::{
+    ExportedOutput, KEY_IMAGE_EXPORT_MAGIC, KeyImageExport, OUTPUT_EXPORT_MAGIC, OutputExport,
+    PendingTx, SIGNED_TX_SET_MAGIC, SignedKeyImage, SignedTxSet, TxConstructionData, TxDestination,
+    TxSource, UNSIGNED_TX_SET_MAGIC, UnsignedTxSet, WalletCipher,
 };
 pub use keys::{AccountKeys, SubaddressIndex, ViewKeys, subaddress_secret_key};
 pub use legacy_sig::{BORROMEAN_PROOF_LEN, borromean_verify, check_ring_signature};
@@ -267,6 +275,15 @@ pub enum Error {
     /// two outputs, more than sixteen, or the inputs do not equal the
     /// outputs plus the fee.
     InvalidAmounts,
+    /// The data is not a file of the reference wallet of the kind expected:
+    /// the magic is not there, or the content does not parse.
+    InvalidFile,
+    /// The file was not made with this account's view key, or was altered.
+    AuthenticationFailed,
+    /// An output the transaction set spends, or one before it in the
+    /// wallet, is not described: the offline side needs a full output
+    /// export.
+    MissingOutputs,
     /// The mnemonic has the wrong number of words, a word that is not in
     /// the list, or a bad checksum.
     InvalidMnemonic,
@@ -288,6 +305,9 @@ impl core::fmt::Display for Error {
             Error::InvalidProof => "invalid range proof input",
             Error::BadRandomness => "random source returned zeros",
             Error::InvalidAmounts => "transaction amounts do not balance",
+            Error::InvalidFile => "not a wallet file of the expected kind",
+            Error::AuthenticationFailed => "file not made with this view key",
+            Error::MissingOutputs => "missing output descriptions",
             Error::InvalidMnemonic => "invalid mnemonic",
         })
     }

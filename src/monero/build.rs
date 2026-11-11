@@ -144,6 +144,12 @@ pub struct TransactionBuilder {
     fee: u64,
     unlock_time: u64,
     shuffle: bool,
+    /// The change address is only there to recognise the outputs that go
+    /// back to the sender: no change output is added.
+    no_change_output: bool,
+    /// A payment id to encrypt for the recipient, in place of that of an
+    /// integrated address.
+    payment_id: Option<[u8; 8]>,
 }
 
 impl core::fmt::Debug for TransactionBuilder {
@@ -234,6 +240,27 @@ impl TransactionBuilder {
         self
     }
 
+    /// Declares `address` as the sender's change address without asking for
+    /// a change output: the destinations that pay it (the caller lists them
+    /// itself, as the transaction sets of the reference wallet do) are
+    /// derived with `view_secret`, as change is.
+    pub(crate) fn change_among_destinations(
+        &mut self,
+        address: Address,
+        view_secret: &[u8; 32],
+    ) -> &mut Self {
+        self.change(address, view_secret);
+        self.no_change_output = true;
+        self
+    }
+
+    /// Sets the 8-byte payment id of the transaction, as an integrated
+    /// address among the destinations would.
+    pub(crate) fn payment_id(&mut self, payment_id: [u8; 8]) -> &mut Self {
+        self.payment_id = Some(payment_id);
+        self
+    }
+
     /// Sets the fee, in atomic units (zero by default): see
     /// [`estimate_fee`](super::estimate_fee) for what the reference wallet
     /// pays.
@@ -302,6 +329,11 @@ impl TransactionBuilder {
         }
         let mut payments = self.payments.clone();
         match &self.change {
+            Some(_) if self.no_change_output => {
+                if total_in != total_out {
+                    return Err(Error::InvalidAmounts);
+                }
+            }
             Some(change) => payments.push(Payment {
                 address: change.address,
                 amount: total_in
@@ -446,6 +478,10 @@ impl TransactionBuilder {
             .iter()
             .filter_map(|payment| payment.address.payment_id());
         let payment_id = payment_ids.next();
+        let payment_id = match (self.payment_id, payment_id) {
+            (Some(_), Some(_)) => return Err(Error::InvalidAddress),
+            (set, found) => set.or(found),
+        };
         if payment_ids.next().is_some() {
             return Err(Error::InvalidAddress);
         }
