@@ -162,20 +162,21 @@
 //! makes of what it serves and the ignored tools of the tests
 //! (`tests/chain.rs`):
 //!
-//! - about a thousand blocks from every era — the first 780 of the chain,
-//!   and those around each hard fork — parse, serialize back to the same
-//!   bytes and hash to the daemon's ids, and so do their transactions, of
-//!   every version, which verify with the rings the daemon gives:
-//!   transfers, swaps signed separately, asset operations, the first
-//!   transactions of the blocks with the reward `block_reward` computes
-//!   (less for the oversized blocks before hard fork 6);
-//! - the stakes of the proof-of-stake blocks among those first 780 meet
-//!   the difficulty with the stake modifier followed from the first block.
-//!   The stake proof of a Zarcanum block needs the kernel hash of the
-//!   proof-of-stake block before, which this daemon serves for the top
-//!   block only (`get_pos_details`): of older ones everything is verified
-//!   but the three Schnorr proofs that take it, which the two blocks of
-//!   `tests/mainnet.rs` cover;
+//! - 1165 blocks from every era — the first 780 of the chain, those
+//!   around each hard fork and others in between — parse, serialize back
+//!   to the same bytes and hash to the daemon's ids, and so do their 1918
+//!   transactions, of every version. The 1738 of them the daemon still has
+//!   whole verify with the rings it gives: transfers, swaps signed
+//!   separately, an asset operation, and the first transactions of the
+//!   blocks with the reward `block_reward` computes (less for seven
+//!   oversized blocks);
+//! - the stakes of the 499 proof-of-stake blocks among those first 780
+//!   meet the difficulty with the stake modifier followed from the first
+//!   block. The stake proof of a Zarcanum block needs the kernel hash of
+//!   the proof-of-stake block before, which a daemon only gives for the
+//!   block it would make next (`get_pos_details`): of the 183 older ones
+//!   everything is verified but the three Schnorr proofs that take it,
+//!   which the two blocks of `tests/mainnet.rs` cover;
 //! - the daemon parses transfers of two assets built and signed here, of
 //!   versions 2, 3 and 4, computes the same ids and decodes every output —
 //!   amount, asset and payment id — as this module scans it
@@ -187,7 +188,7 @@
 //!
 //! What a daemon prunes below its checkpoints — the signatures of the
 //! transactions of the first years, but those of the first transactions of
-//! blocks — could not be verified from it.
+//! blocks: 180 of the 1918 — could not be verified from it.
 //!
 //! No transaction signed here has been sent to the network, and the chain
 //! rules beyond those checks (unlock times, mixin counts, fees, sizes)

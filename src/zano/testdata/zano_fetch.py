@@ -12,7 +12,7 @@ the ignored tools of `src/zano/tests/chain.rs` read (`ZANO_TX_DIR`).
 Only read-only JSON-RPC methods are called (get_blocks_details,
 get_tx_details, get_out_info, getrandom_outs3, get_assets_list, getinfo,
 getblocktemplate, and for `ask` decrypt_tx_details and validate_signature),
-one at a time and at most four a second. Nothing is ever
+one at a time and at most five a second. Nothing is ever
 broadcast.
 
 What it writes:
@@ -141,7 +141,8 @@ class Dump:
         # Every output of that transaction is worth remembering.
         found = None
         for n, out in enumerate(info["outs"]):
-            keys = out["pub_keys"]
+            # (A key that must not be mixed comes with a note after it.)
+            keys = [key[:64] for key in out["pub_keys"]]
             if out["amount"] != 0:
                 value = f"{keys[0]} {'0' * 64} {'0' * 64} {'0' * 64}" if keys else None
             else:

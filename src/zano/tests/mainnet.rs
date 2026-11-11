@@ -191,6 +191,12 @@ const FIXTURES: &[Fixture] = &[
         3400121,
         rings
     ),
+    fixture!(
+        "v1_receiver",
+        "04ab399f7da8593fff87e80898a8b13d89ab6c2f605c21b967b38726914bd573",
+        2554990,
+        rings
+    ),
     // Three transactions of block 3 870 005 of the chain builds below 600
     // follow (hard fork 6 without hard fork 7): no height, which would
     // call for the hard fork id of the main network.
@@ -1078,9 +1084,28 @@ fn separately_signed_transparent() {
 }
 
 /// Entries encrypted for the recipient, with the scheme of versions 2 and
-/// 3, and transparent inputs spent after hard fork 5.
+/// 3 — which the last transactions of version 1 used already —, and
+/// transparent inputs spent after hard fork 5.
 #[test]
 fn more_of_versions_2_and_3() {
+    // Ten blocks before hard fork 4: a receiver encrypted for the
+    // recipient, in a transparent transaction.
+    let (_, tx) = load("v1_receiver");
+    assert_eq!(tx.version, 1);
+    assert_eq!(
+        names(&tx.extra),
+        [
+            "receiver2",
+            "pub_key",
+            "etc_tx_flags16",
+            "checksum",
+            "derivation_hint",
+            "derivation_hint"
+        ]
+    );
+    assert_eq!(verify("v1_receiver", 0, None), Ok(()));
+    assert_eq!(tx.bare_fee(), Some(10_000_000_000));
+
     let (_, tx) = load("v2_encrypted");
     assert_eq!(tx.version, 2);
     assert_eq!(
