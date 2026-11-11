@@ -104,15 +104,22 @@ fn build_and_check(version: CircuitVersion, name: &str) {
     };
     let sighash = tx.sighash(None, SIGHASH_ALL, &[]).unwrap();
     // Signed elsewhere, the bundle is as good.
+    // (From NU6.3 the note kept is created by an action of its own, which
+    // spends a note of value zero of the wallet: two actions to sign.)
     let requests = unauthorized.spend_auth_requests();
-    assert_eq!(requests.len(), 1);
-    let external = sk
-        .to_ask()
-        .randomize(&requests[0].alpha)
-        .sign(&seed(7), &sighash)
-        .to_bytes();
+    assert_eq!(requests.len(), if restricted { 2 } else { 1 });
+    let external: Vec<(usize, [u8; 64])> = requests
+        .iter()
+        .map(|request| {
+            let signature = sk
+                .to_ask()
+                .randomize(&request.alpha)
+                .sign(&seed(7), &sighash);
+            (request.index, signature.to_bytes())
+        })
+        .collect();
     let signed = unauthorized
-        .authorize(&sighash, &[], &[(requests[0].index, external)], &seed(6))
+        .authorize(&sighash, &[], &external, &seed(6))
         .unwrap()
         .to_bytes();
     let signed = BundleRef::parse(&signed).unwrap().unwrap();
