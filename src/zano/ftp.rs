@@ -4,8 +4,12 @@
 //!
 //! Both are the binary serialization of the structure, encrypted with
 //! ChaCha8 under a key derived from the secret view key. The format is not
-//! versioned and follows the wallet's C++ structures, which changed with
-//! the release that brought hard fork 6 ([`FtpFormat`]).
+//! versioned and follows the wallet's C++ structures, which changed twice
+//! ([`FtpFormat`]).
+//!
+//! The three layouts are checked against Zano's own serialization of
+//! those structures, and signing against its `construct_tx` and its
+//! verifiers (`testdata/zano_harness.cpp`).
 
 use purecrypto::zeroize::{Zeroize, Zeroizing};
 
@@ -22,12 +26,22 @@ use super::tx::{
 /// Which release of Zano's wallet a blob is laid out for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FtpFormat {
-    /// Zano 2.1.0.382 to 2.1.19.477 (hard fork 5).
+    /// Zano 2.0 and 2.1.0.382 to 2.1.7.424: sources do not name their
+    /// asset, and the signer leaves the transaction id, the derivation and
+    /// the key images of the signed blob empty.
     Legacy,
-    /// Zano 2.2 (hard forks 6 and 7): sources carry their asset id and a
-    /// gateway origin, destinations a payment id and tagged addresses.
+    /// Zano 2.1.8.428 to 2.1.19.477 (hard fork 5): sources carry their
+    /// asset id, and the signer fills the signed blob in.
+    V2_1_8,
+    /// Zano 2.2 (hard forks 6 and 7): sources also carry a gateway origin,
+    /// destinations a payment id and tagged addresses.
     #[default]
     Current,
+}
+
+impl FtpFormat {
+    /// The layouts, in the order parsing tries them: the largest first.
+    const ALL: [FtpFormat; 3] = [FtpFormat::Current, FtpFormat::V2_1_8, FtpFormat::Legacy];
 }
 
 /// One member of the ring of a source (`tx_source_entry::output_entry`).
@@ -82,9 +96,8 @@ pub struct TxSource {
     pub separately_signed_tx_complete: bool,
     /// For an HTLC input, its origin.
     pub htlc_origin: Vec<u8>,
-    /// The asset id of the real output, unblinded. The current blob format
-    /// carries it; a source parsed from a [`FtpFormat::Legacy`] blob has
-    /// `None`, which stands for the asset of the first destination when
+    /// The asset id of the real output, unblinded. A source parsed from a
+    /// [`FtpFormat::Legacy`] blob, which does not carry it, has `None`, which stands for the asset of the first destination when
     /// signing, and for the native coin when working out the fee.
     pub asset_id: Option<[u8; 32]>,
     /// Whether the source is a confidential (Zarcanum) output. Not part of
@@ -125,8 +138,10 @@ impl TxSource {
             asset_id: None,
             is_zc_input: false,
         };
-        if format == FtpFormat::Current {
+        if format != FtpFormat::Legacy {
             source.asset_id = Some(r.key()?);
+        }
+        if format == FtpFormat::Current {
             // A source that spends from a gateway address (hard fork 6
             // only) cannot be signed here.
             if r.key()? != [0u8; 32] {
@@ -150,8 +165,10 @@ impl TxSource {
         out.extend_from_slice(&self.ms_keys_count.to_le_bytes());
         out.push(u8::from(self.separately_signed_tx_complete));
         write_bytes(out, &self.htlc_origin);
-        if format == FtpFormat::Current {
+        if format != FtpFormat::Legacy {
             out.extend_from_slice(&self.asset_id.unwrap_or(super::NATIVE_COIN_ASSET_ID));
+        }
+        if format == FtpFormat::Current {
             out.extend_from_slice(&[0u8; 32]);
         }
     }
@@ -206,7 +223,7 @@ pub struct TxDest {
     /// The `tx_destination_entry_flags` (`TX_DEST_FLAG_*`).
     pub flags: u64,
     /// The payment id of the output (version 4 transactions; zero for
-    /// none). Not in a [`FtpFormat::Legacy`] blob.
+    /// none). Only in a [`FtpFormat::Current`] blob.
     pub payment_id: u64,
 }
 
@@ -214,7 +231,7 @@ impl TxDest {
     fn read(r: &mut Reader<'_>, format: FtpFormat) -> Result<Self, Error> {
         let amount = r.u64()?;
         let addr = match format {
-            FtpFormat::Legacy => r.vec()?,
+            FtpFormat::Legacy | FtpFormat::V2_1_8 => r.vec()?,
             FtpFormat::Current => {
                 // address_v: a tagged account address, or a gateway address
                 // (hard fork 6 only), which cannot be paid here.
@@ -240,7 +257,7 @@ impl TxDest {
             asset_id: r.key()?,
             flags: r.u64()?,
             payment_id: match format {
-                FtpFormat::Legacy => 0,
+                FtpFormat::Legacy | FtpFormat::V2_1_8 => 0,
                 FtpFormat::Current => r.u64()?,
             },
         })
@@ -249,7 +266,7 @@ impl TxDest {
     fn write(&self, out: &mut Vec<u8>, format: FtpFormat) {
         out.extend_from_slice(&self.amount.to_le_bytes());
         match format {
-            FtpFormat::Legacy => write_vec(out, &self.addr),
+            FtpFormat::Legacy | FtpFormat::V2_1_8 => write_vec(out, &self.addr),
             FtpFormat::Current => {
                 push_varint(out, self.addr.len() as u64);
                 for addr in &self.addr {
@@ -386,30 +403,30 @@ impl FinalizeTxParam {
     }
 }
 
-/// Parses `data` as a whole with `read`, in the current layout or else in
-/// the legacy one.
+/// Parses `data` as a whole with `read`, in the first layout that fits:
+/// the current one, then the older ones.
 fn parse<T>(
     data: &[u8],
     read: impl Fn(&mut Reader<'_>, FtpFormat) -> Result<T, Error>,
 ) -> Result<T, Error> {
-    let attempt = |format| {
+    let mut first = None;
+    let mut last = Error::UnexpectedEof;
+    for format in FtpFormat::ALL {
         let mut r = Reader::new(data);
-        let value = read(&mut r, format)?;
-        r.finish()?;
-        Ok(value)
-    };
-    match attempt(FtpFormat::Current) {
-        Ok(value) => Ok(value),
-        Err(current) => attempt(FtpFormat::Legacy).map_err(|legacy| {
-            // What this module cannot sign is reported as such, rather
-            // than as whatever the other layout makes of the bytes.
-            if current == Error::Unsupported {
-                current
-            } else {
-                legacy
+        match read(&mut r, format).and_then(|value| r.finish().map(|()| value)) {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                first.get_or_insert(error);
+                last = error;
             }
-        }),
+        }
     }
+    // What this module cannot sign is reported as such, rather than as
+    // whatever the other layouts make of the bytes.
+    Err(match first {
+        Some(Error::Unsupported) => Error::Unsupported,
+        _ => last,
+    })
 }
 
 /// Decrypts a wallet blob, or encrypts one.
@@ -421,7 +438,7 @@ fn crypt(blob: &[u8], view_secret_key: &[u8; 32]) -> Zeroizing<Vec<u8>> {
 
 impl FinalizeTxParam {
     /// Parses the plain serialization, which must take the whole of `data`:
-    /// in the current layout or, failing that, in the legacy one
+    /// in the current layout or, failing that, in the older ones
     /// ([`format`](Self::format) tells which).
     ///
     /// Fails with [`Error::Unsupported`] for a blob with a gateway source
@@ -509,7 +526,7 @@ impl FinalizedTx {
     }
 
     /// Parses the plain serialization, which must take the whole of `data`
-    /// (in either layout, as [`FinalizeTxParam::from_bytes`]).
+    /// (in any layout, as [`FinalizeTxParam::from_bytes`]).
     pub fn from_bytes(data: &[u8]) -> Result<Self, Error> {
         parse(data, Self::read)
     }

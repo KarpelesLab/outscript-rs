@@ -128,8 +128,12 @@ impl Wallet {
 
 /// Decrypts in place the body of a payment-id service attachment
 /// (`service_id` [`PAYMENT_ID_SERVICE_ID`] with the
-/// [`TX_SERVICE_ATTACHMENT_ENCRYPT_BODY`] flag), with the transaction's
+/// [`TX_SERVICE_ATTACHMENT_ENCRYPT_BODY`] flag) of a transaction of
+/// version 2 or 3, with the transaction's
 /// [`key_derivation`](Wallet::key_derivation). The same call encrypts.
+///
+/// Version 4 transactions encrypt otherwise, and by position: see
+/// `Wallet::decrypt_payload_items`.
 pub fn crypt_payment_id(derivation: &[u8; 32], body: &mut [u8]) {
     chacha8_crypt(derivation, body);
 }
@@ -137,7 +141,8 @@ pub fn crypt_payment_id(derivation: &[u8; 32], body: &mut [u8]) {
 /// The `service_id` of the service attachment that carries the payment id of
 /// an integrated address (`BC_PAYMENT_ID_SERVICE_ID`).
 pub const PAYMENT_ID_SERVICE_ID: &str = "P";
-/// Service attachment flag: the body is ChaCha8-encrypted.
+/// Service attachment flag: the body is encrypted (ChaCha8 in transactions
+/// of version 2 and 3, ChaCha20 in version 4).
 pub const TX_SERVICE_ATTACHMENT_ENCRYPT_BODY: u8 = 1 << 0;
 /// Service attachment flag: the body is deflated.
 pub const TX_SERVICE_ATTACHMENT_DEFLATE_BODY: u8 = 1 << 1;
@@ -185,10 +190,13 @@ impl Wallet {
 /// Decrypts the payment id of output `index` of a version 4 transaction
 /// (`tx_out_zarcanum::encrypted_payment_id`), given the transaction's
 /// [`key_derivation`](Wallet::key_derivation): zero means no payment id.
-/// The same call encrypts.
+/// The same call encrypts: the payment id is XORed with the second 64 bits
+/// of the hash whose first 64 bits mask the amount.
 ///
 /// The result is only meaningful for an output of the wallet the
-/// derivation is of.
+/// derivation is of. A reader takes an encrypted payment id of zero for
+/// "none" without decrypting it (`decode_output_data`), as
+/// `Wallet::scan_tx` does.
 pub fn crypt_output_payment_id(derivation: &[u8; 32], index: u64, payment_id: u64) -> u64 {
     payment_id ^ OutputSecrets::derive(derivation, index).payment_id_mask
 }
@@ -206,6 +214,8 @@ pub struct ScanResult {
     /// one, the eight bytes of the first non-zero payment id of the
     /// wallet's outputs.
     pub payment_id: Option<Vec<u8>>,
+    /// The comments of the transaction (`tx_comment`), decrypted.
+    pub comments: Vec<Vec<u8>>,
     /// For each of `outputs`, its own payment id (version 4 outputs carry
     /// one each); zero for none.
     pub output_payment_ids: Vec<u64>,
@@ -224,20 +234,21 @@ impl Wallet {
     /// Finds the outputs of `tx` that belong to the wallet, decoding the
     /// amount and asset of each — and, for the outputs of a version 4
     /// transaction, its payment id — and recovers the payment id if the
-    /// transaction carries one (`lookup_acc_outs`). Only the view key is
-    /// used.
+    /// transaction carries one (`lookup_acc_outs`). The view key is
+    /// enough; the secret spend key, if the wallet has it, only serves to
+    /// read attachments that auditors must not.
     ///
     /// A transaction without a public key, or with nothing for the wallet,
     /// gives an empty result. Confidential outputs and transparent outputs
     /// to one key are looked at; multisig and gateway outputs are not.
     ///
-    /// An encrypted payment id attachment of a version 4 transaction is
-    /// not read: hard fork 6 changed how extra entries and attachments are
-    /// encrypted (ChaCha20 under a key from a Keccak sponge that
-    /// `purecrypto` does not expose), which this module does not implement.
-    /// Such transactions carry their payment ids in the outputs.
+    /// The payment id attachment and the comments are decrypted as
+    /// [`decrypt_payload_items`](Self::decrypt_payload_items) does, with
+    /// the scheme of the transaction's version; they are left out when
+    /// the transaction says they were encrypted for someone else (its
+    /// `TxCryptoChecksum` does not match the wallet's derivation).
     pub fn scan_tx(&self, tx: &super::Transaction) -> Result<ScanResult, Error> {
-        use super::tx::{TRANSACTION_VERSION_POST_HF6, Variant};
+        use super::tx::Variant;
 
         let mut result = ScanResult::default();
         let Some(tx_pub_key) = tx.tx_pub_key() else {
@@ -252,7 +263,10 @@ impl Wallet {
                 Variant::OutZarcanum(out) => (self.scan_output(&derivation, index, out)?, 0),
                 Variant::OutZarcanumHf6(out) => (
                     self.scan_output(&derivation, index, &out.base())?,
-                    crypt_output_payment_id(&derivation, index, out.encrypted_payment_id),
+                    match out.encrypted_payment_id {
+                        0 => 0,
+                        id => crypt_output_payment_id(&derivation, index, id),
+                    },
                 ),
                 Variant::OutBare(out) => match &*out.target {
                     Variant::ToKeyTarget(target) => (
@@ -269,28 +283,30 @@ impl Wallet {
             }
         }
 
-        let attachment = tx
+        let has_payload = tx
             .extra
             .iter()
             .chain(&tx.attachment)
-            .find_map(|item| match item {
-                Variant::ServiceAttachment(a)
-                    if a.service_id == PAYMENT_ID_SERVICE_ID.as_bytes() =>
-                {
-                    Some(a)
-                }
-                _ => None,
-            });
-        let hf6 = tx.version >= TRANSACTION_VERSION_POST_HF6;
-        if let Some(attachment) = attachment {
-            let encrypted = attachment.flags & TX_SERVICE_ATTACHMENT_ENCRYPT_BODY != 0;
-            let mut body = attachment.body.clone();
-            if encrypted && !hf6 {
-                crypt_payment_id(&derivation, &mut body);
-            }
-            if !(encrypted && hf6) {
-                result.payment_id = Some(body);
-            }
+            .any(|item| matches!(item, Variant::Comment(_) | Variant::ServiceAttachment(_)));
+        if !has_payload {
+            // Nothing to decrypt: spare the derivation.
+        } else if self.payload_derivation(tx, true)?.is_some() {
+            let items = self.decrypt_payload_items(tx, true)?;
+            result.payment_id =
+                super::payload::payment_id_attachment(&items).map(|a| a.body.clone());
+            result.comments = items
+                .into_iter()
+                .filter_map(|item| match item {
+                    Variant::Comment(comment) => Some(comment),
+                    _ => None,
+                })
+                .collect();
+        } else {
+            // Encrypted for someone else: only what is in the clear.
+            let items: Vec<Variant> = tx.extra.iter().chain(&tx.attachment).cloned().collect();
+            result.payment_id = super::payload::payment_id_attachment(&items)
+                .filter(|a| a.flags & TX_SERVICE_ATTACHMENT_ENCRYPT_BODY == 0)
+                .map(|a| a.body.clone());
         }
         if result.payment_id.is_none()
             && let Some(id) = result.output_payment_ids.iter().find(|id| **id != 0)

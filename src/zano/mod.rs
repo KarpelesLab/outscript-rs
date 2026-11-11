@@ -3,8 +3,10 @@
 //!
 //! It started as a port of the Go library `KarpelesLab/zanolib` and now
 //! follows Zano's C++ sources, checked against the main network's
-//! transactions of every era. It covers what an offline signer, a deposit
-//! scanner and a verifier need:
+//! transactions of every era and against the C++ itself: what it signs,
+//! Zano's verifiers accept, and what Zano's `construct_tx` signs it
+//! verifies and scans (see [Compatibility](#compatibility)). It covers
+//! what an offline signer, a deposit scanner and a verifier need:
 //!
 //! - **Addresses** ([`Address`], [`AddressType`]): standard, integrated,
 //!   auditable and auditable integrated, with flags and payment ids.
@@ -14,7 +16,9 @@
 //!   tell whether an output belongs to the wallet and decode its amount and
 //!   asset — the native coin or any other — with the view key only and
 //!   without a heap; `Wallet::scan_tx` does a whole `Transaction`, and
-//!   recovers the payment id of the transaction and of each output.
+//!   recovers the payment id of the transaction and of each output, and
+//!   its comments; `Wallet::decrypt_payload_items` decrypts everything a
+//!   transaction encrypts for its recipient, or for its sender.
 //! - **Signing**: `Wallet::parse_ftp` reads the unsigned transaction a
 //!   view-only `simplewallet` prepares (`FinalizeTxParam`),
 //!   `Wallet::sign` builds and signs it as `construct_tx` does, and
@@ -42,8 +46,8 @@
 //!   derivation of an asset id (`AssetDescriptorBase::asset_id`), and
 //!   `Transaction::verify_asset_operation`.
 //! - **Wire formats**: `Transaction` and its `Variant`s for versions 0 to
-//!   4, the wallet blobs, ChaCha8 ([`chacha8`]) and epee portable storage
-//!   (`epee`).
+//!   4, the wallet blobs, ChaCha8 and ChaCha20 ([`chacha8`], [`chacha20`])
+//!   and epee portable storage (`epee`).
 //!
 //! The network client (`zanorpc`) and threshold signing (`zanompc`) of
 //! zanolib are not ported; `InputSigner` is the seam the latter plugs
@@ -111,8 +115,36 @@
 //! never accepted, are parsed and nothing more.
 //!
 //! The wallet blobs are not versioned and follow the wallet's C++
-//! structures, in two layouts (`FtpFormat`): that of Zano 2.1.0.382 to
-//! 2.1.19.477, and that of Zano 2.2. Parsing tells them apart.
+//! structures, in three layouts (`FtpFormat`): that of Zano 2.0 and
+//! 2.1.0.382 to 2.1.7.424, that of 2.1.8.428 to 2.1.19.477, and that of
+//! Zano 2.2. Parsing tells them apart.
+//!
+//! What a transaction encrypts for its recipient (comments, flagged
+//! service attachments, payer and receiver) is encrypted with ChaCha8 in
+//! versions 2 and 3 and, from hard fork 6 on (version 4), with ChaCha20
+//! under a key from a Keccak sponge; both are built and read.
+//!
+//! Beside the fixtures of zanolib and of the main network, the tests hold
+//! this module to Zano's C++ (2.2.3.608), through a harness linked with
+//! its libraries (`testdata/zano_harness.cpp`):
+//!
+//! - the payload encryption of both eras gives the bytes
+//!   `encrypt_payload_items` gives, and reads back what
+//!   `decrypt_payload_items` reads;
+//! - the wallet blobs of the three layouts, serialized by the C++ from the
+//!   structures of the releases that had them, parse to the same field
+//!   values and serialize back to the same bytes;
+//! - transactions of version 2, 3 and 4 signed here — confidential and
+//!   transparent inputs, the native coin and another asset, payment ids,
+//!   encrypted entries — pass `validate_tx_semantic`, the verification of
+//!   each input's signature and of the range, balance and asset surjection
+//!   proofs, and are scanned by `lookup_acc_outs` as they are here;
+//! - the same unsigned transactions signed by `construct_tx` verify and
+//!   scan here.
+//!
+//! No transaction signed here has been sent to the network, and the chain
+//! rules beyond those checks (unlock times, mixin counts, fees, sizes)
+//! are left to the caller.
 //!
 //! Where zanolib and Zano disagree, this module follows Zano:
 //!
@@ -125,7 +157,9 @@
 //!   multiplication by 8;
 //! - signing sorts the rings, shuffles the outputs when asked, copies and
 //!   encrypts the extra entries and attachments, and shows the bare native
-//!   asset id where `construct_tx` does.
+//!   asset id where `construct_tx` does;
+//! - a payment id attachment encrypted for someone else is not reported,
+//!   and an output's encrypted payment id of zero means none.
 //!
 //! What signing does not build is listed with `Wallet::sign`, what
 //! verification leaves to the chain with `Transaction::verify`.
@@ -145,8 +179,11 @@ mod crypto;
 pub mod epee;
 #[cfg(feature = "alloc")]
 mod ftp;
+mod keccak;
 #[cfg(feature = "alloc")]
 mod nlsag;
+#[cfg(feature = "alloc")]
+mod payload;
 mod scan;
 #[cfg(feature = "alloc")]
 mod schnorr;
@@ -174,7 +211,9 @@ mod tests;
 pub use address::{
     ADDRESS_FLAG_AUDITABLE, Address, AddressType, MAX_ADDRESS_LEN, MAX_PAYMENT_ID_LEN, PaymentId,
 };
-pub use chacha8::{chacha8, chacha8_crypt, chacha8_generate_key};
+pub use chacha8::{
+    chacha8, chacha8_crypt, chacha8_generate_key, chacha20, chacha20_generate_key_and_iv,
+};
 pub use crypto::{
     NATIVE_COIN_ASSET_ID, POINT_G, POINT_H, POINT_H2, POINT_U, POINT_X, derivation_hint,
     generator_h, generator_h2, generator_u, generator_x, key_image, scalar_1div8,

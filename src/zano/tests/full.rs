@@ -890,12 +890,62 @@ fn sign_current_format() {
         found.payment_id,
         Some(0x1122_3344_5566_7788u64.to_le_bytes().to_vec())
     );
-    // Entries that version 4 encrypts are not supported.
+    // Version 4 encrypts its entries with ChaCha20, the nonce counting
+    // them: the wallet the transaction is encrypted for reads them back,
+    // and so does the sender.
+    ftp.crypt_address = AccountPublicAddr::from(&w.address());
     ftp.extra.push(Variant::Comment(b"hello".to_vec()));
+    ftp.attachments = vec![Variant::ServiceAttachment(TxServiceAttachment {
+        service_id: PAYMENT_ID_SERVICE_ID.as_bytes().to_vec(),
+        body: b"payment".to_vec(),
+        flags: TX_SERVICE_ATTACHMENT_ENCRYPT_BODY,
+        ..Default::default()
+    })];
+    let signed = w.sign(&mut stream(0), &ftp, key).unwrap();
+    assert!(verify_all(&signed.tx, &ftp));
+    assert!(
+        !signed
+            .tx
+            .extra
+            .contains(&Variant::Comment(b"hello".to_vec()))
+    );
+    // The checksum goes where the first encrypted entry is.
+    assert_eq!(names(&signed.tx.attachment), ["attachment"]);
+    assert!(names(&signed.tx.extra).contains(&"checksum"));
+    let found = w.scan_tx(&signed.tx).unwrap();
+    assert_eq!(found.payment_id, Some(b"payment".to_vec()));
+    assert_eq!(found.comments, [b"hello".to_vec()]);
+    let sent = w.decrypt_payload_items(&signed.tx, false).unwrap();
+    assert!(sent.contains(&Variant::Comment(b"hello".to_vec())));
+    assert_eq!(
+        *w.payload_derivation(&signed.tx, false).unwrap().unwrap(),
+        signed.derivation
+    );
+    // An attachment to deflate is not built.
+    let Variant::ServiceAttachment(attachment) = &mut ftp.attachments[0] else {
+        panic!()
+    };
+    attachment.flags |= TX_SERVICE_ATTACHMENT_DEFLATE_BODY;
     assert_eq!(
         w.sign(&mut stream(0), &ftp, key).unwrap_err(),
         Error::Unsupported
     );
+
+    // The layout in between: sources name their asset, addresses have no
+    // tag, and the signer fills the signed blob in.
+    let mut ftp = plain.clone();
+    ftp.format = FtpFormat::V2_1_8;
+    for source in &mut ftp.sources {
+        source.asset_id = Some(NATIVE_COIN_ASSET_ID);
+    }
+    let bytes = ftp.to_bytes();
+    assert_eq!(bytes.len(), plain.to_bytes().len() + 32 * ftp.sources.len());
+    assert_eq!(FinalizeTxParam::from_bytes(&bytes).unwrap(), ftp);
+    let signed = w.sign(&mut stream(0), &ftp, key).unwrap();
+    assert_eq!(signed.tx, reference.tx);
+    assert_eq!(signed.tx_id, signed.tx.prefix_hash());
+    assert!(!signed.outs_key_images.is_empty());
+    assert_eq!(FinalizedTx::from_bytes(&signed.to_bytes()).unwrap(), signed);
 }
 
 #[test]

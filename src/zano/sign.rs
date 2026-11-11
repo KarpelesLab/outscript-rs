@@ -21,20 +21,16 @@ use super::ftp::{
     TxDest, TxSource, TxSourceOutputEntry,
 };
 use super::nlsag::generate_ring_signature;
-use super::scan::{
-    TX_SERVICE_ATTACHMENT_DEFLATE_BODY, TX_SERVICE_ATTACHMENT_ENCRYPT_ADD_PROOF,
-    TX_SERVICE_ATTACHMENT_ENCRYPT_BODY, TX_SERVICE_ATTACHMENT_ENCRYPT_BODY_ISOLATE_AUDITABLE,
-    TxOutZarcanum,
-};
+use super::payload;
+use super::scan::TxOutZarcanum;
 use super::schnorr::{
     SchnorrGenerator, generate_double_schnorr_sig, generate_vector_ug_aggregation_proof,
 };
-use super::ser::{Reader, Wire, write_vec};
+use super::ser::write_vec;
 use super::tx::{
     ClsagGgxSig, ExtraAttachmentInfo, TRANSACTION_VERSION_POST_HF4, TRANSACTION_VERSION_POST_HF5,
-    TRANSACTION_VERSION_POST_HF6, TX_FLAG_SIGNATURE_MODE_SEPARATE, Transaction, TxCryptoChecksum,
-    TxInToKey, TxInZcInput, Variant, ZcAssetSurjectionProof, ZcBalanceProof, ZcOutsRangeProof,
-    ZcSig,
+    TRANSACTION_VERSION_POST_HF6, TX_FLAG_SIGNATURE_MODE_SEPARATE, Transaction, TxInToKey,
+    TxInZcInput, Variant, ZcAssetSurjectionProof, ZcBalanceProof, ZcOutsRangeProof, ZcSig,
 };
 use super::tx_ext::{NlsagSig, TxOutZarcanumHf6};
 use super::{ADDRESS_FLAG_AUDITABLE, Error, Wallet};
@@ -104,6 +100,47 @@ pub trait InputSigner {
     /// encrypt.
     fn crypt_for_sender(&self, data: &mut [u8]) -> Result<(), Error> {
         let _ = data;
+        Err(Error::Unsupported)
+    }
+
+    /// Encrypts in place the key derivation a version 4 transaction keeps
+    /// for its sender (`encrypt_decrypt_key_derivation_for_sender`):
+    /// ChaCha20 under the key and nonce that
+    /// [`chacha20_generate_key_and_iv`](super::chacha20_generate_key_and_iv)
+    /// derives, with the domain `"ZANO_HDS_CHACHA_TX_PI_SENDR_DER\0"`,
+    /// from `8 * x * tx_public_key`.
+    ///
+    /// The default fails with [`Error::Unsupported`]: a signer that does
+    /// not implement it cannot sign a version 4 transaction that has
+    /// entries to encrypt.
+    fn crypt_derivation_for_sender(
+        &self,
+        tx_public_key: &EdwardsPoint,
+        derivation: &mut [u8; 32],
+    ) -> Result<(), Error> {
+        let _ = (tx_public_key, derivation);
+        Err(Error::Unsupported)
+    }
+
+    /// Encrypts in place the key derivation of a service attachment of a
+    /// version 4 transaction that auditors must not read
+    /// ([`TX_SERVICE_ATTACHMENT_ENCRYPT_BODY_ISOLATE_AUDITABLE`]):
+    /// ChaCha20 with the little-endian `nonce`, under the key that
+    /// [`chacha20_generate_key_and_iv`](super::chacha20_generate_key_and_iv)
+    /// derives from the secret spend key with the domain
+    /// `"ZANO_HDS_CHACHA_TX_PI_ISLT_AUDT\0"`.
+    ///
+    /// The default fails with [`Error::Unsupported`]: a signer that does
+    /// not implement it cannot sign a version 4 transaction with such an
+    /// attachment.
+    ///
+    /// [`TX_SERVICE_ATTACHMENT_ENCRYPT_BODY_ISOLATE_AUDITABLE`]: super::TX_SERVICE_ATTACHMENT_ENCRYPT_BODY_ISOLATE_AUDITABLE
+    fn crypt_isolated_for_sender(
+        &self,
+        nonce: u64,
+        derivation: &mut [u8; 32],
+    ) -> Result<(), Error> {
+        let _ = (nonce, derivation);
         Err(Error::Unsupported)
     }
 }
@@ -185,6 +222,24 @@ impl InputSigner for LocalInputSigner {
     fn crypt_for_sender(&self, data: &mut [u8]) -> Result<(), Error> {
         let key = Zeroizing::new(self.spend_secret.to_bytes());
         chacha8_crypt(&key, data);
+        Ok(())
+    }
+
+    fn crypt_derivation_for_sender(
+        &self,
+        tx_public_key: &EdwardsPoint,
+        derivation: &mut [u8; 32],
+    ) -> Result<(), Error> {
+        payload::crypt_derivation_for_sender(&self.spend_secret, tx_public_key, derivation);
+        Ok(())
+    }
+
+    fn crypt_isolated_for_sender(
+        &self,
+        nonce: u64,
+        derivation: &mut [u8; 32],
+    ) -> Result<(), Error> {
+        payload::crypt_isolated_for_sender(&self.spend_secret, nonce, derivation);
         Ok(())
     }
 }
@@ -310,63 +365,6 @@ fn update_or_add(extra: &mut Vec<Variant>, entry: Variant) {
     }
 }
 
-/// Encrypts a value through its serialization, which is the layout of the
-/// structure the reference encrypts in memory.
-fn crypt_wire<T: Wire>(value: &mut T, derivation: &[u8; 32]) -> Result<(), Error> {
-    let mut bytes = Vec::new();
-    value.write(&mut bytes);
-    chacha8_crypt(derivation, &mut bytes);
-    *value = T::read(&mut Reader::new(&bytes))?;
-    Ok(())
-}
-
-/// Encrypts in place what `encrypt_attach_visitor_legacy` encrypts of one
-/// extra or attachment entry (transactions of version 2 and 3); whether it
-/// did.
-fn encrypt_legacy_item(item: &mut Variant, derivation: &[u8; 32]) -> Result<bool, Error> {
-    match item {
-        Variant::Comment(comment) => chacha8_crypt(derivation, comment),
-        Variant::Payer(addr) | Variant::Receiver(addr) => crypt_wire(addr, derivation)?,
-        Variant::PayerOld(addr) | Variant::ReceiverOld(addr) => crypt_wire(addr, derivation)?,
-        Variant::ServiceAttachment(attachment) => {
-            if attachment.flags & TX_SERVICE_ATTACHMENT_DEFLATE_BODY != 0 {
-                // No deflate here.
-                return Err(Error::Unsupported);
-            }
-            if attachment.flags & TX_SERVICE_ATTACHMENT_ENCRYPT_BODY == 0 {
-                return Ok(false);
-            }
-            if attachment.flags & TX_SERVICE_ATTACHMENT_ENCRYPT_BODY_ISOLATE_AUDITABLE != 0 {
-                return Err(Error::Unsupported);
-            }
-            let proof =
-                (attachment.flags & TX_SERVICE_ATTACHMENT_ENCRYPT_ADD_PROOF != 0).then(|| {
-                    let mut salted = attachment.body.clone();
-                    salted.extend_from_slice(&cn_fast_hash(derivation));
-                    cn_fast_hash(&salted)
-                });
-            chacha8_crypt(derivation, &mut attachment.body);
-            attachment.security.extend(proof);
-        }
-        _ => return Ok(false),
-    }
-    Ok(true)
-}
-
-/// Whether `encrypt_payload_items_visitor` (version 4) would change this
-/// entry.
-fn needs_hf6_encryption(item: &Variant) -> bool {
-    match item {
-        Variant::Comment(_) => true,
-        Variant::ServiceAttachment(attachment) => {
-            attachment.flags
-                & (TX_SERVICE_ATTACHMENT_ENCRYPT_BODY | TX_SERVICE_ATTACHMENT_DEFLATE_BODY)
-                != 0
-        }
-        _ => false,
-    }
-}
-
 /// A uniform index below `bound` (which is not zero), by rejection.
 fn random_below(rng: &mut dyn FnMut(&mut [u8]), bound: usize) -> usize {
     let bound = bound as u64;
@@ -407,18 +405,28 @@ impl Wallet {
     ///   ([`TX_DEST_FLAG_EXPLICIT_NATIVE_ASSET_ID`]) or when every ring
     ///   member of every input does;
     /// - the extra entries and attachments of `ftp` are copied, with the
-    ///   unlock time, flags and expiration time; in versions 2 and 3,
-    ///   comments, payer and receiver entries and service attachments
-    ///   flagged for it are encrypted for `ftp.crypt_address`.
+    ///   unlock time, flags and expiration time; comments, service
+    ///   attachments flagged for it (also those auditors must not read)
+    ///   and, in versions 2 and 3, payer and receiver entries are
+    ///   encrypted for `ftp.crypt_address`: with ChaCha8 in versions 2 and
+    ///   3, with ChaCha20 in version 4 (`encrypt_payload_items`). The
+    ///   recipient reads them back with
+    ///   [`decrypt_payload_items`](Self::decrypt_payload_items). Version 4
+    ///   leaves payer and receiver entries as they are, as the reference
+    ///   does; the network refuses them from hard fork 6 on, as it does a
+    ///   comment among the attachments. As in the reference, an
+    ///   attachment (not an extra entry) that ends up with one key gets a
+    ///   key derived for it in its place, which is then neither the proof
+    ///   nor what lets the sender read an isolated body back; one with two
+    ///   keys is refused.
     ///
     /// The fee is the native coin surplus of the inputs over the outputs;
     /// every other asset must balance exactly.
     ///
     /// Not built ([`Error::Unsupported`]): multisig, HTLC and gateway
     /// inputs, outputs to several keys or to the null address, the
-    /// separate signature mode, asset operations, entries that need
-    /// deflate or the auditable-isolated encryption, and, in version 4,
-    /// any entry to encrypt.
+    /// separate signature mode, asset operations, and entries that need
+    /// deflate.
     ///
     /// Fails with [`Error::ViewOnly`] without a secret spend key, and with
     /// the errors of [`sign_with`](Self::sign_with).
@@ -586,46 +594,13 @@ impl Wallet {
 
         // Attachments, and the entries to encrypt for the recipient.
         tx.attachment = ftp.attachments.clone();
-        // d = 8 * r * V of the address attachments are encrypted for; zero
-        // if it has no usable view key.
-        let crypt_derivation = Zeroizing::new(
-            crypto::point(&ftp.crypt_address.view_key)
-                .map(|view| view.mul(&tx_secret).mul_by_cofactor().compress())
-                .unwrap_or_default(),
-        );
-        if hf6 {
-            if tx
-                .extra
-                .iter()
-                .chain(&tx.attachment)
-                .any(needs_hf6_encryption)
-            {
-                return Err(Error::Unsupported);
-            }
-        } else {
-            let mut in_attachments = false;
-            for item in &mut tx.attachment {
-                in_attachments |= encrypt_legacy_item(item, &crypt_derivation)?;
-            }
-            let mut in_extra = false;
-            for item in &mut tx.extra {
-                in_extra |= encrypt_legacy_item(item, &crypt_derivation)?;
-            }
-            if in_attachments || in_extra {
-                let mut encrypted_key_derivation = *crypt_derivation;
-                signer.crypt_for_sender(&mut encrypted_key_derivation)?;
-                let hash = cn_fast_hash(&crypt_derivation[..]);
-                let checksum = Variant::CryptoChecksum(TxCryptoChecksum {
-                    encrypted_key_derivation,
-                    derivation_hash: u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]),
-                });
-                if in_extra {
-                    tx.extra.push(checksum);
-                } else {
-                    tx.attachment.push(checksum);
-                }
-            }
-        }
+        let crypt_derivation = payload::encrypt_payload_items(
+            &mut tx,
+            &tx_secret,
+            &tx_public,
+            &ftp.crypt_address,
+            signer,
+        )?;
 
         // Outputs, shuffled if asked.
         let mut dests: Vec<&TxDest> = ftp.prepared_destinations.iter().collect();
@@ -1017,9 +992,9 @@ impl Wallet {
             .push(Variant::BalanceProof(ZcBalanceProof { dss }));
 
         // What the wallet that prepared the transaction needs back
-        // (`sign_transfer`): the key images of the outputs that are its own.
-        // A wallet of the legacy format left the id and the derivation
-        // zero, and no key images.
+        // (`sign_transfer`): the id, the derivation and the key images of
+        // the outputs that are its own. A wallet of the legacy format left
+        // them empty.
         let mut finalized = FinalizedTx {
             tx,
             tx_id: [0u8; 32],
@@ -1030,7 +1005,7 @@ impl Wallet {
             derivation: [0u8; 32],
             was_not_prepared: false,
         };
-        if ftp.format == FtpFormat::Current {
+        if ftp.format != FtpFormat::Legacy {
             finalized.tx_id = tx_id;
             finalized.derivation = *crypt_derivation;
             for (index, out) in finalized.tx.vout.iter().enumerate() {

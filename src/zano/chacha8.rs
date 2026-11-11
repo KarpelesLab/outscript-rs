@@ -1,10 +1,13 @@
-//! ChaCha8: Bernstein's original ChaCha (64-bit block counter, 64-bit nonce)
-//! reduced to 8 rounds, the stream cipher Zano uses for wallet blobs and
-//! payment ids.
+//! Bernstein's original ChaCha (64-bit block counter, 64-bit nonce): with 8
+//! rounds, the stream cipher Zano uses for wallet blobs and, before hard
+//! fork 6, for what a transaction encrypts; with 20 rounds, the one hard
+//! fork 6 encrypts the payload of a transaction with.
 
 use purecrypto::zeroize::{Zeroize, Zeroizing};
 
 use crate::cryptonote::cn_fast_hash;
+
+use super::keccak::keccak;
 
 /// `"expand 32-byte k"` as four little-endian words.
 const SIGMA: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
@@ -30,6 +33,47 @@ fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
 /// Applies the ChaCha8 keystream for `key` and `nonce` to `data` in place,
 /// starting at block 0. Encryption and decryption are the same operation.
 pub fn chacha8(key: &[u8; 32], nonce: &[u8; 8], data: &mut [u8]) {
+    chacha(4, key, nonce, data);
+}
+
+/// Applies the ChaCha20 keystream for `key` and `nonce` to `data` in place,
+/// starting at block 0 (`crypto::chacha20`: the original ChaCha20, with a
+/// 64-bit nonce, not the one of RFC 8439). Encryption and decryption are
+/// the same operation.
+pub fn chacha20(key: &[u8; 32], nonce: &[u8; 8], data: &mut [u8]) {
+    chacha(10, key, nonce, data);
+}
+
+/// The ChaCha20 key and nonce hard fork 6 derives from a secret
+/// (`chacha_generate_key_and_iv`): the first 40 bytes of a Keccak sponge
+/// of capacity 640 bits over `domain || data || index`, `domain` being one
+/// of the 32-byte `CRYPTO_HDS_CHACHA_*` strings (31 characters and a zero).
+///
+/// The nonce is used as a little-endian counter: one value per entry
+/// encrypted.
+pub fn chacha20_generate_key_and_iv(
+    domain: &[u8; 32],
+    data: &[u8; 32],
+    index: u64,
+) -> (Zeroizing<[u8; 32]>, u64) {
+    let mut input = Zeroizing::new([0u8; 72]);
+    let (head, tail) = input.split_at_mut(32);
+    head.copy_from_slice(domain);
+    let (middle, tail) = tail.split_at_mut(32);
+    middle.copy_from_slice(data);
+    tail.copy_from_slice(&index.to_le_bytes());
+    let mut out = Zeroizing::new([0u8; 40]);
+    keccak(&input[..], &mut out[..]);
+    let mut key = Zeroizing::new([0u8; 32]);
+    let mut iv = [0u8; 8];
+    let (k, n) = out.split_at(32);
+    key.copy_from_slice(k);
+    iv.copy_from_slice(n);
+    (key, u64::from_le_bytes(iv))
+}
+
+/// ChaCha with `double_rounds` double rounds.
+fn chacha(double_rounds: usize, key: &[u8; 32], nonce: &[u8; 8], data: &mut [u8]) {
     let mut state = [0u32; 16];
     state[..4].copy_from_slice(&SIGMA);
     for (word, chunk) in state[4..12].iter_mut().zip(key.as_chunks::<4>().0) {
@@ -42,7 +86,7 @@ pub fn chacha8(key: &[u8; 32], nonce: &[u8; 8], data: &mut [u8]) {
 
     for block in data.chunks_mut(64) {
         let mut x = state;
-        for _ in 0..4 {
+        for _ in 0..double_rounds {
             quarter_round(&mut x, 0, 4, 8, 12);
             quarter_round(&mut x, 1, 5, 9, 13);
             quarter_round(&mut x, 2, 6, 10, 14);
