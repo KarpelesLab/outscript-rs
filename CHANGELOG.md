@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/KarpelesLab/outscript-rs/compare/v0.2.8...v0.3.0) - 2026-11-11
+
+### Other
+
+- compcol's embed::flate in place of minizlib, which only re-exports it
+- a late transaction of version 1, the fetch script reads keys not to be mixed
+- transactions of the chain of hard fork 6 without 7, and what a daemon confirms
+- verify separately signed transactions
+- the reward of an oversized block, on block 3 832 995
+- blocks of the main network and the stakes of its first blocks
+- blocks, block reward, stake kernel, getrandom_outs3 replies, daemon tools
+- multisig as in the reference wallet (experimental)
+- the files of the reference wallet's cold signing
+- cn_slow_hash (CryptoNight v0), the key derivation of the reference wallet
+- the circuit build test signs both actions of a restricted bundle
+- any transparent input, external signing, change, coinbase
+- coinbase inputs, block subsidy and funding streams of mainnet
+- bundles without cross-address transfers as ZIP 326 has them
+- TEX addresses (ZIP 320)
+- P2SH and bare multisig, P2PK and custom scriptSigs, external signatures
+- tests against the compiled C++ (payload encryption, wallet blobs, signing both ways)
+- payload encryption of hard fork 6, decryption of both eras, the 2.1.8 wallet blob layout
+- no id, signature or encoding for a transaction out of range
+- sign refuses a transaction without a chain id
+- Document version 6 transactions, the unified builder and the wider Monero and Zano coverage
+- version 6 transactions (ZIP 229), parsed, digested and built
+- the Ironwood pool (notes of ZIP 2005, flags, bundles, builder)
+- Fix the Monero word lists on Windows checkouts
+- mainnet fixtures of every era, ported proof tests, multi-asset transfers
+- current-chain formats, full transaction verification, construct_tx alignment
+- weights, fees and decoy selection as the reference wallet
+- scan the whole chain history, more real-chain fixtures
+- mnemonics in the eleven other languages of the reference wallet
+- verify every historical signature and proof type, batch range proofs
+- documentation of threads, test lock, batch count
+- no blanket dead_code allowance in the circuit
+- ZIP-316 Revision 2 unified encodings
+- incremental witnesses, batched trial decryption
+- batch validation of bundles, mainnet fixtures after NU6.2
+- circuit version of a consensus branch or height
+- spend authorization signatures made elsewhere
+- multithreaded key generation and proving, shared subexpressions
+- the Sapling fields of v4 transactions, module docs
+- reference checks of depth-32 witnesses and of zivks encodings
+- builder change, dummies, padding, shuffle and external signing
+- batched verification of signatures and proofs, verify_bundle
+- witnesses in zcashd's IncrementalWitness format
+- batched trial decryption, wipe key agreement secrets
+- cite the reference's bundle versions, fix doc links
+- one builder for transparent, Sapling and Orchard parts
+- strict compact sizes, typed bundle views, ZIP-317 fee
+- run the slow tests in release, with the Sapling parameters
+
 ## [0.2.8](https://github.com/KarpelesLab/outscript-rs/compare/v0.2.7...v0.2.8) - 2026-11-10
 
 ### Other
