@@ -4,12 +4,48 @@
 //!
 //! A [`Builder`] collects spends and outputs. [`Builder::build`] pairs
 //! them into actions (padding with dummy spends and outputs of value zero,
-//! to at least two actions, as the reference wallet does), encrypts the
-//! new notes, and proves the bundle. The result, an
-//! [`UnauthorizedBundle`], serializes with zeroed signatures into the
-//! `orchard` field of a [`ZcashTx`](crate::zcashtx::ZcashTx), which gives
-//! the ZIP-244 signature hash; [`UnauthorizedBundle::apply_signatures`]
-//! then signs every action and the bundle.
+//! to at least two actions unless the [`BundleType`] says otherwise, as
+//! the reference wallet does), encrypts the new notes, and proves the
+//! bundle. The result, an [`UnauthorizedBundle`], serializes with zeroed
+//! signatures into the `orchard` field of a
+//! [`ZcashTx`](crate::zcashtx::ZcashTx), which gives the ZIP-244 signature
+//! hash; [`UnauthorizedBundle::apply_signatures`] then signs every action
+//! and the bundle.
+//!
+//! # Bundles without cross-address transfers
+//!
+//! From NU6.3 every action of the Orchard pool, and every action of an
+//! Ironwood bundle whose flags clear `enableCrossAddress`, must create its
+//! note at the address of the note it spends (ZIP 2006). Such a bundle is
+//! built as ZIP 326 specifies and as the reference builder (`orchard`
+//! 0.16.0) does, with actions of two kinds that never mix:
+//!
+//! - a *spend action* spends a real note and creates a note of value zero
+//!   at the address of the note spent, whose ciphertext is random bytes
+//!   and not an encryption (which whoever holds the incoming viewing key
+//!   of that address could decrypt, in the very action that carries the
+//!   nullifier of the spend: the spend would be linked to the address);
+//! - an *output action* creates a note that carries value at an address of
+//!   the wallet ([`Builder::add_change_output`]: change, ordinarily at an
+//!   internal address), and spends a note of value zero made up at that
+//!   address under the wallet's own full viewing key. That spend is
+//!   authorized like a real one, with the spend authorizing key of the
+//!   wallet (it is listed by
+//!   [`UnauthorizedBundle::spend_auth_requests`]).
+//!
+//! The value that leaves such a bundle does so through its value balance.
+//! A bundle has therefore as many actions as it has spends *plus* outputs,
+//! not the larger of the two: [`Builder::num_actions`] tells, for the fee.
+//! [`Builder::add_output`] to an address of a key that spends in the same
+//! bundle is taken as a change output; to any other address it cannot be
+//! built ([`BuildError::CrossAddressDisabled`]). The one difference with
+//! the reference is that it randomizes the ciphertext of the note of value
+//! zero of a spend action only when the note spent is at an external
+//! address, where ZIP 326 says it must be random: here it always is.
+//!
+//! In a bundle with cross-address transfers (the Orchard pool before
+//! NU6.3, the Ironwood pool ordinarily) spends and outputs share actions,
+//! shuffled independently, and a change output is an output like another.
 //!
 //! # Signing elsewhere
 //!
@@ -50,8 +86,84 @@ use super::tree::MerklePath;
 use super::value::{ValueCommitment, binding_signing_key};
 use super::{Fp, Fq, halo2};
 
-/// The minimum number of actions of a bundle the builder makes.
-const MIN_ACTIONS: usize = 2;
+/// The number of actions a bundle is padded to unless its [`BundleType`]
+/// says otherwise.
+pub const DEFAULT_MIN_ACTIONS: u8 = 2;
+
+/// How a bundle is completed with dummy actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleType {
+    /// The bundle of an ordinary transaction, padded to at least
+    /// `pad_to_minimum` actions when it has any (and to one, the least a
+    /// bundle can have, for a minimum of zero).
+    Transactional {
+        /// The least number of actions: [`DEFAULT_MIN_ACTIONS`]
+        /// ordinarily, so that the number of actions does not tell a
+        /// payment from a transfer. With 1 the bundle has exactly the
+        /// actions asked for, and their number reveals the shape of the
+        /// transaction: for transactions whose shape is public anyway,
+        /// such as the migration of a pool, whose value balances show the
+        /// transfer.
+        pad_to_minimum: u8,
+    },
+    /// The bundle of a coinbase transaction: its flags must disable
+    /// spends, it has one action per output, each spending a dummy note,
+    /// and no padding.
+    Coinbase,
+}
+
+impl BundleType {
+    /// Padded to [`DEFAULT_MIN_ACTIONS`] actions.
+    pub const DEFAULT: BundleType = BundleType::Transactional {
+        pad_to_minimum: DEFAULT_MIN_ACTIONS,
+    };
+    /// Not padded: exactly the actions asked for.
+    pub const UNPADDED: BundleType = BundleType::Transactional { pad_to_minimum: 1 };
+
+    /// The number of actions of a bundle of this type with the given
+    /// flags and numbers of spends and of outputs (change included), under
+    /// a circuit that has the cross-address restriction or not; 0 for no
+    /// bundle at all.
+    pub fn num_actions(
+        &self,
+        restricted: bool,
+        flags: Flags,
+        spends: usize,
+        outputs: usize,
+    ) -> Result<usize, BuildError> {
+        if !flags.spends_enabled() && spends > 0 {
+            return Err(BuildError::SpendsDisabled);
+        }
+        if !flags.outputs_enabled() && outputs > 0 {
+            return Err(BuildError::OutputsDisabled);
+        }
+        if restricted && !flags.spends_enabled() && outputs > 0 {
+            return Err(BuildError::BundleTypeNotSatisfiable);
+        }
+        match self {
+            BundleType::Transactional { pad_to_minimum } => {
+                let requested = if restricted {
+                    spends
+                        .checked_add(outputs)
+                        .ok_or(BuildError::ValueOverflow)?
+                } else {
+                    spends.max(outputs)
+                };
+                Ok(if requested == 0 {
+                    0
+                } else {
+                    requested.max(*pad_to_minimum as usize)
+                })
+            }
+            BundleType::Coinbase => {
+                if flags.spends_enabled() || spends > 0 {
+                    return Err(BuildError::BundleTypeNotSatisfiable);
+                }
+                Ok(outputs)
+            }
+        }
+    }
+}
 
 /// Errors of the bundle builder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +200,11 @@ pub enum BuildError {
     /// not exist, that the builder signs itself (a dummy spend), or that
     /// has another signature already.
     UnexpectedSignature,
+    /// The bundle cannot be built as its [`BundleType`] and flags say: a
+    /// coinbase bundle whose flags enable spends or that has spends, or
+    /// outputs in a bundle with neither spends nor cross-address
+    /// transfers (the Orchard pool in a coinbase transaction from NU6.3).
+    BundleTypeNotSatisfiable,
 }
 
 impl core::fmt::Display for BuildError {
@@ -105,6 +222,7 @@ impl core::fmt::Display for BuildError {
             BuildError::Proof(e) => return write!(f, "proof creation failed: {e}"),
             BuildError::InvalidSignature => "invalid spend authorization signature",
             BuildError::UnexpectedSignature => "signature for an action that takes none",
+            BuildError::BundleTypeNotSatisfiable => "bundle type not satisfiable",
         })
     }
 }
@@ -225,18 +343,24 @@ impl SpendInfo {
         let recipient = fvk.address_at(0u32, Scope::External);
         let rho = Nullifier::from_fp(rng.base());
         let note = rng.note(recipient, 0, rho, note_version);
-        let position = u32::from_le_bytes(rng.bytes());
-        let mut auth_path = [Fp::ZERO; 32];
-        for node in auth_path.iter_mut() {
-            *node = rng.base();
-        }
         SpendInfo {
             dummy_sk: Some(sk),
             fvk,
             scope: Scope::External,
             note,
-            merkle_path: MerklePath::from_parts(position, auth_path),
+            merkle_path: Self::dummy_path(rng),
         }
+    }
+
+    /// A random Merkle path, for a note of value zero, whose path is not
+    /// checked.
+    fn dummy_path(rng: &mut Random) -> MerklePath {
+        let position = u32::from_le_bytes(rng.bytes());
+        let mut auth_path = [Fp::ZERO; 32];
+        for node in auth_path.iter_mut() {
+            *node = rng.base();
+        }
+        MerklePath::from_parts(position, auth_path)
     }
 }
 
@@ -247,6 +371,17 @@ struct OutputInfo {
     recipient: Address,
     value: u64,
     memo: [u8; MEMO_SIZE],
+    /// The ciphertext of the note is random bytes: for the note of value
+    /// zero of a spend action, that nobody must be able to read.
+    randomized: bool,
+}
+
+/// An output of the wallet itself, and the key that owns its address.
+#[derive(Clone)]
+struct ChangeInfo {
+    output: OutputInfo,
+    fvk: FullViewingKey,
+    scope: Scope,
 }
 
 impl OutputInfo {
@@ -258,6 +393,16 @@ impl OutputInfo {
             recipient,
             value: 0,
             memo: [0u8; MEMO_SIZE],
+            randomized: false,
+        }
+    }
+
+    /// The output of value zero of a spend action, at the address of the
+    /// note spent, with a random ciphertext.
+    fn fabricated_for_spend(recipient: Address) -> Self {
+        OutputInfo {
+            randomized: true,
+            ..Self::zero(recipient)
         }
     }
 
@@ -287,6 +432,8 @@ pub struct Builder {
     note_version: NoteVersion,
     spends: Vec<SpendInfo>,
     outputs: Vec<OutputInfo>,
+    changes: Vec<ChangeInfo>,
+    bundle_type: BundleType,
 }
 
 impl Builder {
@@ -307,6 +454,8 @@ impl Builder {
             note_version: NoteVersion::V2,
             spends: Vec::new(),
             outputs: Vec::new(),
+            changes: Vec::new(),
+            bundle_type: BundleType::DEFAULT,
         }
     }
 
@@ -330,13 +479,88 @@ impl Builder {
             note_version: NoteVersion::V3,
             spends: Vec::new(),
             outputs: Vec::new(),
+            changes: Vec::new(),
+            bundle_type: BundleType::DEFAULT,
         }
     }
 
     /// Whether every action must create its note at the address of the
-    /// note it spends.
-    fn restricted(&self) -> bool {
+    /// note it spends (see the [module documentation](self)): under the
+    /// circuit of NU6.3, unless the flags enable cross-address transfers,
+    /// which only those of an Ironwood bundle can.
+    pub fn restricted(&self) -> bool {
         self.version.supports_cross_address_restriction() && !self.flags.cross_address_enabled()
+    }
+
+    /// How the bundle is padded: [`BundleType::DEFAULT`] unless set.
+    pub fn bundle_type(&self) -> BundleType {
+        self.bundle_type
+    }
+
+    /// Chooses how the bundle is padded: [`BundleType::UNPADDED`] for a
+    /// bundle of exactly the actions asked for, [`BundleType::Coinbase`]
+    /// for the bundle of a coinbase transaction (whose flags must disable
+    /// spends: [`BuildError::BundleTypeNotSatisfiable`] when building
+    /// otherwise).
+    pub fn set_bundle_type(&mut self, bundle_type: BundleType) {
+        self.bundle_type = bundle_type;
+    }
+
+    /// The outputs that [`build`](Self::build) will treat as plain ones
+    /// and as change: in a restricted bundle, an output added with
+    /// [`add_output`](Self::add_output) to an address of a key that spends
+    /// here is change.
+    fn split_outputs(&self) -> (usize, usize) {
+        if !self.restricted() {
+            return (self.outputs.len() + self.changes.len(), 0);
+        }
+        let own = self
+            .outputs
+            .iter()
+            .filter(|output| self.owner_of(&output.recipient).is_some())
+            .count();
+        (self.outputs.len() - own, self.changes.len() + own)
+    }
+
+    /// The key spending in this bundle that owns `address`.
+    fn owner_of(&self, address: &Address) -> Option<(FullViewingKey, Scope)> {
+        self.spends.iter().find_map(|spend| {
+            spend
+                .fvk
+                .scope_for_address(address)
+                .map(|scope| (spend.fvk, scope))
+        })
+    }
+
+    /// The number of actions the bundle will have as it stands: what the
+    /// ZIP-317 fee counts. In a bundle with cross-address transfers, the
+    /// larger of the numbers of spends and of outputs; in one without,
+    /// their sum; padded as the [`BundleType`] says. An error if the
+    /// bundle cannot be built ([`BuildError::CrossAddressDisabled`] for an
+    /// output that would need a cross-address transfer).
+    pub fn num_actions(&self) -> Result<usize, BuildError> {
+        self.num_actions_with(0)
+    }
+
+    /// The number of actions the bundle would have with `extra` more
+    /// outputs of the wallet itself ([`add_change_output`](Self::add_change_output)):
+    /// see [`num_actions`](Self::num_actions).
+    pub fn num_actions_with(&self, extra: usize) -> Result<usize, BuildError> {
+        let (plain, changes) = self.split_outputs();
+        let changes = changes + extra;
+        if self.restricted() && plain > 0 {
+            return Err(if self.flags.spends_enabled() {
+                BuildError::CrossAddressDisabled
+            } else {
+                BuildError::BundleTypeNotSatisfiable
+            });
+        }
+        self.bundle_type.num_actions(
+            self.restricted(),
+            self.flags,
+            self.spends.len(),
+            plain + changes,
+        )
     }
 
     /// Adds a note to spend: `note`, owned by `fvk`, at `merkle_path` in
@@ -388,6 +612,53 @@ impl Builder {
             recipient,
             value,
             memo,
+            randomized: false,
+        });
+        Ok(())
+    }
+
+    /// Adds a note the wallet creates for itself, change ordinarily:
+    /// `value` zatoshi to `recipient`, an address of `fvk`
+    /// ([`BuildError::WrongKey`] otherwise; for change, the internal
+    /// address `fvk.address_at(0, Scope::Internal)`, which is never
+    /// published, with the internal outgoing viewing key or none).
+    ///
+    /// This is the only way to keep value in a bundle without
+    /// cross-address transfers (the Orchard pool from NU6.3): the note is
+    /// created by an action that spends a note of value zero made up at
+    /// the same address, which the wallet authorizes with the spend
+    /// authorizing key of `fvk` as it does its real spends (see the
+    /// [module documentation](self)). It needs spends to be enabled
+    /// ([`BuildError::SpendsDisabled`]). In a bundle with cross-address
+    /// transfers this is [`add_output`](Self::add_output), with the check
+    /// that the wallet owns the address.
+    pub fn add_change_output(
+        &mut self,
+        fvk: &FullViewingKey,
+        ovk: Option<OutgoingViewingKey>,
+        recipient: Address,
+        value: u64,
+        memo: [u8; MEMO_SIZE],
+    ) -> Result<(), BuildError> {
+        if !self.flags.outputs_enabled() {
+            return Err(BuildError::OutputsDisabled);
+        }
+        if self.restricted() && !self.flags.spends_enabled() {
+            return Err(BuildError::SpendsDisabled);
+        }
+        let scope = fvk
+            .scope_for_address(&recipient)
+            .ok_or(BuildError::WrongKey)?;
+        self.changes.push(ChangeInfo {
+            output: OutputInfo {
+                ovk,
+                recipient,
+                value,
+                memo,
+                randomized: false,
+            },
+            fvk: *fvk,
+            scope,
         });
         Ok(())
     }
@@ -396,35 +667,63 @@ impl Builder {
     /// outputs, in zatoshi (positive when value leaves the pool).
     pub fn value_balance(&self) -> Result<i64, BuildError> {
         let spent: i128 = self.spends.iter().map(|s| s.note.value() as i128).sum();
-        let output: i128 = self.outputs.iter().map(|o| o.value as i128).sum();
+        let output: i128 = self
+            .outputs
+            .iter()
+            .chain(self.changes.iter().map(|change| &change.output))
+            .map(|o| o.value as i128)
+            .sum();
         i64::try_from(spent - output).map_err(|_| BuildError::ValueOverflow)
     }
 
     /// Pairs the spends and outputs into actions, padding with dummies.
     fn pair(self, rng: &mut Random) -> Result<Vec<(SpendInfo, OutputInfo)>, BuildError> {
         let restricted = self.restricted();
+        let num_actions = self.num_actions()?;
+        let owners: Vec<Option<(FullViewingKey, Scope)>> = self
+            .outputs
+            .iter()
+            .map(|output| self.owner_of(&output.recipient))
+            .collect();
         let Builder {
             note_version,
             mut spends,
             mut outputs,
+            mut changes,
             ..
         } = self;
         if restricted {
-            // Each output goes with a spend from its address; a spend
-            // without one gets an output of value zero to its own address.
-            let mut actions = Vec::with_capacity(spends.len().max(MIN_ACTIONS));
+            // Every action creates its note at the address of the note it
+            // spends, so the pairs are made on purpose: a spend with a
+            // note of value zero at its own address, a note the wallet
+            // keeps with a spend of value zero the wallet controls at the
+            // address of that note, a dummy spend with a note of value
+            // zero at its own address. Only whole pairs are shuffled.
+            for (output, owner) in outputs.into_iter().zip(owners) {
+                // `num_actions` refused the outputs of other owners
+                let (fvk, scope) = owner.ok_or(BuildError::CrossAddressDisabled)?;
+                changes.push(ChangeInfo { output, fvk, scope });
+            }
+            let mut actions = Vec::with_capacity(num_actions);
             for spend in spends {
-                let recipient = spend.note.recipient();
-                let output = match outputs.iter().position(|o| o.recipient == recipient) {
-                    Some(i) => outputs.swap_remove(i),
-                    None => OutputInfo::zero(recipient),
+                let output = OutputInfo::fabricated_for_spend(spend.note.recipient());
+                actions.push((spend, output));
+            }
+            for ChangeInfo { output, fvk, scope } in changes {
+                let rho = Nullifier::from_fp(rng.base());
+                let note = rng.note(output.recipient, 0, rho, note_version);
+                let spend = SpendInfo {
+                    // the wallet controls this spend: it is signed as the
+                    // real ones are, by the spend authorizing key of `fvk`
+                    dummy_sk: None,
+                    fvk,
+                    scope,
+                    note,
+                    merkle_path: SpendInfo::dummy_path(rng),
                 };
                 actions.push((spend, output));
             }
-            if !outputs.is_empty() {
-                return Err(BuildError::CrossAddressDisabled);
-            }
-            while actions.len() < MIN_ACTIONS {
+            while actions.len() < num_actions {
                 let spend = SpendInfo::dummy(rng, note_version);
                 let output = OutputInfo::zero(spend.note.recipient());
                 actions.push((spend, output));
@@ -432,7 +731,7 @@ impl Builder {
             rng.shuffle(&mut actions);
             Ok(actions)
         } else {
-            let num_actions = spends.len().max(outputs.len()).max(MIN_ACTIONS);
+            outputs.extend(changes.into_iter().map(|change| change.output));
             // Pair up the spends and outputs, extending with dummy values
             // as necessary, in an order that reveals nothing.
             while spends.len() < num_actions {
@@ -495,7 +794,12 @@ impl Builder {
 
             let note = rng.note(output.recipient, output.value, nf_old, note_version);
             let cmx = note.cmx();
-            let encrypted = encrypt_note(&note, &output.memo);
+            let mut encrypted = encrypt_note(&note, &output.memo);
+            if output.randomized {
+                // never in place of the ciphertext of a note with a value
+                debug_assert_eq!(output.value, 0);
+                encrypted.enc_ciphertext = rng.bytes();
+            }
             let out_ciphertext = match &output.ovk {
                 Some(ovk) => encrypt_outgoing(&note, ovk, &cv_net, &encrypted.ephemeral_key),
                 None => encrypt_outgoing_unrecoverable(&rng.bytes()),
@@ -766,11 +1070,18 @@ mod tests {
 
         for version in CircuitVersion::ALL {
             let restricted = version.supports_cross_address_restriction();
+            if restricted {
+                // see `restricted_bundles`
+                continue;
+            }
             let mut builder = Builder::new(version, Flags::ENABLED, anchor);
             builder.add_spend(&fvk, note, path).unwrap();
-            let to = if restricted { sender } else { recipient };
-            builder.add_output(None, to, 60_000, NO_MEMO).unwrap();
+            assert!(!builder.restricted());
+            builder
+                .add_output(None, recipient, 60_000, NO_MEMO)
+                .unwrap();
             assert_eq!(builder.value_balance(), Ok(10_000));
+            assert_eq!(builder.num_actions(), Ok(2));
             // only the full viewing key was needed so far
             let unauthorized = builder
                 .build_with(&seed(5), |circuits, instances, _| {
@@ -980,6 +1291,306 @@ mod tests {
             }
             assert_eq!(found, 60_000);
         }
+    }
+
+    /// The notes `ivk` reads in a bundle: their values.
+    fn read(bundle: &Bundle, ivk: &crate::orchard::keys::IncomingViewingKey) -> Vec<u64> {
+        use crate::orchard::note_encryption::try_note_decryption_versioned;
+        let mut found: Vec<u64> = bundle
+            .actions
+            .iter()
+            .filter_map(|action| {
+                [NoteVersion::V2, NoteVersion::V3]
+                    .into_iter()
+                    .find_map(|v| {
+                        try_note_decryption_versioned(
+                            v,
+                            ivk,
+                            &action.output(),
+                            &action.enc_ciphertext,
+                        )
+                    })
+            })
+            .map(|(note, _)| note.value())
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Bundles without cross-address transfers (the Orchard pool from
+    /// NU6.3, an Ironwood bundle with the flag cleared), as ZIP 326 has
+    /// them: spend actions and output actions.
+    #[test]
+    fn restricted_bundles() {
+        let sk = SpendingKey::from_bytes(seed(1)).unwrap();
+        let fvk = sk.to_fvk();
+        let sender = fvk.address_at(0u32, Scope::External);
+        let change = fvk.address_at(0u32, Scope::Internal);
+        let other = SpendingKey::from_bytes(seed(2)).unwrap().to_fvk();
+        let recipient = other.address_at(3u32, Scope::External);
+        let rho = Nullifier::from_fp(Fp::from_uniform_bytes(&seed(3)));
+        let sighash = seed::<32>(6);
+        let external = fvk.to_ivk(Scope::External);
+        let internal = fvk.to_ivk(Scope::Internal);
+
+        for ironwood in [false, true] {
+            let version = if ironwood {
+                NoteVersion::V3
+            } else {
+                NoteVersion::V2
+            };
+            let note = Note::from_parts_versioned(sender, 70_000, rho, seed(4), version).unwrap();
+            let leaves = [Fp::from_u64(5), note.cmx().to_fp()];
+            let anchor = tree::root(&leaves).unwrap();
+            let path = tree::witness(&leaves, 1).unwrap();
+            let new = || {
+                if ironwood {
+                    Builder::new_ironwood(Flags::IRONWOOD_ENABLED.with_cross_address(false), anchor)
+                } else {
+                    Builder::new(CircuitVersion::PostNu6_3, Flags::ENABLED, anchor)
+                }
+            };
+            let build = |builder: Builder, actions: usize| {
+                assert_eq!(builder.num_actions(), Ok(actions));
+                builder
+                    .build_with(&seed(5), |circuits, instances, _| {
+                        assert_eq!(circuits.len(), actions);
+                        assert!(instances.iter().all(|i| i.disable_cross_address));
+                        Ok(Vec::new())
+                    })
+                    .unwrap()
+            };
+
+            // a spend alone: its action, and one of padding. The note of
+            // value zero at the address spent from is not readable.
+            let mut builder = new();
+            assert!(builder.restricted());
+            assert_eq!(builder.num_actions(), Ok(0));
+            builder.add_spend(&fvk, note, path).unwrap();
+            assert_eq!(builder.value_balance(), Ok(70_000));
+            let unauthorized = build(builder, 2);
+            assert_eq!(unauthorized.spend_auth_requests().len(), 1);
+            let signed = unauthorized
+                .apply_signatures(&sighash, &[sk.to_ask()], &seed(9))
+                .unwrap();
+            assert_eq!(read(&signed, &external), [0u64; 0]);
+            assert_eq!(read(&signed, &internal), [0u64; 0]);
+
+            // unpadded: the one action
+            let mut builder = new();
+            builder.set_bundle_type(BundleType::UNPADDED);
+            assert_eq!(builder.bundle_type(), BundleType::UNPADDED);
+            builder.add_spend(&fvk, note, path).unwrap();
+            let unauthorized = build(builder, 1);
+            assert_eq!(unauthorized.bundle().actions.len(), 1);
+
+            // a spend and change: two actions, both signed by the wallet;
+            // only the change is readable, by the internal key
+            let mut builder = new();
+            builder.add_spend(&fvk, note, path).unwrap();
+            builder
+                .add_change_output(
+                    &fvk,
+                    Some(fvk.to_ovk(Scope::Internal)),
+                    change,
+                    60_000,
+                    NO_MEMO,
+                )
+                .unwrap();
+            assert_eq!(builder.value_balance(), Ok(10_000));
+            let unauthorized = build(builder, 2);
+            let requests = unauthorized.spend_auth_requests();
+            assert_eq!(requests.len(), 2);
+            assert!(requests.iter().all(|r| r.ak == fvk.ak().to_bytes()));
+            // without the key of the wallet neither action is signed
+            assert_eq!(
+                unauthorized
+                    .authorize(&sighash, &[other_ask()], &[], &seed(9))
+                    .err(),
+                Some(BuildError::MissingSigningKey)
+            );
+            // signed elsewhere, both
+            let signatures: Vec<(usize, [u8; 64])> = requests
+                .iter()
+                .map(|r| {
+                    let sig = sk.to_ask().randomize(&r.alpha).sign(&seed(7), &sighash);
+                    (r.index, sig.to_bytes())
+                })
+                .collect();
+            let signed = unauthorized
+                .authorize(&sighash, &[], &signatures, &seed(9))
+                .unwrap();
+            let bytes = signed.to_bytes();
+            let parsed = if ironwood {
+                BundleRef::parse_ironwood(&bytes)
+            } else {
+                BundleRef::parse(&bytes)
+            }
+            .unwrap()
+            .unwrap();
+            assert_eq!(parsed.verify_signatures(&sighash), Ok(()));
+            assert_eq!(parsed.value_balance(), 10_000);
+            assert_eq!(read(&signed, &external), [0u64; 0]);
+            assert_eq!(read(&signed, &internal), [60_000]);
+            // the change is recovered with the internal outgoing key too
+            let ovk = fvk.to_ovk(Scope::Internal);
+            let recovered = signed
+                .actions
+                .iter()
+                .filter(|action| {
+                    crate::orchard::note_encryption::try_output_recovery_with_ovk_versioned(
+                        version,
+                        &ovk,
+                        &action.cv,
+                        &action.output(),
+                        &action.enc_ciphertext,
+                        &action.out_ciphertext,
+                    )
+                    .is_some()
+                })
+                .count();
+            assert_eq!(recovered, 1);
+
+            // an output to an address of a key spending here is change
+            // (three actions: the spend, and the two notes kept)
+            let mut builder = new();
+            builder.add_spend(&fvk, note, path).unwrap();
+            builder.add_output(None, sender, 20_000, NO_MEMO).unwrap();
+            builder.add_output(None, change, 30_000, NO_MEMO).unwrap();
+            let signed = build(builder, 3)
+                .apply_signatures(&sighash, &[sk.to_ask()], &seed(9))
+                .unwrap();
+            assert_eq!(read(&signed, &external), [20_000]);
+            assert_eq!(read(&signed, &internal), [30_000]);
+
+            // to any other address it is a cross-address transfer
+            let mut builder = new();
+            builder.add_spend(&fvk, note, path).unwrap();
+            builder
+                .add_output(None, recipient, 60_000, NO_MEMO)
+                .unwrap();
+            assert_eq!(builder.num_actions(), Err(BuildError::CrossAddressDisabled));
+            assert_eq!(
+                builder.build_with(&seed(5), |_, _, _| Ok(Vec::new())).err(),
+                Some(BuildError::CrossAddressDisabled)
+            );
+            // and change is at an address of the key given
+            let mut builder = new();
+            assert_eq!(
+                builder.add_change_output(&fvk, None, recipient, 1, NO_MEMO),
+                Err(BuildError::WrongKey)
+            );
+            // change alone (no spend of the pool): value enters the
+            // bundle, which only the transaction can forbid
+            builder
+                .add_change_output(&fvk, None, change, 5, NO_MEMO)
+                .unwrap();
+            assert_eq!(builder.value_balance(), Ok(-5));
+            let unauthorized = build(builder, 2);
+            assert_eq!(unauthorized.spend_auth_requests().len(), 1);
+
+            // a coinbase bundle cannot be restricted
+            let mut builder = if ironwood {
+                Builder::new_ironwood(Flags::from_parts(false, true), anchor)
+            } else {
+                Builder::new(
+                    CircuitVersion::PostNu6_3,
+                    Flags::from_parts(false, true),
+                    anchor,
+                )
+            };
+            builder.set_bundle_type(BundleType::Coinbase);
+            assert_eq!(
+                builder.add_change_output(&fvk, None, change, 5, NO_MEMO),
+                Err(BuildError::SpendsDisabled)
+            );
+            builder.add_output(None, recipient, 5, NO_MEMO).unwrap();
+            assert_eq!(
+                builder.num_actions(),
+                Err(BuildError::BundleTypeNotSatisfiable)
+            );
+        }
+    }
+
+    /// Bundle types where cross-address transfers are allowed: padding,
+    /// none, and coinbase.
+    #[test]
+    fn bundle_types() {
+        let fvk = SpendingKey::from_bytes(seed(1)).unwrap().to_fvk();
+        let recipient = fvk.address_at(7u32, Scope::External);
+        let anchor = Fp::from_u64(9);
+        let sighash = seed::<32>(6);
+        let coinbase_flags = Flags::from_parts(false, true).with_cross_address(true);
+        for (bundle_type, flags, outputs, actions) in [
+            (BundleType::DEFAULT, Flags::IRONWOOD_ENABLED, 1, 2),
+            (BundleType::DEFAULT, Flags::IRONWOOD_ENABLED, 3, 3),
+            (BundleType::UNPADDED, Flags::IRONWOOD_ENABLED, 1, 1),
+            (
+                BundleType::Transactional { pad_to_minimum: 0 },
+                Flags::IRONWOOD_ENABLED,
+                1,
+                1,
+            ),
+            (
+                BundleType::Transactional { pad_to_minimum: 4 },
+                Flags::IRONWOOD_ENABLED,
+                1,
+                4,
+            ),
+            (BundleType::Coinbase, coinbase_flags, 1, 1),
+            (BundleType::Coinbase, coinbase_flags, 3, 3),
+        ] {
+            let mut builder = Builder::new_ironwood(flags, anchor);
+            builder.set_bundle_type(bundle_type);
+            assert_eq!(builder.num_actions(), Ok(0));
+            for i in 0..outputs {
+                builder
+                    .add_output(None, recipient, 100 + i, NO_MEMO)
+                    .unwrap();
+            }
+            assert_eq!(builder.num_actions(), Ok(actions));
+            let unauthorized = builder
+                .build_with(&seed(5), |circuits, instances, _| {
+                    assert_eq!(circuits.len(), actions);
+                    assert!(
+                        instances
+                            .iter()
+                            .all(|i| i.enable_spend == flags.spends_enabled())
+                    );
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            // nothing of the wallet to sign
+            assert!(unauthorized.spend_auth_requests().is_empty());
+            let signed = unauthorized
+                .apply_signatures(&sighash, &[], &seed(9))
+                .unwrap();
+            assert_eq!(signed.actions.len(), actions);
+            assert_eq!(signed.flags, flags);
+            let total: u64 = read(&signed, &fvk.to_ivk(Scope::External)).iter().sum();
+            assert_eq!(total, (0..outputs).map(|i| 100 + i).sum::<u64>());
+        }
+        // a coinbase bundle has no spends, and flags that say so
+        let mut builder = Builder::new_ironwood(Flags::IRONWOOD_ENABLED, anchor);
+        builder.set_bundle_type(BundleType::Coinbase);
+        builder.add_output(None, recipient, 1, NO_MEMO).unwrap();
+        assert_eq!(
+            builder.num_actions(),
+            Err(BuildError::BundleTypeNotSatisfiable)
+        );
+        assert_eq!(
+            builder.build_with(&seed(5), |_, _, _| Ok(Vec::new())).err(),
+            Some(BuildError::BundleTypeNotSatisfiable)
+        );
+        // the Orchard pool before NU6.3 had coinbase bundles
+        let mut builder = Builder::new(
+            CircuitVersion::FixedPostNu6_2,
+            Flags::from_parts(false, true),
+            anchor,
+        );
+        builder.set_bundle_type(BundleType::Coinbase);
+        builder.add_output(None, recipient, 1, NO_MEMO).unwrap();
+        assert_eq!(builder.num_actions(), Ok(1));
     }
 
     fn other_ask() -> SpendAuthorizingKey {
