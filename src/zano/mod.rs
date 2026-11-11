@@ -158,9 +158,43 @@
 //! - the same unsigned transactions signed by `construct_tx` verify and
 //!   scan here.
 //!
+//! And to a daemon (2.2.0.501), through the dumps `testdata/zano_fetch.py`
+//! makes of what it serves and the ignored tools of the tests
+//! (`tests/chain.rs`):
+//!
+//! - about a thousand blocks from every era — the first 780 of the chain,
+//!   and those around each hard fork — parse, serialize back to the same
+//!   bytes and hash to the daemon's ids, and so do their transactions, of
+//!   every version, which verify with the rings the daemon gives:
+//!   transfers, swaps signed separately, asset operations, the first
+//!   transactions of the blocks with the reward `block_reward` computes
+//!   (less for the oversized blocks before hard fork 6);
+//! - the stakes of the proof-of-stake blocks among those first 780 meet
+//!   the difficulty with the stake modifier followed from the first block.
+//!   The stake proof of a Zarcanum block needs the kernel hash of the
+//!   proof-of-stake block before, which this daemon serves for the top
+//!   block only (`get_pos_details`): of older ones everything is verified
+//!   but the three Schnorr proofs that take it, which the two blocks of
+//!   `tests/mainnet.rs` cover;
+//! - the daemon parses transfers of two assets built and signed here, of
+//!   versions 2, 3 and 4, computes the same ids and decodes every output —
+//!   amount, asset and payment id — as this module scans it
+//!   (`decrypt_tx_details`), and validates a signature made here
+//!   (`validate_signature`);
+//! - the first transaction of a block template the daemon makes for a
+//!   wallet scans here to the amounts and blinding masks the daemon says
+//!   it put in.
+//!
+//! What a daemon prunes below its checkpoints — the signatures of the
+//! transactions of the first years, but those of the first transactions of
+//! blocks — could not be verified from it.
+//!
 //! No transaction signed here has been sent to the network, and the chain
 //! rules beyond those checks (unlock times, mixin counts, fees, sizes)
-//! are left to the caller.
+//! are left to the caller. The tool `tool_build_transfer` of the tests
+//! does everything short of sending: from a dump it scans a wallet's
+//! outputs, picks decoys among what `getrandom_outs3` gave, builds, signs
+//! and verifies a transfer, and prints it.
 //!
 //! Where zanolib and Zano disagree, this module follows Zano:
 //!

@@ -191,6 +191,27 @@ const FIXTURES: &[Fixture] = &[
         3400121,
         rings
     ),
+    // Three transactions of block 3 870 005 of the chain builds below 600
+    // follow (hard fork 6 without hard fork 7): no height, which would
+    // call for the hard fork id of the main network.
+    fixture!(
+        "v4hf6_comment",
+        "835c2a1ba02e47c11be8b92d7148f0d25c34dd12b9060918e2febb11096f151c",
+        0,
+        rings
+    ),
+    fixture!(
+        "v4hf6_mixed",
+        "06b528edf82819a4a5d9e7b99b594cd6618d209944b7972e722447f2c7a655d6",
+        0,
+        rings
+    ),
+    fixture!(
+        "v4hf6_swap",
+        "caaf323e3e84d077921afa06ea7604a10331a3751c361b9fb6295eeb8dc72b75",
+        0,
+        rings
+    ),
 ];
 
 fn load(name: &str) -> (&'static Fixture, Transaction) {
@@ -881,6 +902,179 @@ fn separately_signed() {
         .retain(|entry| !matches!(entry, Variant::Flags(_)));
     assert_eq!(plain.hash_for_input_signature(0), Some(plain.prefix_hash()));
     assert_eq!(plain.verify(&context), Err(VerifyError::InputsNotSorted));
+}
+
+/// Version 4 on the chain of hard fork 6 without hard fork 7 (what a
+/// daemon of a build below 600 follows above block 3 833 000): the same
+/// transactions but for the hard fork id they state.
+#[test]
+fn hard_fork_6_chain() {
+    // A comment, encrypted with the scheme of version 4.
+    let (_, tx) = load("v4hf6_comment");
+    assert_eq!((tx.version, tx.hardfork_id), (4, HARDFORK_06));
+    assert_eq!(
+        names(&tx.extra),
+        [
+            "comment",
+            "pub_key",
+            "etc_tx_flags16",
+            "checksum",
+            "derivation_hint",
+            "derivation_hint",
+            "zarcanum_tx_data_v1"
+        ]
+    );
+    assert_eq!(verify("v4hf6_comment", 0, None), Ok(()));
+    let stranger = Wallet::generate(&mut super::stream(8), 0).unwrap();
+    let found = stranger.scan_tx(&tx).unwrap();
+    assert!(!found.found() && found.comments.is_empty());
+    // The hard fork id is part of the transaction id, which every proof is
+    // bound to.
+    let mut other = tx.clone();
+    other.hardfork_id = HARDFORK_07;
+    assert_ne!(other.prefix_hash(), tx.prefix_hash());
+    assert!(tx.verify_proofs() && !other.verify_proofs());
+
+    // Two transparent inputs and a confidential one: from hard fork 6 on
+    // the native coin is the first member of the surjection rings.
+    let (fixture, tx) = load("v4hf6_mixed");
+    assert_eq!(tx.hardfork_id, HARDFORK_06);
+    assert_eq!(names(&tx.vin), ["key", "key", "txin_zc_input"]);
+    assert_eq!(names(&tx.signatures), ["NLSAG_sig", "NLSAG_sig", "ZC_sig"]);
+    let rings = rings_from_binary(fixture.rings);
+    let sizes: Vec<usize> = rings.iter().map(Vec::len).collect();
+    assert_eq!(sizes, [1, 1, 16]);
+    assert_eq!(verify("v4hf6_mixed", 0, None), Ok(()));
+    let mut bad = tx.clone();
+    let Variant::ToKey(input) = &mut bad.vin[0] else {
+        panic!()
+    };
+    input.amount += 1;
+    assert!(!bad.verify_proofs());
+
+    // A swap: three inputs of two parties.
+    let (_, tx) = load("v4hf6_swap");
+    assert_eq!(
+        (tx.hardfork_id, tx.flags()),
+        (HARDFORK_06, TX_FLAG_SIGNATURE_MODE_SEPARATE)
+    );
+    assert_eq!((tx.vin.len(), tx.vout.len()), (3, 5));
+    let id = tx.prefix_hash();
+    let hashes: Vec<[u8; 32]> = (0..3)
+        .map(|index| tx.hash_for_input_signature(index).unwrap())
+        .collect();
+    assert_eq!(hashes[2], id);
+    assert!(hashes[0] != id && hashes[1] != id);
+    assert_eq!(verify("v4hf6_swap", 0, None), Ok(()));
+}
+
+/// The same with transparent inputs, as before hard fork 4. No such
+/// transaction is among the fixtures: this one is made here, as the
+/// reference's `check_input_signature` wants it — the last input carries
+/// one more signature, of the transaction key over the transaction id.
+#[test]
+fn separately_signed_transparent() {
+    use crate::cryptonote::{EdwardsPoint, generate_signature, scalar_from_u64};
+
+    let secrets = [scalar_from_u64(11), scalar_from_u64(22)];
+    let keys: Vec<EdwardsPoint> = secrets.iter().map(EdwardsPoint::mul_base).collect();
+    let images: Vec<EdwardsPoint> = secrets
+        .iter()
+        .zip(&keys)
+        .map(|(secret, key)| key_image(secret, key))
+        .collect();
+    let tx_secret = scalar_from_u64(33);
+    let tx_pub = EdwardsPoint::mul_base(&tx_secret).compress();
+    let input = |n: usize, amount: u64, n_outs: u64, n_extras: u64| {
+        Variant::ToKey(TxInToKey {
+            amount,
+            key_offsets: vec![Variant::Uint64(n as u64)],
+            k_image: images[n].compress(),
+            etc_details: vec![Variant::SignedParts(SignedParts { n_outs, n_extras })],
+        })
+    };
+    let output = |amount: u64| {
+        Variant::OutBare(TxOutBare {
+            amount,
+            target: Box::new(Variant::ToKeyTarget(TxOutToKey {
+                key: tx_pub,
+                mix_attr: 0,
+            })),
+        })
+    };
+    let mut tx = Transaction {
+        version: 1,
+        vin: vec![input(0, 5, 1, 2), input(1, 7, 2, 3)],
+        vout: vec![output(6), output(5)],
+        extra: vec![
+            Variant::Flags(TX_FLAG_SIGNATURE_MODE_SEPARATE),
+            Variant::PubKey(tx_pub),
+            Variant::Padding(Vec::new()),
+        ],
+        ..Default::default()
+    };
+    let id = tx.prefix_hash();
+    let rings: Vec<[ClsagGgxInput; 1]> = keys
+        .iter()
+        .map(|key| {
+            [ClsagGgxInput {
+                stealth_address: key.compress(),
+                ..Default::default()
+            }]
+        })
+        .collect();
+    let refs: [&[ClsagGgxInput]; 2] = [&rings[0], &rings[1]];
+    let context = VerifyContext::new(&refs);
+    for n in 0..2 {
+        let message = tx.hash_for_input_signature(n).unwrap();
+        assert_eq!(message == id, n == 1);
+        let sig = generate_ring_signature(
+            &mut super::stream(n as u64),
+            &message,
+            &[keys[n].compress()],
+            &images[n],
+            &secrets[n],
+            0,
+        )
+        .unwrap();
+        tx.signatures.push(Variant::Nlsag(sig));
+    }
+    // Without the signature of whoever completed the transaction.
+    assert_eq!(tx.verify(&context), Err(VerifyError::InputSignature(1)));
+    let completion = |secret: u64| {
+        let secret = scalar_from_u64(secret);
+        generate_signature(
+            &id,
+            &EdwardsPoint::mul_base(&secret).compress(),
+            &secret.to_bytes(),
+            &[9; 32],
+        )
+        .unwrap()
+    };
+    let with = |extra: [u8; 64]| {
+        let mut tx = tx.clone();
+        let Some(Variant::Nlsag(sig)) = tx.signatures.last_mut() else {
+            panic!()
+        };
+        sig.s.push(extra);
+        tx
+    };
+    assert_eq!(with(completion(33)).verify(&context), Ok(()));
+    // Not by another key, and not on the first input.
+    assert_eq!(
+        with(completion(34)).verify(&context),
+        Err(VerifyError::InputSignature(1))
+    );
+    let mut misplaced = tx.clone();
+    let Some(Variant::Nlsag(sig)) = misplaced.signatures.first_mut() else {
+        panic!()
+    };
+    sig.s.push(completion(33));
+    assert_eq!(
+        misplaced.verify(&context),
+        Err(VerifyError::InputSignature(0))
+    );
+    assert_eq!(with(completion(33)).bare_fee(), Some(1));
 }
 
 /// Entries encrypted for the recipient, with the scheme of versions 2 and
