@@ -121,6 +121,15 @@
 //! from a height. The gateway types of hard fork 6, which the main network
 //! never accepted, are parsed and nothing more.
 //!
+//! Hard forks 6 and 7 share a height because the main network started
+//! over from block 3 833 000: the reference refuses, since build 600, a
+//! chain whose block 3 833 001 does not state hard fork 7. A daemon of an
+//! older build (2.2.0.501 knows hard fork 6 only) keeps following the
+//! chain that was left, whose transactions are of version 4 and state hard
+//! fork 6. This module reads and verifies both alike, and builds for
+//! either: `mainnet_tx_version` gives the main network's 7,
+//! `Wallet::build_transfer` takes the id to state.
+//!
 //! The wallet blobs are not versioned and follow the wallet's C++
 //! structures, in three layouts (`FtpFormat`): that of Zano 2.0 and
 //! 2.1.0.382 to 2.1.7.424, that of 2.1.8.428 to 2.1.19.477, and that of

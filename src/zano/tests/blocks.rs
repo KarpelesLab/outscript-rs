@@ -505,6 +505,13 @@ const BLOCKS: &[BlockFixture] = &[
         3
     ),
     block!(
+        3832995,
+        "1d2e9608e341d59c84b7540a7651080385c65f57d212dec5e12764d51f414d61",
+        false,
+        42,
+        3
+    ),
+    block!(
         3833001,
         "be9116ccd30367cfdf03d854e3ea532f6130645c61d284c30c6ba908b448803d",
         false,
@@ -533,7 +540,7 @@ fn block(height: u64) -> (&'static BlockFixture, Block) {
 }
 
 /// Every block parses, serializes back to the same bytes and hashes to the
-/// id the daemon gives it: the header, the tree hash of one to nineteen
+/// id the daemon gives it: the header, the tree hash of one to forty-two
 /// transactions and their count.
 #[test]
 fn block_ids() {
@@ -766,5 +773,30 @@ fn zarcanum_blocks() {
     assert_eq!(
         block.miner_tx.verify(&reward),
         Err(VerifyError::MissingStakeContext)
+    );
+}
+
+/// A block over the full reward zone creates less: block 3 832 995, of
+/// 146 739 bytes when the median of the 400 blocks before was below the
+/// zone (sizes as the daemon reports them).
+#[test]
+fn oversized_block() {
+    let (_, block) = block(3_832_995);
+    let reward = block_reward(3_832_995, 0, 146_739).unwrap();
+    assert_eq!(reward, 969_754_616_256);
+    // The balance proof of the first transaction holds for that amount and
+    // no other.
+    let tx = &block.miner_tx;
+    assert!(tx.verify_coinbase_proofs(reward));
+    assert!(!tx.verify_coinbase_proofs(reward + 1));
+    assert!(!tx.verify_coinbase_proofs(reward - 1));
+    assert!(!tx.verify_coinbase_proofs(BLOCK_REWARD));
+    let context = VerifyContext::new(&[]).block_reward(reward);
+    assert_eq!(tx.verify(&context), Ok(()));
+    // The median only counts above the zone.
+    assert_eq!(block_reward(3_832_995, 125_000, 146_739), Some(reward));
+    assert_eq!(
+        block_reward(3_832_995, 146_739, 146_739),
+        Some(BLOCK_REWARD)
     );
 }

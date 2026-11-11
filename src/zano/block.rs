@@ -275,11 +275,12 @@ pub fn median_block_size(sizes: &mut [u64]) -> u64 {
 ///
 /// `median_size` is the [median](median_block_size) of the sizes of the
 /// [`REWARD_BLOCKS_WINDOW`] blocks before; `block_size` the cumulative size
-/// of the block: the sizes of its transactions, with that of the first
-/// one if it is over 1100 bytes (before hard fork 6), or what the first
-/// transaction states in its
+/// of the block, as the daemon reports both (`block_cumulative_size`): the
+/// sizes of the transactions of the block, the first one left out unless it
+/// is larger than what is reserved for it. From hard fork 6 on the first
+/// transaction states that size in its
 /// [`CoinbaseBlockCumulativeSize`](Variant::CoinbaseBlockCumulativeSize)
-/// entry (from hard fork 6 on).
+/// entry.
 ///
 /// Before hard fork 4 the first transaction also collects the fees of the
 /// block; since then they are burnt.
