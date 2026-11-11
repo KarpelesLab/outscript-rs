@@ -69,10 +69,10 @@ struct Change {
 
 /// One output to make.
 #[derive(Clone)]
-struct Payment {
-    address: Address,
-    amount: u64,
-    is_change: bool,
+pub(crate) struct Payment {
+    pub(crate) address: Address,
+    pub(crate) amount: u64,
+    pub(crate) is_change: bool,
 }
 
 /// A transaction to build: inputs, destinations, change and fee.
@@ -391,136 +391,21 @@ impl TransactionBuilder {
             .filter_map(|i| payments.get(*i).cloned())
             .collect();
 
-        // The distinct recipients, besides the change address.
-        let change_address = self.change.as_ref().map(|change| change.address);
-        let same = |a: &Address, b: &Address| {
-            a.spend_public == b.spend_public && a.view_public == b.view_public
-        };
-        let is_change_address =
-            |address: &Address| change_address.is_some_and(|change| same(&change, address));
-        let mut recipients: Vec<&Address> = Vec::new();
-        for payment in &payments {
-            if !is_change_address(&payment.address)
-                && !recipients.iter().any(|known| same(known, &payment.address))
-            {
-                recipients.push(&payment.address);
-            }
-        }
-        let subaddresses = recipients.iter().filter(|a| a.is_subaddress()).count();
-        let standard = recipients.len() - subaddresses;
-
-        // The transaction key: R = r * G, or r * D for a lone subaddress.
         let tx_secret = random_secret(rng)?;
-        let r = scalar_from_bytes(&tx_secret)?;
-        let tx_public = match recipients.first() {
-            Some(only) if standard == 0 && subaddresses == 1 => {
-                point_from_bytes(&only.spend_public)?.mul(&r).compress()
-            }
-            _ => EdwardsPoint::mul_base(&r).compress(),
-        };
-        let need_additional = subaddresses > 0 && (standard > 0 || subaddresses > 1);
-
-        let mut outputs = Vec::with_capacity(payments.len());
-        let mut ecdh_info = Vec::with_capacity(payments.len());
-        let mut out_pk = Vec::with_capacity(payments.len());
-        let mut out_masks = Vec::with_capacity(payments.len());
-        let mut out_amounts = Vec::with_capacity(payments.len());
         let mut additional_secrets = Vec::new();
-        let mut additional_publics = Vec::new();
-        for (index, payment) in payments.iter().enumerate() {
-            let output_index = index as u64;
-            let address = &payment.address;
-            let mut additional = None;
-            if need_additional {
-                let secret = random_secret(rng)?;
-                let s = scalar_from_bytes(&secret)?;
-                additional_publics.push(if address.is_subaddress() {
-                    point_from_bytes(&address.spend_public)?.mul(&s).compress()
-                } else {
-                    EdwardsPoint::mul_base(&s).compress()
-                });
-                additional = Some(secret.clone());
-                additional_secrets.push(secret);
+        if self.recipients(&payments).1 {
+            for _ in &payments {
+                additional_secrets.push(random_secret(rng)?);
             }
-            let derivation = Zeroizing::new(match (&self.change, additional) {
-                // The change: the sender's view key and the transaction
-                // public key.
-                (Some(change), _) if payment.is_change || is_change_address(address) => {
-                    generate_key_derivation(&tx_public, &change.view_secret)?
-                }
-                (_, Some(secret)) if address.is_subaddress() => {
-                    generate_key_derivation(&address.view_public, &secret)?
-                }
-                _ => generate_key_derivation(&address.view_public, &tx_secret)?,
-            });
-            let key = derive_public_key(&derivation, output_index, &address.spend_public)?;
-            let shared = Zeroizing::new(derivation_to_scalar(&derivation, output_index));
-            let mask = commitment_mask(&shared);
-            let mask_scalar = scalar_from_bytes(&mask)?;
-            outputs.push(Output {
-                amount: 0,
-                key,
-                view_tag: Some(derive_view_tag(&derivation, output_index)),
-            });
-            ecdh_info.push(EcdhInfo::Compact(encrypt_amount(&shared, payment.amount)));
-            out_pk.push(commit_point(&scalar_from_u64(payment.amount), &mask_scalar).compress());
-            out_masks.push(mask);
-            out_amounts.push(payment.amount);
         }
-
-        // --- the extra field: public key, additional keys, payment id ---
-        let mut extra = Vec::new();
-        push_tx_public_key(&mut extra, &tx_public);
-        if need_additional {
-            push_additional_public_keys(&mut extra, &additional_publics);
-        }
-        let mut payment_ids = payments
-            .iter()
-            .filter_map(|payment| payment.address.payment_id());
-        let payment_id = payment_ids.next();
-        let payment_id = match (self.payment_id, payment_id) {
-            (Some(_), Some(_)) => return Err(Error::InvalidAddress),
-            (set, found) => set.or(found),
-        };
-        if payment_ids.next().is_some() {
-            return Err(Error::InvalidAddress);
-        }
-        // The view key the payment id is encrypted for: that of the only
-        // recipient, or the sender's own when there is none.
-        let id_view_key = {
-            let mut found: Option<&Address> = None;
-            let mut several = false;
-            for payment in &payments {
-                let address = &payment.address;
-                if payment.amount == 0
-                    || is_change_address(address)
-                    || found.is_some_and(|known| same(known, address))
-                {
-                    continue;
-                }
-                several |= found.is_some();
-                found = Some(address);
-            }
-            match (found, several) {
-                (_, true) => None,
-                (Some(address), false) => Some(address.view_public),
-                (None, false) => change_address.map(|change| change.view_public),
-            }
-        };
-        match (payment_id, id_view_key) {
-            (Some(id), Some(view_public)) => {
-                let derivation = Zeroizing::new(generate_key_derivation(&view_public, &tx_secret)?);
-                let encrypted = encrypt_payment_id(&derivation, &id);
-                push_payment_id(&mut extra, &PaymentId::Encrypted(encrypted));
-            }
-            (Some(_), None) => return Err(Error::InvalidAddress),
-            (None, Some(view_public)) if payments.len() <= 2 => {
-                let derivation = Zeroizing::new(generate_key_derivation(&view_public, &tx_secret)?);
-                let encrypted = encrypt_payment_id(&derivation, &[0u8; 8]);
-                push_payment_id(&mut extra, &PaymentId::Encrypted(encrypted));
-            }
-            (None, _) => {}
-        }
+        let OutputSet {
+            outputs,
+            ecdh_info,
+            out_pk,
+            out_masks,
+            out_amounts,
+            extra,
+        } = self.make_outputs(&payments, &tx_secret, &additional_secrets)?;
 
         // --- the pseudo-outputs: the last mask makes the sums equal ---
         let mut out_mask_sum = Scalar::ZERO;
@@ -607,6 +492,180 @@ impl TransactionBuilder {
             tx_secret_key: tx_secret,
             additional_secret_keys: additional_secrets,
             output_order: order,
+        })
+    }
+}
+
+/// Whether two addresses have the same keys.
+fn same(a: &Address, b: &Address) -> bool {
+    a.spend_public == b.spend_public && a.view_public == b.view_public
+}
+
+/// The outputs of a transaction, with what goes with them.
+pub(crate) struct OutputSet {
+    pub(crate) outputs: Vec<Output>,
+    pub(crate) ecdh_info: Vec<EcdhInfo>,
+    pub(crate) out_pk: Vec<[u8; 32]>,
+    pub(crate) out_masks: Vec<Zeroizing<[u8; 32]>>,
+    pub(crate) out_amounts: Vec<u64>,
+    pub(crate) extra: Vec<u8>,
+}
+
+impl TransactionBuilder {
+    /// What the recipients of `payments`, besides the change address, call
+    /// for: the spend key of the subaddress the transaction public key is
+    /// made with when it is the only recipient, and whether every output
+    /// needs an additional key.
+    pub(crate) fn recipients(&self, payments: &[Payment]) -> (Option<[u8; 32]>, bool) {
+        let change_address = self.change.as_ref().map(|change| change.address);
+        let mut recipients: Vec<&Address> = Vec::new();
+        for payment in payments {
+            if !change_address.is_some_and(|change| same(&change, &payment.address))
+                && !recipients.iter().any(|known| same(known, &payment.address))
+            {
+                recipients.push(&payment.address);
+            }
+        }
+        let subaddresses = recipients.iter().filter(|a| a.is_subaddress()).count();
+        let standard = recipients.len() - subaddresses;
+        let lone = match recipients.first() {
+            Some(only) if standard == 0 && subaddresses == 1 => Some(only.spend_public),
+            _ => None,
+        };
+        (lone, subaddresses > 0 && (standard > 0 || subaddresses > 1))
+    }
+
+    /// The outputs for `payments`, in that order, with the transaction
+    /// secret key `tx_secret` and, when [`recipients`](Self::recipients)
+    /// asks for them, one additional secret key per output.
+    pub(crate) fn make_outputs(
+        &self,
+        payments: &[Payment],
+        tx_secret: &[u8; 32],
+        additional_secrets: &[Zeroizing<[u8; 32]>],
+    ) -> Result<OutputSet, Error> {
+        let change_address = self.change.as_ref().map(|change| change.address);
+        let is_change_address =
+            |address: &Address| change_address.is_some_and(|change| same(&change, address));
+        let (lone_subaddress, need_additional) = self.recipients(payments);
+        if need_additional && additional_secrets.len() != payments.len() {
+            return Err(Error::InvalidAmounts);
+        }
+
+        // The transaction key: R = r * G, or r * D for a lone subaddress.
+        let r = scalar_from_bytes(tx_secret)?;
+        let tx_public = match lone_subaddress {
+            Some(spend_public) => point_from_bytes(&spend_public)?.mul(&r).compress(),
+            None => EdwardsPoint::mul_base(&r).compress(),
+        };
+
+        let mut outputs = Vec::with_capacity(payments.len());
+        let mut ecdh_info = Vec::with_capacity(payments.len());
+        let mut out_pk = Vec::with_capacity(payments.len());
+        let mut out_masks = Vec::with_capacity(payments.len());
+        let mut out_amounts = Vec::with_capacity(payments.len());
+        let mut additional_publics = Vec::new();
+        for (index, payment) in payments.iter().enumerate() {
+            let output_index = index as u64;
+            let address = &payment.address;
+            let mut additional = None;
+            if need_additional {
+                let secret = additional_secrets.get(index).ok_or(Error::InvalidAmounts)?;
+                let s = scalar_from_bytes(secret)?;
+                additional_publics.push(if address.is_subaddress() {
+                    point_from_bytes(&address.spend_public)?.mul(&s).compress()
+                } else {
+                    EdwardsPoint::mul_base(&s).compress()
+                });
+                additional = Some(secret);
+            }
+            let derivation = Zeroizing::new(match (&self.change, additional) {
+                // The change: the sender's view key and the transaction
+                // public key.
+                (Some(change), _) if payment.is_change || is_change_address(address) => {
+                    generate_key_derivation(&tx_public, &change.view_secret)?
+                }
+                (_, Some(secret)) if address.is_subaddress() => {
+                    generate_key_derivation(&address.view_public, secret)?
+                }
+                _ => generate_key_derivation(&address.view_public, tx_secret)?,
+            });
+            let key = derive_public_key(&derivation, output_index, &address.spend_public)?;
+            let shared = Zeroizing::new(derivation_to_scalar(&derivation, output_index));
+            let mask = commitment_mask(&shared);
+            let mask_scalar = scalar_from_bytes(&mask)?;
+            outputs.push(Output {
+                amount: 0,
+                key,
+                view_tag: Some(derive_view_tag(&derivation, output_index)),
+            });
+            ecdh_info.push(EcdhInfo::Compact(encrypt_amount(&shared, payment.amount)));
+            out_pk.push(commit_point(&scalar_from_u64(payment.amount), &mask_scalar).compress());
+            out_masks.push(mask);
+            out_amounts.push(payment.amount);
+        }
+
+        // --- the extra field: public key, additional keys, payment id ---
+        let mut extra = Vec::new();
+        push_tx_public_key(&mut extra, &tx_public);
+        if need_additional {
+            push_additional_public_keys(&mut extra, &additional_publics);
+        }
+        let mut payment_ids = payments
+            .iter()
+            .filter_map(|payment| payment.address.payment_id());
+        let payment_id = payment_ids.next();
+        let payment_id = match (self.payment_id, payment_id) {
+            (Some(_), Some(_)) => return Err(Error::InvalidAddress),
+            (set, found) => set.or(found),
+        };
+        if payment_ids.next().is_some() {
+            return Err(Error::InvalidAddress);
+        }
+        // The view key the payment id is encrypted for: that of the only
+        // recipient, or the sender's own when there is none.
+        let id_view_key = {
+            let mut found: Option<&Address> = None;
+            let mut several = false;
+            for payment in payments {
+                let address = &payment.address;
+                if payment.amount == 0
+                    || is_change_address(address)
+                    || found.is_some_and(|known| same(known, address))
+                {
+                    continue;
+                }
+                several |= found.is_some();
+                found = Some(address);
+            }
+            match (found, several) {
+                (_, true) => None,
+                (Some(address), false) => Some(address.view_public),
+                (None, false) => change_address.map(|change| change.view_public),
+            }
+        };
+        match (payment_id, id_view_key) {
+            (Some(id), Some(view_public)) => {
+                let derivation = Zeroizing::new(generate_key_derivation(&view_public, tx_secret)?);
+                let encrypted = encrypt_payment_id(&derivation, &id);
+                push_payment_id(&mut extra, &PaymentId::Encrypted(encrypted));
+            }
+            (Some(_), None) => return Err(Error::InvalidAddress),
+            (None, Some(view_public)) if payments.len() <= 2 => {
+                let derivation = Zeroizing::new(generate_key_derivation(&view_public, tx_secret)?);
+                let encrypted = encrypt_payment_id(&derivation, &[0u8; 8]);
+                push_payment_id(&mut extra, &PaymentId::Encrypted(encrypted));
+            }
+            (None, _) => {}
+        }
+
+        Ok(OutputSet {
+            outputs,
+            ecdh_info,
+            out_pk,
+            out_masks,
+            out_amounts,
+            extra,
         })
     }
 }

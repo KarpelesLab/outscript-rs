@@ -48,10 +48,26 @@
 //!   computes them ([`estimate_tx_weight`], [`calculate_fee_from_weight`]);
 //!   with `alloc`, its decoy selection (`DecoyPicker`, `build_ring`) over
 //!   the output distribution the caller fetched.
+//! - **Cold signing** (with `alloc`): the files a view-only wallet and the
+//!   offline wallet of the reference implementation (`monero-wallet-cli`,
+//!   `wallet2`) exchange, and the encryption they share (`WalletCipher`,
+//!   keyed with `cn_slow_hash` of the view key): output exports
+//!   (`OutputExport`), key images with their proofs (`KeyImageExport`,
+//!   `SignedKeyImage`), and unsigned and signed transaction sets
+//!   (`UnsignedTxSet::sign`, `SignedTxSet`). This crate can stand for the
+//!   offline wallet of a view-only reference wallet.
+//! - **Multisig** (with `alloc`, experimental as in the reference wallet):
+//!   the key exchange that makes an M-of-N account (`MultisigKex`), the
+//!   exchange of partial key images and nonces (`MultisigInfo`,
+//!   `MultisigNonces`), and proposing and co-signing transactions
+//!   (`MultisigAccount::propose`, `MultisigAccount::sign`, `MultisigTxSet`),
+//!   in the formats of the reference wallet, whose wallets this crate's
+//!   participant can share an account with.
 //!
 //! Not here: the daemon RPC (everything works on data the caller fetched),
 //! signing in the older formats, the checksum-less 24-word mnemonics that
-//! predate 2014, and multisignature.
+//! predate 2014, the wallet's own files (keys and cache), and the layouts
+//! the exchanged files had before version 0.18 of the reference wallet.
 //!
 //! # Randomness
 //!
@@ -78,6 +94,9 @@
 //! signing walks the ring starting from it, and decoy selection is
 //! variable-time. Looking the words of a mnemonic up in a word list goes
 //! through the whole list for every word, but is not constant-time either.
+//! `cn_slow_hash`, which turns a view key into the key of the wallet's
+//! files, reads its scratchpad at places that depend on its input: that is
+//! how the function is defined.
 //!
 //! # Untrusted input
 //!
@@ -156,6 +175,8 @@ mod files;
 mod keys;
 mod legacy_sig;
 mod mnemonic;
+#[cfg(feature = "alloc")]
+mod multisig;
 mod ringct;
 mod scan;
 #[cfg(feature = "alloc")]
@@ -197,7 +218,8 @@ pub use fee::{
 };
 #[cfg(feature = "alloc")]
 pub use files::{
-    ExportedOutput, KEY_IMAGE_EXPORT_MAGIC, KeyImageExport, OUTPUT_EXPORT_MAGIC, OutputExport,
+    ExportedOutput, KEY_IMAGE_EXPORT_MAGIC, KeyImageExport, MULTISIG_INFO_MAGIC,
+    MULTISIG_TX_SET_MAGIC, MultisigSignature, MultisigTxSet, OUTPUT_EXPORT_MAGIC, OutputExport,
     PendingTx, SIGNED_TX_SET_MAGIC, SignedKeyImage, SignedTxSet, TxConstructionData, TxDestination,
     TxSource, UNSIGNED_TX_SET_MAGIC, UnsignedTxSet, WalletCipher,
 };
@@ -209,6 +231,11 @@ pub use mnemonic::{
 };
 #[cfg(feature = "alloc")]
 pub use mnemonic::{seed_to_mnemonic, seed_to_mnemonic_in};
+#[cfg(feature = "alloc")]
+pub use multisig::{
+    MULTISIG_MAX_SIGNERS, MultisigAccount, MultisigInfo, MultisigKex, MultisigNonces,
+    MultisigOutputInfo,
+};
 pub use ringct::{H, commit, verify_balance, zero_commit};
 #[cfg(feature = "alloc")]
 pub use scan::OwnedOutput;
@@ -284,6 +311,13 @@ pub enum Error {
     /// wallet, is not described: the offline side needs a full output
     /// export.
     MissingOutputs,
+    /// A message of the multisig key exchange is malformed, badly signed or
+    /// not the one expected; or multisig data does not fit the account, the
+    /// signers or the transaction it is used with.
+    InvalidMultisig,
+    /// The nonces or the info a multisig signature calls for are not there:
+    /// the participants must exchange their multisig info again.
+    MultisigInfoNeeded,
     /// The mnemonic has the wrong number of words, a word that is not in
     /// the list, or a bad checksum.
     InvalidMnemonic,
@@ -308,6 +342,8 @@ impl core::fmt::Display for Error {
             Error::InvalidFile => "not a wallet file of the expected kind",
             Error::AuthenticationFailed => "file not made with this view key",
             Error::MissingOutputs => "missing output descriptions",
+            Error::InvalidMultisig => "invalid multisig data",
+            Error::MultisigInfoNeeded => "multisig info must be exchanged again",
             Error::InvalidMnemonic => "invalid mnemonic",
         })
     }

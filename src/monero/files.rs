@@ -34,6 +34,11 @@ pub const UNSIGNED_TX_SET_MAGIC: &[u8] = b"Monero unsigned tx set\x05";
 /// The magic of a signed transaction set (`signed_monero_tx`).
 pub const SIGNED_TX_SET_MAGIC: &[u8] = b"Monero signed tx set\x05";
 
+/// The magic of a multisig transaction set (`multisig_monero_tx`).
+pub const MULTISIG_TX_SET_MAGIC: &[u8] = b"Monero multisig unsigned tx set\x01";
+/// The magic of a multisig info export (`export_multisig_info`).
+pub const MULTISIG_INFO_MAGIC: &[u8] = b"Monero multisig export\x01";
+
 /// The size of the nonce in front of an encrypted payload.
 const IV_LEN: usize = 8;
 /// The size of the signature at its end.
@@ -215,13 +220,13 @@ impl WalletCipher {
     }
 
     /// Decrypts a file that starts with `magic`.
-    fn open(&self, magic: &[u8], file: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
+    pub(super) fn open(&self, magic: &[u8], file: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
         let ciphertext = file.strip_prefix(magic).ok_or(Error::InvalidFile)?;
         self.decrypt(ciphertext)
     }
 
     /// Makes a file that starts with `magic`.
-    fn seal(
+    pub(super) fn seal(
         &self,
         magic: &[u8],
         plaintext: &[u8],
@@ -430,7 +435,7 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-fn put_keys(out: &mut Vec<u8>, keys: &[[u8; 32]]) {
+pub(super) fn put_keys(out: &mut Vec<u8>, keys: &[[u8; 32]]) {
     push_varint(out, keys.len() as u64);
     for key in keys {
         out.extend_from_slice(key);
@@ -577,7 +582,7 @@ impl ExportedOutput {
 /// The one-time secret key and key image of an output, trying the
 /// transaction public key and then the output's additional key
 /// (`generate_key_image_helper`).
-fn output_secret(
+pub(super) fn output_secret(
     account: &AccountKeys,
     output_key: &[u8; 32],
     tx_public_key: &[u8; 32],
@@ -628,9 +633,10 @@ fn write_outputs(out: &mut Vec<u8>, offset: u64, total: u64, outputs: &[Exported
 
 /// Maps the errors of reading a payload that was authenticated: whatever is
 /// wrong with it, it is not a file this crate reads.
-fn archive<T>(result: Result<T, Error>) -> Result<T, Error> {
+pub(super) fn archive<T>(result: Result<T, Error>) -> Result<T, Error> {
     result.map_err(|e| match e {
         Error::Unsupported => Error::Unsupported,
+        Error::InvalidMultisig => Error::InvalidMultisig,
         _ => Error::InvalidFile,
     })
 }
@@ -803,7 +809,7 @@ impl TxDestination {
         }
     }
 
-    fn same_address(&self, other: &Self) -> bool {
+    pub(super) fn same_address(&self, other: &Self) -> bool {
         self.spend_public == other.spend_public && self.view_public == other.view_public
     }
 }
@@ -895,7 +901,7 @@ impl TxSource {
     }
 
     /// The ring member being spent.
-    fn real(&self) -> Result<&RingMember, Error> {
+    pub(super) fn real(&self) -> Result<&RingMember, Error> {
         usize::try_from(self.real_output)
             .ok()
             .and_then(|index| self.outputs.get(index))
@@ -1027,7 +1033,7 @@ impl TxConstructionData {
 
     /// The payment id in the extra field, which may hold nothing else that
     /// matters: the transaction public keys are replaced when signing.
-    fn payment_id(&self) -> Result<Option<[u8; 8]>, Error> {
+    pub(super) fn payment_id(&self) -> Result<Option<[u8; 8]>, Error> {
         let mut found = None;
         for field in parse_extra(&self.extra) {
             match field.map_err(|_| Error::InvalidExtra)? {
@@ -1357,6 +1363,7 @@ fn sign_one(
             additional_tx_secret_keys: built.additional_secret_keys,
             destinations: data.destinations.clone(),
             construction_data,
+            multisig_signatures: Vec::new(),
             multisig_tx_key_entropy: [0u8; 32],
         },
         owned,
@@ -1393,6 +1400,9 @@ pub struct PendingTx {
     /// What the transaction was built from, the sources in the order of its
     /// inputs and the destinations in the order of its outputs.
     pub construction_data: TxConstructionData,
+    /// The signing attempts of a multisig transaction, one per group of
+    /// signers that can complete it; none otherwise.
+    pub multisig_signatures: Vec<MultisigSignature>,
     /// The entropy of the transaction key of a multisig transaction; zero
     /// otherwise.
     pub multisig_tx_key_entropy: [u8; 32],
@@ -1408,7 +1418,7 @@ impl core::fmt::Debug for PendingTx {
 }
 
 impl PendingTx {
-    fn read(r: &mut Reader<'_>) -> Result<Self, Error> {
+    pub(super) fn read(r: &mut Reader<'_>) -> Result<Self, Error> {
         if r.varint()? != 1 {
             return Err(Error::Unsupported);
         }
@@ -1427,10 +1437,11 @@ impl PendingTx {
         let additional_tx_secret_keys = r.key_vec()?.into_iter().map(Zeroizing::new).collect();
         let destinations = TxDestination::read_vec(r)?;
         let construction_data = TxConstructionData::read(r)?;
-        // The partial signatures of a multisig transaction are not read
-        // here.
-        if r.varint()? != 0 {
-            return Err(Error::Unsupported);
+        // A signing attempt takes at least 55 bytes.
+        let count = r.count(55)?;
+        let mut multisig_signatures = Vec::with_capacity(count);
+        for _ in 0..count {
+            multisig_signatures.push(MultisigSignature::read(r)?);
         }
         let multisig_tx_key_entropy = r.key()?;
         Ok(PendingTx {
@@ -1445,13 +1456,14 @@ impl PendingTx {
             additional_tx_secret_keys,
             destinations,
             construction_data,
+            multisig_signatures,
             multisig_tx_key_entropy,
         })
     }
 
     /// Writes the transaction, without its secret keys unless
     /// `with_secrets`.
-    fn write(&self, out: &mut Vec<u8>, with_secrets: bool) {
+    pub(super) fn write(&self, out: &mut Vec<u8>, with_secrets: bool) {
         push_varint(out, 1);
         out.extend_from_slice(&self.transaction.serialize());
         put_u64(out, self.dust);
@@ -1475,7 +1487,10 @@ impl PendingTx {
         }
         TxDestination::write_vec(out, &self.destinations);
         self.construction_data.write(out);
-        push_varint(out, 0);
+        push_varint(out, self.multisig_signatures.len() as u64);
+        for signature in &self.multisig_signatures {
+            signature.write(out);
+        }
         out.extend_from_slice(&self.multisig_tx_key_entropy);
     }
 }
@@ -1498,8 +1513,7 @@ impl SignedTxSet {
     /// Reads a signed transaction set — the file `signed_monero_tx`, or the
     /// `signed_txset` of the wallet RPC once decoded.
     ///
-    /// Fails as [`UnsignedTxSet::from_file`] does; a set with multisig
-    /// partial signatures is [`Error::Unsupported`].
+    /// Fails as [`UnsignedTxSet::from_file`] does.
     pub fn from_file(cipher: &WalletCipher, file: &[u8]) -> Result<Self, Error> {
         let data = cipher.open(SIGNED_TX_SET_MAGIC, file)?;
         let mut r = Reader { data: &data };
@@ -1556,6 +1570,158 @@ impl SignedTxSet {
             data.extend_from_slice(image);
         }
         let file = cipher.seal(SIGNED_TX_SET_MAGIC, &data, rng);
+        data.zeroize();
+        file
+    }
+}
+
+/// One signing attempt of a multisig transaction (`multisig_sig`): the
+/// aggregate nonces of a group of signers that can complete it, and the
+/// responses as far as they have signed.
+///
+/// With more signers available than the threshold, the proposer does not
+/// know who will sign, and makes one attempt per group, each leaving out
+/// (`ignore`) the signers that are not of the group.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MultisigSignature {
+    /// The signers that are not part of this attempt.
+    pub ignore: Vec<[u8; 32]>,
+    /// The public nonces (`L`) of the other signers this attempt uses: how
+    /// each of them finds the secret nonces to sign with.
+    pub used_l: Vec<[u8; 32]>,
+    /// The public keys of the shares of the spend key signed with so far.
+    pub signing_keys: Vec<[u8; 32]>,
+    /// Left from the format of older versions: unused.
+    pub legacy_c: Vec<[u8; 32]>,
+    /// Left from the format of older versions: unused.
+    pub legacy_mu_p: Vec<[u8; 32]>,
+    /// For each input, the aggregate nonces on `G`, one per component.
+    pub total_alpha_g: Vec<Vec<[u8; 32]>>,
+    /// For each input, the aggregate nonces on the hash of the output key.
+    pub total_alpha_h: Vec<Vec<[u8; 32]>>,
+    /// For each input, the first challenge of its ring signature.
+    pub c_0: Vec<[u8; 32]>,
+    /// For each input, the response of the output being spent, as far as
+    /// the signers have contributed.
+    pub s: Vec<[u8; 32]>,
+}
+
+/// The size of an empty `rct::rctSig`, which a signing attempt carries
+/// since older versions and no longer uses.
+const EMPTY_RCT_SIG_LEN: usize = 44;
+
+impl MultisigSignature {
+    fn read(r: &mut Reader<'_>) -> Result<Self, Error> {
+        if r.varint()? != 1 {
+            return Err(Error::Unsupported);
+        }
+        if r.bytes(EMPTY_RCT_SIG_LEN)?.iter().any(|byte| *byte != 0) {
+            return Err(Error::Unsupported);
+        }
+        let ignore = r.key_vec()?;
+        let used_l = r.key_vec()?;
+        let signing_keys = r.key_vec()?;
+        let legacy_c = r.key_vec()?;
+        let legacy_mu_p = r.key_vec()?;
+        let matrix = |r: &mut Reader<'_>| -> Result<Vec<Vec<[u8; 32]>>, Error> {
+            let count = r.count(1)?;
+            (0..count).map(|_| r.key_vec()).collect()
+        };
+        Ok(MultisigSignature {
+            ignore,
+            used_l,
+            signing_keys,
+            legacy_c,
+            legacy_mu_p,
+            total_alpha_g: matrix(r)?,
+            total_alpha_h: matrix(r)?,
+            c_0: r.key_vec()?,
+            s: r.key_vec()?,
+        })
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        push_varint(out, 1);
+        out.extend_from_slice(&[0u8; EMPTY_RCT_SIG_LEN]);
+        put_keys(out, &self.ignore);
+        put_keys(out, &self.used_l);
+        put_keys(out, &self.signing_keys);
+        put_keys(out, &self.legacy_c);
+        put_keys(out, &self.legacy_mu_p);
+        for matrix in [&self.total_alpha_g, &self.total_alpha_h] {
+            push_varint(out, matrix.len() as u64);
+            for row in matrix {
+                put_keys(out, row);
+            }
+        }
+        put_keys(out, &self.c_0);
+        put_keys(out, &self.s);
+    }
+}
+
+/// The transactions the participants of a multisig account sign in turn
+/// (`multisig_tx_set`, the file `multisig_monero_tx`): each with the signing
+/// attempts it can be completed by, and who has signed so far.
+///
+/// Once as many participants as the threshold have signed, the
+/// transactions are complete and anyone can send them
+/// (`submit_multisig`).
+#[derive(Debug, Clone)]
+pub struct MultisigTxSet {
+    /// The transactions.
+    pub transactions: Vec<PendingTx>,
+    /// The participants that have signed, by the keys that identify them
+    /// ([`MultisigAccount::signer_public`](super::MultisigAccount::signer_public)).
+    pub signers: Vec<[u8; 32]>,
+}
+
+impl MultisigTxSet {
+    /// Reads a multisig transaction set — the file `multisig_monero_tx`, or
+    /// the `multisig_txset` or `tx_data_hex` of the wallet RPC once decoded.
+    /// The cipher is that of the multisig account
+    /// ([`MultisigAccount::cipher`](super::MultisigAccount::cipher)).
+    ///
+    /// Fails with [`Error::InvalidFile`] if it is not one,
+    /// [`Error::AuthenticationFailed`] if it was not made with this view
+    /// key, and [`Error::Unsupported`] for an older layout.
+    pub fn from_file(cipher: &WalletCipher, file: &[u8]) -> Result<Self, Error> {
+        let data = cipher.open(MULTISIG_TX_SET_MAGIC, file)?;
+        let mut r = Reader { data: &data };
+        archive(Self::read(&mut r))
+    }
+
+    fn read(r: &mut Reader<'_>) -> Result<Self, Error> {
+        let count = r.count(1)?;
+        let mut transactions = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            transactions.push(PendingTx::read(r)?);
+        }
+        let signers = r.key_vec()?;
+        if !r.data.is_empty() {
+            return Err(Error::TrailingData);
+        }
+        Ok(MultisigTxSet {
+            transactions,
+            signers,
+        })
+    }
+
+    /// Writes the multisig transaction set, for the next participant to
+    /// sign or for anyone to submit. Unlike a signed transaction set, it
+    /// carries the transaction secret keys: every signer needs them to check
+    /// what it signs. `rng` is as for [`WalletCipher::encrypt`].
+    pub fn to_file(
+        &self,
+        cipher: &WalletCipher,
+        rng: &mut dyn FnMut(&mut [u8]),
+    ) -> Result<Vec<u8>, Error> {
+        let mut data = Zeroizing::new(Vec::new());
+        push_varint(&mut data, self.transactions.len() as u64);
+        for tx in &self.transactions {
+            tx.write(&mut data, true);
+        }
+        put_keys(&mut data, &self.signers);
+        let file = cipher.seal(MULTISIG_TX_SET_MAGIC, &data, rng);
         data.zeroize();
         file
     }

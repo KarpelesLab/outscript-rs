@@ -1271,6 +1271,8 @@ mod files;
 #[cfg(feature = "alloc")]
 mod legacy;
 #[cfg(feature = "alloc")]
+mod multisig;
+#[cfg(feature = "alloc")]
 mod wallet;
 #[cfg(feature = "alloc")]
 mod with_alloc;

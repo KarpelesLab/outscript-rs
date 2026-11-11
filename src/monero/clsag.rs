@@ -363,3 +363,128 @@ impl Clsag {
         clsag_verify(message, ring, key_image, pseudo_out, &self.s, &parts)
     }
 }
+
+/// What the signers of a multisig CLSAG (`multisig::signing::CLSAG_context_t`)
+/// derive from the public data of an input and the aggregate nonces.
+#[cfg(feature = "alloc")]
+pub(crate) struct MultisigChallenge {
+    /// The factor that merges the nonce components: component `i` counts
+    /// `b^i` times.
+    pub(crate) b: Scalar,
+    /// The challenge of the output being spent.
+    pub(crate) c: Scalar,
+    /// The first challenge, which the signature carries.
+    pub(crate) c1: Scalar,
+    /// The aggregation coefficient of the key.
+    pub(crate) mu_p: Scalar,
+    /// The aggregation coefficient of the commitment.
+    pub(crate) mu_c: Scalar,
+}
+
+/// The challenges of a multisig CLSAG
+/// (`CLSAG_context_t::combine_alpha_and_compute_challenge`): the signers'
+/// aggregate nonces `alpha_g` (on `G`) and `alpha_h` (on `Hp(P)`), one per
+/// component, are merged with a factor that binds everything the signature
+/// is about, and the ring is walked from the output being spent.
+///
+/// `d` is the commitment key image as the signature carries it (divided by
+/// 8), `responses` the responses of the signature, the one at `real_index`
+/// being ignored. Variable-time: everything here is public.
+#[cfg(feature = "alloc")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn multisig_challenge(
+    message: &[u8; 32],
+    ring: &[RingMember],
+    real_index: usize,
+    key_image: &[u8; 32],
+    d: &[u8; 32],
+    pseudo_out: &[u8; 32],
+    responses: &[[u8; 32]],
+    alpha_g: &[[u8; 32]],
+    alpha_h: &[[u8; 32]],
+) -> Result<MultisigChallenge, Error> {
+    let n = ring.len();
+    if real_index >= n
+        || responses.len() != n
+        || alpha_g.is_empty()
+        || alpha_g.len() != alpha_h.len()
+    {
+        return Err(Error::InvalidRing);
+    }
+    let image = point_from_bytes(key_image)?;
+    let d8 = point_from_bytes(d)?.mul_by_cofactor();
+    let offset = point_from_bytes(pseudo_out)?;
+    let (mu_p, mu_c, round) = prepare(message, ring, key_image, d, pseudo_out);
+
+    let mut h = Hasher::new();
+    h.update(&domain(b"CLSAG_round_ms_merge_factor"));
+    for member in ring {
+        h.update(&member.key);
+    }
+    for member in ring {
+        h.update(&member.commitment);
+    }
+    h.update(pseudo_out);
+    h.update(message);
+    for nonce in alpha_g.iter().chain(alpha_h) {
+        h.update(nonce);
+    }
+    h.update(key_image);
+    h.update(&d8.compress());
+    for (i, response) in responses.iter().enumerate() {
+        if i != real_index {
+            h.update(response);
+        }
+    }
+    let number = |value: usize| {
+        let mut key = [0u8; 32];
+        for (o, b) in key.iter_mut().zip((value as u64).to_le_bytes()) {
+            *o = b;
+        }
+        key
+    };
+    h.update(&number(real_index));
+    h.update(&number(alpha_g.len()));
+    h.update(&number(n));
+    let b = h.finalize_to_scalar();
+
+    let mut l = EdwardsPoint::identity();
+    let mut r = EdwardsPoint::identity();
+    let mut power = Scalar::ONE;
+    for (g, h) in alpha_g.iter().zip(alpha_h) {
+        l = l.add(&point_from_bytes(g)?.mul(&power));
+        r = r.add(&point_from_bytes(h)?.mul(&power));
+        power = power.mul(&b);
+    }
+    let mut tables = new_tables();
+    let mut c = challenge(&round, &l, &r);
+    let mut c1 = None;
+    let mut i = real_index;
+    for _ in 1..n {
+        i = if i + 1 >= n { 0 } else { i + 1 };
+        if i == 0 {
+            c1 = Some(c.clone());
+        }
+        let s = scalar_from_bytes(responses.get(i).ok_or(Error::InvalidRing)?)?;
+        let points = member_points(ring.get(i).ok_or(Error::InvalidRing)?, &offset)?;
+        c = step(
+            &round,
+            &mu_p,
+            &mu_c,
+            &c,
+            &s,
+            &points,
+            &image,
+            &d8,
+            &mut tables,
+        );
+    }
+    let c1 = c1.unwrap_or_else(|| c.clone());
+    Ok(MultisigChallenge {
+        b,
+        c,
+        c1,
+        mu_p,
+        mu_c,
+    })
+}
