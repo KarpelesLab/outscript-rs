@@ -1,11 +1,15 @@
 //! Zcash transparent addresses (`t1…`/`t3…` on mainnet, `tm…`/`t2…` on
 //! testnet): base58check with a two-byte version. Shielded addresses have no
-//! output script and are not handled.
+//! output script and are not handled here (see the `sapling` and `orchard`
+//! modules). TEX addresses (ZIP 320, `tex1…`), which are P2PKH addresses
+//! that must be paid from transparent funds only, have their own functions:
+//! [`encode_tex_address_to_slice`] and [`decode_tex_address`].
 //!
 //! Transactions are built and signed in [`zcashtx`](crate::zcashtx).
 
 use crate::address::{DecodedAddress, Error};
 use crate::base58;
+use crate::bech32;
 use crate::hash::dsha256;
 #[cfg(feature = "alloc")]
 use crate::out::Out;
@@ -90,6 +94,84 @@ pub fn decode_zcash_address(network: &str, address: &str) -> Result<DecodedAddre
     Err(Error::UnsupportedAddressVersion(version[1]))
 }
 
+/// The human-readable part of the TEX addresses of `network`.
+fn tex_hrp(network: &str) -> Option<&'static str> {
+    Some(match network {
+        "zcash" => "tex",
+        "zcash-testnet" => "textest",
+        _ => return None,
+    })
+}
+
+/// The length of the longest TEX address (a testnet one).
+pub const TEX_ADDRESS_MAX_LEN: usize = 7 + 1 + 32 + 6;
+
+/// Writes the TEX address (ZIP 320, `tex1…` on mainnet, `textest1…` on
+/// testnet) of the public key hash `hash` into `out`
+/// ([`TEX_ADDRESS_MAX_LEN`] bytes always suffice), returning the number of
+/// (ASCII) bytes written.
+///
+/// A TEX address, or *transparent-source-only* address, is the Bech32m
+/// encoding of the hash of a P2PKH address: the same output script, with
+/// the request that the transaction paying it spend only transparent
+/// outputs (so that the recipient can send the funds back to where they
+/// came from). There is no TEX form of a P2SH address.
+pub fn encode_tex_address_to_slice(
+    hash: &[u8; 20],
+    network: &str,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    let hrp = tex_hrp(network).ok_or(Error::UnsupportedNetwork)?;
+    Ok(bech32::encode_to_slice(
+        hrp,
+        hash,
+        bech32::Variant::Bech32m,
+        out,
+    )?)
+}
+
+/// Decodes a TEX address (ZIP 320) of `network` (`zcash` or
+/// `zcash-testnet`; `auto` tells them apart), returning the hash of the
+/// public key it pays to (the output script is the P2PKH script of that
+/// hash, `zcashtx::p2pkh_script`) and its network.
+///
+/// A transaction with an output to a TEX address must spend only
+/// transparent outputs, and should have only transparent outputs: that is
+/// what distinguishes the address from the P2PKH address of the same key,
+/// and why [`decode_zcash_address`] does not accept it. The transaction
+/// builder (`zcash_builder`) enforces the rule for the outputs added as
+/// TEX ones.
+pub fn decode_tex_address(network: &str, address: &str) -> Result<([u8; 20], &'static str), Error> {
+    // twenty bytes are 32 characters: longer payloads are refused before
+    // they are decoded
+    let mut hash = [0u8; 20];
+    let (hrp, len, variant) = bech32::decode_to_slice(address, &mut hash).map_err(|e| match e {
+        bech32::Error::BufferTooSmall => Error::InvalidLength,
+        bech32::Error::InvalidChecksum => Error::BadChecksum,
+        _ => Error::InvalidAddress,
+    })?;
+    let found = ["zcash", "zcash-testnet"]
+        .into_iter()
+        .find(|net| tex_hrp(net).is_some_and(|want| hrp.eq_ignore_ascii_case(want)))
+        .ok_or(Error::InvalidAddress)?;
+    match network {
+        "auto" => {}
+        "zcash" | "zcash-testnet" => {
+            if network != found {
+                return Err(Error::NetworkMismatch);
+            }
+        }
+        _ => return Err(Error::UnsupportedNetwork),
+    }
+    if variant != bech32::Variant::Bech32m {
+        return Err(Error::BadChecksum);
+    }
+    if len != 20 {
+        return Err(Error::InvalidLength);
+    }
+    Ok((hash, found))
+}
+
 /// Parses a Zcash transparent address: see [`decode_zcash_address`].
 #[cfg(feature = "alloc")]
 pub fn parse_zcash_address(network: &str, address: &str) -> Result<Out, Error> {
@@ -163,6 +245,82 @@ mod tests {
                 Err(Error::UnsupportedAddressVersion(_))
             ));
         }
+    }
+
+    /// The address pair of ZIP 320 (its reference implementation's
+    /// example), and encodings of the same hash by an independent Bech32m
+    /// implementation that reproduces that pair.
+    #[test]
+    fn tex_addresses() {
+        let t1 = "t1VmmGiyjVNeCjxDZzg7vZmd99WyzVby9yC";
+        let tex = "tex1s2rt77ggv6q989lr49rkgzmh5slsksa9khdgte";
+        let textest = "textest1s2rt77ggv6q989lr49rkgzmh5slsksa90ej7wz";
+        let decoded = decode_zcash_address("zcash", t1).unwrap();
+        let hash: [u8; 20] = decoded.script[3..23].try_into().unwrap();
+        let mut out = [0u8; TEX_ADDRESS_MAX_LEN];
+        let n = encode_tex_address_to_slice(&hash, "zcash", &mut out).unwrap();
+        assert_eq!(core::str::from_utf8(&out[..n]).unwrap(), tex);
+        let n = encode_tex_address_to_slice(&hash, "zcash-testnet", &mut out).unwrap();
+        assert_eq!(n, TEX_ADDRESS_MAX_LEN);
+        assert_eq!(core::str::from_utf8(&out[..n]).unwrap(), textest);
+        for network in ["zcash", "auto"] {
+            assert_eq!(decode_tex_address(network, tex), Ok((hash, "zcash")));
+        }
+        for network in ["zcash-testnet", "auto"] {
+            assert_eq!(
+                decode_tex_address(network, textest),
+                Ok((hash, "zcash-testnet"))
+            );
+        }
+        assert_eq!(
+            decode_tex_address("zcash", textest),
+            Err(Error::NetworkMismatch)
+        );
+        assert_eq!(
+            decode_tex_address("bitcoin", tex),
+            Err(Error::UnsupportedNetwork)
+        );
+        assert_eq!(
+            encode_tex_address_to_slice(&hash, "bitcoin", &mut out),
+            Err(Error::UnsupportedNetwork)
+        );
+        assert!(encode_tex_address_to_slice(&hash, "zcash", &mut out[..10]).is_err());
+        // upper case is the same address; a transparent address is not one
+        let mut upper = [0u8; 42];
+        upper.copy_from_slice(tex.as_bytes());
+        upper.make_ascii_uppercase();
+        assert_eq!(
+            decode_tex_address("zcash", core::str::from_utf8(&upper).unwrap()),
+            Ok((hash, "zcash"))
+        );
+        assert!(decode_tex_address("zcash", t1).is_err());
+        assert!(decode_zcash_address("zcash", tex).is_err());
+        // every single-character change is refused
+        let mut damaged = [0u8; 42];
+        for i in 0..tex.len() {
+            damaged.copy_from_slice(tex.as_bytes());
+            damaged[i] = if damaged[i] == b'q' { b'p' } else { b'q' };
+            let s = core::str::from_utf8(&damaged).unwrap();
+            assert!(decode_tex_address("auto", s).is_err(), "{s}");
+        }
+        // a segwit address (another prefix), a Bech32 checksum under the
+        // right prefix, and hashes of other lengths
+        assert_eq!(
+            decode_tex_address("auto", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"),
+            Err(Error::InvalidAddress)
+        );
+        assert_eq!(
+            decode_tex_address("auto", "tex1s2rt77ggv6q989lr49rkgzmh5slsksa9rtaywm"),
+            Err(Error::BadChecksum)
+        );
+        assert_eq!(
+            decode_tex_address("auto", "tex1s2rt77ggv6q989lr49rkgzmh5slsksa9qqf37tgt"),
+            Err(Error::InvalidLength)
+        );
+        assert_eq!(
+            decode_tex_address("auto", "tex1s2rt77ggv6q989lr49rkgzmh5slskscxv8q42"),
+            Err(Error::InvalidLength)
+        );
     }
 
     #[test]
