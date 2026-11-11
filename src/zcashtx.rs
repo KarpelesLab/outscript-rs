@@ -113,6 +113,14 @@ use crate::prelude::*;
 use crate::pushbytes::push_bytes_to_slice;
 use crate::sink::{Counter, Sink, SliceSink};
 
+mod spend;
+pub use spend::{
+    InputSignature, InputSigner, InputSpend, MAX_INPUT_SIGNATURE_LEN, MAX_MULTISIG_KEYS,
+    MAX_REDEEM_SCRIPT_SIZE, MAX_SCRIPT_SIZE, Multisig, ScriptKind, ScriptSigBuilder,
+    is_valid_sighash_type, multisig_script_sig_to_slice, p2pk_script_sig_to_slice, p2pkh_script,
+    p2pkh_script_sig_to_slice, p2sh_script, p2sh_script_of,
+};
+
 /// Consensus branch ids of the network upgrades that use v5 or v6
 /// transactions, for [`ZcashTx::consensus_branch_id`]. A transaction is only
 /// valid for the upgrade in force when it is mined.
@@ -1292,6 +1300,9 @@ impl<'a> ZcashTx<'a> {
         Ok(out)
     }
 }
+
+#[cfg(all(test, feature = "std"))]
+mod spend_tests;
 
 #[cfg(test)]
 mod tests {
