@@ -136,6 +136,9 @@ pub enum Error {
     InvalidV,
     /// The RLP list has the wrong number of fields for its type.
     InvalidFieldCount,
+    /// The transaction has no chain id (it is 0), so its signature would not
+    /// be bound to a network.
+    MissingChainId,
     /// The transaction has no inputs.
     NoInputs,
     /// The transaction has no outputs.
@@ -317,6 +320,7 @@ impl core::fmt::Display for Error {
             Error::NotSigned => f.write_str("transaction is not signed"),
             Error::InvalidV => f.write_str("invalid signature v value"),
             Error::InvalidFieldCount => f.write_str("wrong number of transaction fields"),
+            Error::MissingChainId => f.write_str("transaction has no chain id"),
             Error::NoInputs => f.write_str("transaction has no inputs"),
             Error::NoOutputs => f.write_str("transaction has no outputs"),
             Error::EmptyAddress => f.write_str("output has an empty address"),

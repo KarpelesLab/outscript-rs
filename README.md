@@ -248,11 +248,24 @@ let mut tx = EvmTx::eip1559(
 );
 // also: EvmTx::legacy / EvmTx::eip2930, .with_data(..), .with_access_list(..);
 // EvmTx is #[non_exhaustive], so other fields are set by assignment
-tx.call("transfer(address,uint256)", &[/* AbiValue... */]).unwrap();
+tx.call("approve(address,uint256)", &[/* AbiValue... */]).unwrap();
 tx.sign(&key).unwrap();
 let data = tx.to_bytes().unwrap();
 let sender = tx.sender_address().unwrap();
+
+// an ERC-20 transfer: chain id, nonce, token, to, amount, gas limit, fees
+let mut tx = EvmTx::erc20_transfer(
+    1, 1, "0x<token>", "0x<recipient>", 5_000_000u64, 60_000, 20_000_000_000u64, 1_000_000_000u64,
+)?;
+tx.sign(&key)?;
 ```
+
+`sign` needs the chain id: a transaction whose `chain_id` is 0 (the default,
+and what JSON without `chainId` gives) fails with `Error::MissingChainId`
+instead of being signed without EIP-155 replay protection. A legacy
+transaction meant to be valid on every chain is signed with the explicitly
+named `sign_unprotected`; existing unprotected transactions are still parsed
+and their sender recovered. The same holds for `evmraw::RawEvmTx`.
 
 ### Solana transactions
 

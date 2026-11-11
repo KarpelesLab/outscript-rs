@@ -20,8 +20,10 @@ use crate::rlp::{self, RlpItem};
 ///
 /// The struct is `#[non_exhaustive]`, so new fields can be added without
 /// breaking callers: outside this crate, build one with [`EvmTx::eip1559`],
-/// [`EvmTx::legacy`] or [`EvmTx::eip2930`] (plus the `with_*` methods), or
-/// start from [`EvmTx::default`] and set the fields you need.
+/// [`EvmTx::erc20_transfer`], [`EvmTx::legacy`] or [`EvmTx::eip2930`] (plus
+/// the `with_*` methods), or start from [`EvmTx::default`] and set the
+/// fields you need, the chain id among them: [`EvmTx::sign`] refuses a
+/// transaction without one.
 ///
 /// ```
 /// use outscript::EvmTx;
@@ -55,7 +57,9 @@ pub struct EvmTx {
     pub value: BigInt,
     /// Calldata.
     pub data: Vec<u8>,
-    /// Chain id (encoded in v for legacy EIP-155).
+    /// Chain id (encoded in v for legacy EIP-155). 0 means none: only a
+    /// parsed pre-EIP-155 transaction, or one for
+    /// [`sign_unprotected`](EvmTx::sign_unprotected), has it.
     pub chain_id: u64,
     /// Transaction type.
     pub tx_type: EvmTxType,
@@ -123,8 +127,10 @@ impl EvmTx {
     }
 
     /// An unsigned legacy transaction with EIP-155 replay protection:
-    /// `value` wei to `to` at `gas_price` per gas. A `chain_id` of 0 gives a
-    /// pre-EIP-155 transaction, which is valid on every chain: avoid it.
+    /// `value` wei to `to` at `gas_price` per gas. The `chain_id` must be the
+    /// network's: [`EvmTx::sign`] refuses 0. A transaction without replay
+    /// protection (pre-EIP-155, valid on every chain) takes a `chain_id` of 0
+    /// and the explicit [`EvmTx::sign_unprotected`].
     pub fn legacy(
         chain_id: u64,
         nonce: u64,
@@ -159,6 +165,72 @@ impl EvmTx {
             tx_type: EvmTxType::Eip2930,
             ..EvmTx::legacy(chain_id, nonce, to, value, gas, gas_price)
         }
+    }
+
+    /// An unsigned EIP-1559 transaction calling `transfer(to, amount)` on the
+    /// ERC-20 contract `token`: it sends `amount` of the token's base units
+    /// and no ether. The other arguments are those of [`EvmTx::eip1559`];
+    /// a token transfer needs more gas than the 21000 of a plain one.
+    ///
+    /// `token` and `to` must be full 20-byte `0x` addresses
+    /// ([`Error::InvalidAddress`] otherwise), and a mixed-case one must carry
+    /// a valid EIP-55 checksum ([`Error::BadChecksum`]). `amount` must fit a
+    /// `uint256` ([`Error::TooLarge`]) and not be negative
+    /// ([`Error::InvalidAmount`]).
+    ///
+    /// ```
+    /// use outscript::EvmTx;
+    ///
+    /// // 5 USDT (6 decimals) on mainnet
+    /// let tx = EvmTx::erc20_transfer(
+    ///     1,                                            // chain id
+    ///     7,                                            // nonce
+    ///     "0xdAC17F958D2ee523a2206206994597C13D831ec7", // token contract
+    ///     "0x2AeB8ADD8337360E088B7D9ce4e857b9BE60f3a7", // recipient
+    ///     5_000_000u64,                                 // amount, in base units
+    ///     60_000,                                       // gas limit
+    ///     20_000_000_000u64,                            // max fee per gas
+    ///     1_000_000_000u64,                             // max priority fee per gas
+    /// )
+    /// .unwrap();
+    /// assert_eq!(tx.data[..4], [0xa9, 0x05, 0x9c, 0xbb]);
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn erc20_transfer(
+        chain_id: u64,
+        nonce: u64,
+        token: &str,
+        to: &str,
+        amount: impl Into<BigInt>,
+        gas: u64,
+        max_fee_per_gas: impl Into<BigInt>,
+        max_priority_fee_per_gas: impl Into<BigInt>,
+    ) -> Result<EvmTx, Error> {
+        let address = |s: &str| -> Result<[u8; 20], Error> {
+            let decoded = crate::address::decode_evm_address(s)?;
+            <[u8; 20]>::try_from(&decoded.script[..]).map_err(|_| Error::InvalidAddress)
+        };
+        address(token)?;
+        let (sign, amount) = amount.into().to_bytes_be();
+        if sign == Sign::Minus {
+            return Err(Error::InvalidAmount);
+        }
+        if amount.len() > 32 {
+            return Err(Error::TooLarge);
+        }
+        let mut word = [0u8; 32];
+        word[32 - amount.len()..].copy_from_slice(&amount);
+        let data = crate::evmabi::erc20_transfer_calldata(&address(to)?, &word);
+        Ok(EvmTx::eip1559(
+            chain_id,
+            nonce,
+            token,
+            0u8,
+            gas,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        )
+        .with_data(data))
     }
 
     /// Sets the calldata.
@@ -468,10 +540,57 @@ impl EvmTx {
 
     /// Signs the transaction with the given key.
     ///
+    /// The transaction must name its network: a `chain_id` of 0 (the
+    /// [`Default`], and what JSON without `chainId` gives) fails with
+    /// [`Error::MissingChainId`], for every transaction type. A legacy
+    /// transaction is signed with EIP-155 replay protection
+    /// (`v = chain_id * 2 + 35 + recid`); EIP-2930 and EIP-1559 transactions
+    /// carry the chain id in the signed fields, and no network has chain
+    /// id 0.
+    ///
     /// Fails with [`Error::Overflow`] for a legacy transaction whose chain id
-    /// is so large that the EIP-155 `v` (`chain_id * 2 + 35 + recid`) does not
-    /// fit a `u64`.
+    /// is so large that the EIP-155 `v` does not fit a `u64`.
+    ///
+    /// # Migration
+    ///
+    /// Up to 0.2.8 a legacy transaction with chain id 0 was silently signed
+    /// without replay protection (`v` = 27/28), and a typed one with chain id
+    /// 0 was signed as is. Set the chain id, or, for the rare legacy
+    /// transaction that must be valid on every chain, call
+    /// [`sign_unprotected`](Self::sign_unprotected).
     pub fn sign(&mut self, key: &SecpPrivateKey) -> Result<(), Error> {
+        if self.chain_id == 0 {
+            return Err(Error::MissingChainId);
+        }
+        self.sign_as_is(key)
+    }
+
+    /// Signs a legacy transaction **without replay protection**, the way
+    /// transactions were signed before EIP-155 (`v` = 27/28).
+    ///
+    /// Such a signature does not commit to a network: anyone can rebroadcast
+    /// the signed transaction on every other chain that accepts unprotected
+    /// transactions and where the sender has funds and the same nonce. Use
+    /// it only when that is the intent (for example a deployment meant to
+    /// land at the same address on every chain); otherwise set the chain id
+    /// and call [`sign`](Self::sign).
+    ///
+    /// The transaction must be a legacy one ([`Error::UnsupportedTxType`]
+    /// otherwise) with a `chain_id` of 0 ([`Error::InvalidData`] otherwise:
+    /// a transaction that names a chain is not signed without it).
+    pub fn sign_unprotected(&mut self, key: &SecpPrivateKey) -> Result<(), Error> {
+        if self.tx_type != EvmTxType::Legacy {
+            return Err(Error::UnsupportedTxType);
+        }
+        if self.chain_id != 0 {
+            return Err(Error::InvalidData);
+        }
+        self.sign_as_is(key)
+    }
+
+    /// Signs whatever the fields say: a legacy transaction with chain id 0
+    /// gets a pre-EIP-155 signature.
+    fn sign_as_is(&mut self, key: &SecpPrivateKey) -> Result<(), Error> {
         let eip155_base = if self.tx_type == EvmTxType::Legacy && self.chain_id != 0 {
             let max_v = self
                 .chain_id
@@ -631,7 +750,7 @@ mod tests {
 
     #[test]
     fn pre_eip155_sign_and_recover() {
-        // chain_id == 0 produces a pre-EIP-155 legacy signature (v = 27/28).
+        // chain_id == 0 gives a pre-EIP-155 legacy signature (v = 27/28).
         // Recovery must not panic and must return the signer.
         let mut tx = EvmTx {
             chain_id: 0,
@@ -642,7 +761,10 @@ mod tests {
             value: BigInt::from(1u64),
             ..Default::default()
         };
-        tx.sign(&key()).unwrap();
+        // signing without a chain id is refused unless asked for by name
+        assert_eq!(tx.sign(&key()), Err(Error::MissingChainId));
+        assert!(!tx.signed);
+        tx.sign_unprotected(&key()).unwrap();
         // v must be the legacy 27/28 form
         let v = tx.y.to_u64().unwrap();
         assert!(v == 27 || v == 28, "expected legacy v 27/28, got {v}");
@@ -650,6 +772,15 @@ mod tests {
             tx.sender_address().unwrap(),
             "0x2AeB8ADD8337360E088B7D9ce4e857b9BE60f3a7"
         );
+    }
+
+    /// Signs, without replay protection when the chain id is 0.
+    fn sign_any(tx: &mut EvmTx) {
+        if tx.chain_id == 0 {
+            tx.sign_unprotected(&key()).unwrap();
+        } else {
+            tx.sign(&key()).unwrap();
+        }
     }
 
     fn to_raw(tx: &EvmTx) -> (crate::evmraw::RawEvmTx<'_>, crate::evmraw::EvmSignature) {
@@ -708,13 +839,18 @@ mod tests {
                 ..Default::default()
             };
             let unsigned = tx.clone();
-            tx.sign(&key()).unwrap();
+            sign_any(&mut tx);
             let (raw, _) = to_raw(&unsigned);
             assert_eq!(
                 raw.signing_hash().unwrap(),
                 keccak256_once(&unsigned.sign_bytes().unwrap())
             );
-            let sig = raw.sign(&key()).unwrap();
+            let sig = if chain_id == 0 {
+                assert_eq!(raw.sign(&key()), Err(Error::MissingChainId));
+                raw.sign_unprotected(&key()).unwrap()
+            } else {
+                raw.sign(&key()).unwrap()
+            };
             let mut out = vec![0u8; raw.signed_len(&sig).unwrap()];
             raw.encode_signed_to_slice(&sig, &mut out).unwrap();
             assert_eq!(out, tx.to_bytes().unwrap(), "{tx_type:?}/{chain_id}");
@@ -879,6 +1015,7 @@ mod tests {
         // when building: a malformed list, or any list on a legacy transaction
         let mut tx = EvmTx {
             tx_type: EvmTxType::Eip1559,
+            chain_id: 1,
             to: TO.into(),
             access_list: vec![bytes(&[1])],
             ..Default::default()
@@ -1003,6 +1140,114 @@ mod tests {
         assert!(serde_json::from_str::<EvmTx>(&format!("{{\"to\":\"{TO}\"}}")).is_ok());
     }
 
+    /// A transaction without a chain id is not signed by `sign`: the default
+    /// and JSON without `chainId` must not yield a replayable signature.
+    #[test]
+    fn sign_requires_chain_id() {
+        for tx_type in [EvmTxType::Legacy, EvmTxType::Eip2930, EvmTxType::Eip1559] {
+            let mut tx = EvmTx {
+                tx_type,
+                gas: 21000,
+                to: TO.into(),
+                ..Default::default()
+            };
+            assert_eq!(tx.sign(&key()), Err(Error::MissingChainId), "{tx_type:?}");
+            assert!(!tx.signed);
+            if tx_type != EvmTxType::Legacy {
+                assert_eq!(
+                    tx.sign_unprotected(&key()),
+                    Err(Error::UnsupportedTxType),
+                    "{tx_type:?}"
+                );
+                assert!(!tx.signed);
+            }
+            tx.chain_id = 1;
+            tx.sign(&key()).unwrap();
+            assert_eq!(tx.sender_address().unwrap(), SENDER);
+        }
+        assert_eq!(
+            EvmTx::legacy(0, 0, TO, 1u64, 21000, 1u64).sign(&key()),
+            Err(Error::MissingChainId)
+        );
+        // JSON without a chain id
+        let mut tx: EvmTx = serde_json::from_str(&format!(
+            r#"{{"gas":"0x5208","gasPrice":"0x2","to":"{TO}"}}"#
+        ))
+        .unwrap();
+        assert_eq!(tx.sign(&key()), Err(Error::MissingChainId));
+        // a protected signature is the EIP-155 one
+        let mut tx = EvmTx::legacy(1, 0, TO, 1u64, 21000, 1u64);
+        tx.sign(&key()).unwrap();
+        assert!(matches!(tx.y.to_u64(), Some(37 | 38)));
+        // the opt-in is for transactions without a chain id only
+        let mut tx = EvmTx::legacy(1, 0, TO, 1u64, 21000, 1u64);
+        assert_eq!(tx.sign_unprotected(&key()), Err(Error::InvalidData));
+        assert!(!tx.signed);
+        // an unprotected transaction that exists is still parsed and recovered
+        let mut tx = EvmTx::legacy(0, 0, TO, 1u64, 21000, 1u64);
+        tx.sign_unprotected(&key()).unwrap();
+        let parsed = EvmTx::parse_transaction(&tx.to_bytes().unwrap()).unwrap();
+        assert_eq!(parsed.chain_id, 0);
+        assert_eq!(parsed.sender_address().unwrap(), SENDER);
+        assert_eq!(parsed.hash().unwrap(), tx.hash().unwrap());
+    }
+
+    #[test]
+    fn erc20_transfer_constructor() {
+        const TOKEN: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+        let tx =
+            EvmTx::erc20_transfer(1, 7, TOKEN, SENDER, 5_000_000u64, 60_000, 30u64, 2u64).unwrap();
+        let mut by_hand = EvmTx::eip1559(1, 7, TOKEN, 0u64, 60_000, 30u64, 2u64);
+        by_hand
+            .call(
+                "transfer(address,uint256)",
+                &[
+                    AbiValue::Out(crate::address::parse_evm_address(SENDER).unwrap()),
+                    AbiValue::Uint(BigInt::from(5_000_000u64)),
+                ],
+            )
+            .unwrap();
+        assert_eq!(tx.data, by_hand.data);
+        assert_eq!(tx.sign_bytes().unwrap(), by_hand.sign_bytes().unwrap());
+        assert_eq!(
+            hex::encode(&tx.data),
+            "a9059cbb0000000000000000000000002aeb8add8337360e088b7d9ce4e857b9be60f3a7\
+             00000000000000000000000000000000000000000000000000000000004c4b40"
+        );
+        // the largest amount
+        let max: BigInt = (BigInt::from(1) << 256) - 1;
+        let tx = EvmTx::erc20_transfer(1, 7, TOKEN, TO, max.clone(), 60_000, 30u64, 2u64).unwrap();
+        assert_eq!(&tx.data[36..], &[0xff; 32]);
+
+        let build = |token: &str, to: &str, amount: BigInt| {
+            EvmTx::erc20_transfer(1, 7, token, to, amount, 60_000, 30u64, 2u64).map(drop)
+        };
+        let one = || BigInt::from(1);
+        assert_eq!(build(TOKEN, TO, max + 1), Err(Error::TooLarge));
+        assert_eq!(
+            build(TOKEN, TO, BigInt::from(-1)),
+            Err(Error::InvalidAmount)
+        );
+        // neither address may be empty, short or without its prefix
+        for bad in [
+            "0x",
+            "",
+            "0x2aeb8add8337360e088b7d9ce4e857b9be60f3",
+            &TO[2..],
+        ] {
+            assert_eq!(build(bad, TO, one()), Err(Error::InvalidAddress), "{bad:?}");
+            assert_eq!(
+                build(TOKEN, bad, one()),
+                Err(Error::InvalidAddress),
+                "{bad:?}"
+            );
+        }
+        // nor wrongly checksummed
+        let bad_case = "0xdAC17F958D2ee523a2206206994597C13D831eC7";
+        assert_eq!(build(bad_case, TO, one()), Err(Error::BadChecksum));
+        assert_eq!(build(TOKEN, bad_case, one()), Err(Error::BadChecksum));
+    }
+
     #[test]
     fn sign_rejects_chain_id_overflowing_v() {
         for chain_id in [u64::MAX, u64::MAX / 2, (u64::MAX - 36) / 2 + 1] {
@@ -1058,7 +1303,7 @@ mod tests {
             assert!(!back.signed);
             assert_eq!(back.to_bytes().unwrap(), tx.to_bytes().unwrap());
 
-            tx.sign(&key()).unwrap();
+            sign_any(&mut tx);
             let j = serde_json::to_string(&tx).unwrap();
             let back: EvmTx = serde_json::from_str(&j).unwrap();
             assert!(back.signed, "{tx_type:?}");
@@ -1115,7 +1360,7 @@ mod tests {
             to: TO.into(),
             ..Default::default()
         };
-        tx.sign(&key()).unwrap();
+        tx.sign_unprotected(&key()).unwrap();
         assert_eq!(tx.sender_address().unwrap(), SENDER);
         tx.chain_id = 1;
         assert_eq!(tx.sender_address(), Err(Error::InvalidV));

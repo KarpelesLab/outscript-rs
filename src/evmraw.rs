@@ -1,9 +1,12 @@
 //! Heap-free EVM transaction signing: [`RawEvmTx`] holds fixed-size fields and
 //! streams its RLP encoding straight into keccak-256 or a caller buffer.
 //!
-//! Supports legacy (with or without EIP-155 replay protection), EIP-2930 and
-//! EIP-1559 transactions with an empty access list (`EvmTx`, which needs
-//! `alloc`, also carries access lists).
+//! Supports legacy, EIP-2930 and EIP-1559 transactions with an empty access
+//! list (`EvmTx`, which needs `alloc`, also carries access lists).
+//! [`RawEvmTx::sign`] requires a chain id, so that the signature is bound to
+//! one network; a legacy transaction without EIP-155 replay protection is
+//! signed with the explicit [`RawEvmTx::sign_unprotected`], and one that
+//! exists already is encoded, hashed and its sender recovered as before.
 
 pub use crate::Error;
 
@@ -57,7 +60,9 @@ pub struct EvmSignature {
 pub struct RawEvmTx<'a> {
     /// Transaction type.
     pub tx_type: EvmTxType,
-    /// Chain id (0 for a pre-EIP-155 legacy transaction).
+    /// Chain id. 0 means none, which only a pre-EIP-155 legacy transaction
+    /// has: [`sign`](RawEvmTx::sign) refuses it (see
+    /// [`sign_unprotected`](RawEvmTx::sign_unprotected)).
     pub chain_id: u64,
     /// Account nonce.
     pub nonce: u64,
@@ -184,13 +189,29 @@ impl RawEvmTx<'_> {
     /// Signs the transaction, returning the signature with `v` in the form the
     /// transaction type requires.
     ///
+    /// The transaction must name its network: a `chain_id` of 0 fails with
+    /// [`Error::MissingChainId`], for every transaction type. A legacy
+    /// transaction is signed with EIP-155 replay protection
+    /// (`v = chain_id * 2 + 35 + recid`); EIP-2930 and EIP-1559 transactions
+    /// carry the chain id in the signed fields, and no network has chain
+    /// id 0.
+    ///
     /// Fails with [`Error::Overflow`] for a legacy transaction whose chain id
-    /// is so large that the EIP-155 `v` (`chain_id * 2 + 35 + recid`) does not
-    /// fit a `u64`.
+    /// is so large that the EIP-155 `v` does not fit a `u64`.
+    ///
+    /// # Migration
+    ///
+    /// Up to 0.2.8 a legacy transaction with chain id 0 was silently signed
+    /// without replay protection (`v` = 27/28), and a typed one with chain id
+    /// 0 was signed as is. Set the chain id, or, for the rare legacy
+    /// transaction that must be valid on every chain, call
+    /// [`sign_unprotected`](Self::sign_unprotected).
     pub fn sign(&self, key: &SecpPrivateKey) -> Result<EvmSignature, Error> {
+        if self.chain_id == 0 {
+            return Err(Error::MissingChainId);
+        }
         // the base of v, before the recovery id (0 or 1) is added
         let base = match self.tx_type {
-            EvmTxType::Legacy if self.chain_id == 0 => 27,
             EvmTxType::Legacy => {
                 self.chain_id
                     .checked_mul(2)
@@ -200,6 +221,33 @@ impl RawEvmTx<'_> {
             }
             _ => 0,
         };
+        self.sign_with_base(key, base)
+    }
+
+    /// Signs a legacy transaction **without replay protection**, the way
+    /// transactions were signed before EIP-155 (`v` = 27/28).
+    ///
+    /// Such a signature does not commit to a network: anyone can rebroadcast
+    /// the signed transaction on every other chain that accepts unprotected
+    /// transactions and where the sender has funds and the same nonce. Use
+    /// it only when that is the intent (for example a deployment meant to
+    /// land at the same address on every chain); otherwise set the chain id
+    /// and call [`sign`](Self::sign).
+    ///
+    /// The transaction must be a legacy one ([`Error::UnsupportedTxType`]
+    /// otherwise) with a `chain_id` of 0 ([`Error::InvalidData`] otherwise:
+    /// a transaction that names a chain is not signed without it).
+    pub fn sign_unprotected(&self, key: &SecpPrivateKey) -> Result<EvmSignature, Error> {
+        if self.tx_type != EvmTxType::Legacy {
+            return Err(Error::UnsupportedTxType);
+        }
+        if self.chain_id != 0 {
+            return Err(Error::InvalidData);
+        }
+        self.sign_with_base(key, 27)
+    }
+
+    fn sign_with_base(&self, key: &SecpPrivateKey, base: u64) -> Result<EvmSignature, Error> {
         let (r, s, recid) = key.sign_recoverable(&self.signing_hash()?);
         let v = base + recid as u64;
         Ok(EvmSignature { v, r, s })
@@ -334,7 +382,11 @@ mod tests {
                 value: u256(10u128.pow(18)),
                 data: &data,
             };
-            let sig = tx.sign(&key).unwrap();
+            let sig = if chain_id == 0 {
+                tx.sign_unprotected(&key).unwrap()
+            } else {
+                tx.sign(&key).unwrap()
+            };
             assert_eq!(tx.recover_sender(&sig), Ok(want), "{tx_type:?}/{chain_id}");
             let wrong_chain = RawEvmTx {
                 chain_id: chain_id + 1,
@@ -354,6 +406,56 @@ mod tests {
             data: &[],
         };
         assert_eq!(blob.signing_hash(), Err(Error::UnsupportedTxType));
+    }
+
+    /// Signing without a chain id is refused: an unprotected legacy signature
+    /// takes the explicit method, and typed transactions always need one.
+    #[test]
+    fn sign_requires_chain_id() {
+        let key = SecpPrivateKey::from_bytes(&h(
+            "eb696a065ef48a2192da5b28b694f87544b30fae8327c4510137a922f32c6dcf",
+        ))
+        .unwrap();
+        let sender = h("2aeb8add8337360e088b7d9ce4e857b9be60f3a7");
+        let tx = |tx_type, chain_id| RawEvmTx {
+            tx_type,
+            chain_id,
+            nonce: 3,
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 2,
+            gas: 21000,
+            to: Some([0x11; 20]),
+            value: u256(5),
+            data: &[],
+        };
+        for tx_type in [EvmTxType::Legacy, EvmTxType::Eip2930, EvmTxType::Eip1559] {
+            assert_eq!(tx(tx_type, 0).sign(&key), Err(Error::MissingChainId));
+            let sig = tx(tx_type, 1).sign(&key).unwrap();
+            assert_eq!(tx(tx_type, 1).recover_sender(&sig), Ok(sender));
+            if tx_type == EvmTxType::Legacy {
+                assert!(sig.v == 37 || sig.v == 38, "{}", sig.v);
+            } else {
+                assert!(sig.v <= 1);
+                assert_eq!(
+                    tx(tx_type, 0).sign_unprotected(&key),
+                    Err(Error::UnsupportedTxType)
+                );
+            }
+        }
+        // the explicit opt-in gives the pre-EIP-155 form, for chain id 0 only
+        let legacy = tx(EvmTxType::Legacy, 0);
+        let sig = legacy.sign_unprotected(&key).unwrap();
+        assert!(sig.v == 27 || sig.v == 28, "{}", sig.v);
+        assert_eq!(legacy.recover_sender(&sig), Ok(sender));
+        assert_eq!(
+            tx(EvmTxType::Legacy, 1).sign_unprotected(&key),
+            Err(Error::InvalidData)
+        );
+        // an existing unprotected transaction still encodes and hashes
+        let mut out = [0u8; 128];
+        let n = legacy.encode_signed_to_slice(&sig, &mut out).unwrap();
+        assert_eq!(legacy.signed_len(&sig), Ok(n));
+        legacy.tx_hash(&sig).unwrap();
     }
 
     /// A legacy `v` that does not fit a `u64` is an error, not a wrapped
