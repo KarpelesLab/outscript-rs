@@ -71,11 +71,34 @@
 //! pool), and Orchard proofs for the cross-address restricted circuit.
 //! These are rules about the chain, which the parser does not apply.
 //!
-//! The transparent parts follow Bitcoin: P2PKH outputs, ECDSA signatures with
-//! a sighash type byte, and `push(sig) push(pubkey)` scriptSigs. What differs
-//! is the header (version group and consensus branch ids, expiry height) and
-//! the digests, which are personalized BLAKE2b-256 trees rather than double
-//! SHA-256.
+//! The transparent parts follow Bitcoin: the same scripts, ECDSA signatures
+//! with a sighash type byte, and scriptSigs of pushes. What differs is the
+//! header (version group and consensus branch ids, expiry height) and the
+//! digests, which are personalized BLAKE2b-256 trees rather than double
+//! SHA-256, and commit to the scriptPubKey of the output spent, never to a
+//! redeem script.
+//!
+//! # Signing
+//!
+//! [`ZcashTx::sign_to_slice`] signs P2PKH inputs, one key each.
+//! [`ZcashTx::sign_with_to_slice`] signs each input as an [`InputSpend`]
+//! says: with the key of a P2PKH or P2PK output, with keys of a
+//! multisignature script (a bare one, or the redeem script of a P2SH
+//! output), with a scriptSig made elsewhere, or with a function for any
+//! other script; each for one of the six sighash types. Signatures made
+//! elsewhere (a hardware wallet, the co-signers of a multisignature) sign
+//! [`ZcashTx::sighash`] and are verified and assembled by
+//! [`ZcashTx::verify_input_signature`],
+//! [`ZcashTx::multisig_script_sig_to_slice`] and the functions next to
+//! them; [`ZcashTx::verify_input`] checks a finished input of these forms.
+//! There is no script interpreter here.
+//!
+//! # Coinbase transactions
+//!
+//! [`ZcashTxIn::coinbase`] is the input of a coinbase transaction, whose
+//! script [`coinbase_script_sig_to_slice`] makes from the height of the
+//! block; [`subsidy`] computes what the coinbase transaction of a block of
+//! the main network creates and must pay.
 //!
 //! Everything works without `alloc`, into caller buffers.
 //!
@@ -113,7 +136,13 @@ use crate::prelude::*;
 use crate::pushbytes::push_bytes_to_slice;
 use crate::sink::{Counter, Sink, SliceSink};
 
+mod coinbase;
+pub use coinbase::{
+    COINBASE_VOUT, MAX_COINBASE_SCRIPT_LEN, MIN_COINBASE_SCRIPT_LEN, coinbase_height_prefix,
+    coinbase_script_height, coinbase_script_sig_to_slice,
+};
 mod spend;
+pub mod subsidy;
 pub use spend::{
     InputSignature, InputSigner, InputSpend, MAX_INPUT_SIGNATURE_LEN, MAX_MULTISIG_KEYS,
     MAX_REDEEM_SCRIPT_SIZE, MAX_SCRIPT_SIZE, Multisig, ScriptKind, ScriptSigBuilder,
@@ -752,8 +781,9 @@ fn orchard_auth_digest(bundle: &[u8], pool: &ActionPool) -> Result<[u8; 32], Err
 const NO_SAPLING: &[u8] = &[0, 0];
 const NO_ORCHARD: &[u8] = &[0];
 
-/// The longest scriptSig [`ZcashTx::sign_input_to_slice`] writes: a DER
-/// signature with its sighash byte and an uncompressed key, each pushed.
+/// The longest scriptSig [`ZcashTx::sign_input_to_slice`] writes, that of
+/// a P2PKH input: a DER signature with its sighash byte and an
+/// uncompressed key, each pushed (33 bytes less with a compressed key).
 pub const MAX_SCRIPT_SIG_LEN: usize = 1 + 73 + 1 + 65;
 
 impl<'a> ZcashTx<'a> {
@@ -1031,8 +1061,8 @@ impl<'a> ZcashTx<'a> {
     }
 
     /// Whether this is a coinbase transaction: one input spending nothing.
-    fn is_coinbase(&self) -> bool {
-        matches!(self.inputs, [input] if input.txid == [0; 32] && input.vout == u32::MAX)
+    pub fn is_coinbase(&self) -> bool {
+        matches!(self.inputs, [input] if input.is_coinbase())
     }
 
     fn header_digest(&self) -> [u8; 32] {
