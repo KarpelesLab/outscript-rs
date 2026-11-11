@@ -42,7 +42,7 @@
 #[cfg(feature = "alloc")]
 use crate::prelude::*;
 
-use minizlib::{Buffer, Compressor, Raw};
+use compcol::embed::flate::{self, Buffer, Compressor, Raw};
 
 /// The length of the header each part starts with.
 pub const HEADER_LEN: usize = 8;
@@ -387,9 +387,9 @@ pub fn deflate_to_slice(data: &[u8], out: &mut [u8]) -> Result<usize, Error> {
 /// Decompresses a file received as [`Encoding::Zlib`], all parts together,
 /// into `out`. Returns the number of bytes written.
 pub fn inflate_to_slice(data: &[u8], out: &mut [u8]) -> Result<usize, Error> {
-    match minizlib::inflate(data, Buffer::new(out)) {
+    match flate::inflate(data, Buffer::new(out)) {
         Ok(len) => Ok(len as usize),
-        Err(minizlib::Error::OutputFull) => Err(Error::BufferTooSmall),
+        Err(flate::Error::OutputFull) => Err(Error::BufferTooSmall),
         Err(_) => Err(Error::InvalidCompression),
     }
 }
@@ -408,9 +408,9 @@ pub fn deflate(data: &[u8]) -> Vec<u8> {
 #[cfg(feature = "alloc")]
 pub fn inflate(data: &[u8], max_len: usize) -> Result<Vec<u8>, Error> {
     // A first pass for the length: it is nowhere to be found.
-    let len = match minizlib::inflate_len(data, max_len as u64) {
+    let len = match flate::inflate_len(data, max_len as u64) {
         Ok(len) => len as usize,
-        Err(minizlib::Error::OutputFull) => return Err(Error::TooLarge),
+        Err(flate::Error::OutputFull) => return Err(Error::TooLarge),
         Err(_) => return Err(Error::InvalidCompression),
     };
     let mut out = vec![0u8; len];

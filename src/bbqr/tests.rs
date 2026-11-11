@@ -219,12 +219,15 @@ fn compression_to_slice() {
         // through a window fails on any reference that reaches past it.
         let mut window = [0u8; 1024];
         let mut total = 0;
-        let output = minizlib::Stream::new(&mut window, 5000, |piece| {
+        let output = compcol::embed::flate::Stream::new(&mut window, 5000, |piece| {
             assert_eq!(piece, &data[total..total + piece.len()]);
             total += piece.len();
             Ok(())
         });
-        assert_eq!(minizlib::inflate(&compressed[..n], output), Ok(len as u64));
+        assert_eq!(
+            compcol::embed::flate::inflate(&compressed[..n], output),
+            Ok(len as u64)
+        );
         assert_eq!(total, len);
     }
 

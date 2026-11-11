@@ -92,7 +92,7 @@ cryptonote = ["ed25519"]
 bcur = []
 # Coinkite BBQr: headers, hex/base32 parts, zlib (raw deflate) payloads and
 # (with `alloc`) splitting and joining.
-bbqr = ["dep:minizlib"]
+bbqr = ["dep:compcol"]
 
 # --- curves (enabled by the chains above; usable on their own for the raw
 # `crypto` helpers) ---
@@ -106,7 +106,7 @@ num-traits = { version = "0.2", default-features = false, optional = true }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
 serde_json = { version = "1", default-features = false, features = ["alloc", "raw_value"], optional = true }
 hex = { version = "0.4", default-features = false, features = ["alloc"], optional = true }
-minizlib = { version = "0.1.1", default-features = false, features = ["decompress", "compress", "stored", "fixed", "dynamic"], optional = true }
+compcol = { version = "0.8.0", default-features = false, features = ["embed", "deflate"], optional = true }
 
 [dev-dependencies]
 hex = "0.4"

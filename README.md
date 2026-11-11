@@ -506,16 +506,16 @@ let (file_type, psbt) = joiner.finish()?;
 ```
 
 Compressed data stays within the 1 KiB window the specification asks for, so
-that hardware wallets can decompress it. The compressor ([minizlib]) is a small
-one: close to zlib on the likes of PSBTs, where little repeats, and a long way
-behind on very repetitive files. Anything zlib produces is decompressed.
+that hardware wallets can decompress it. The compressor ([compcol]'s
+`embed::flate`) is a small one: close to zlib on the likes of PSBTs, where
+little repeats, and a long way behind on very repetitive files. Anything zlib produces is decompressed.
 
 Both decoders bound what untrusted parts can make them allocate
 (`Decoder::with_limits`, `Joiner::with_max_len`).
 
 [BCR-2020-005]: https://github.com/BlockchainCommons/Research/blob/master/papers/bcr-2020-005-ur.md
 [BBQr]: https://github.com/coinkite/BBQr/blob/master/BBQr.md
-[minizlib]: https://crates.io/crates/minizlib
+[compcol]: https://crates.io/crates/compcol
 
 ### Block rewards
 
@@ -553,7 +553,7 @@ default:
 | Feature | Enables | Dependency |
 |---------|---------|------------|
 | `bcur` | Uniform Resources: bytewords, `ur:` strings, fountain encoder and decoder | |
-| `bbqr` | BBQr: parts, splitting and joining, compression | `minizlib` |
+| `bbqr` | BBQr: parts, splitting and joining, compression | `compcol` |
 
 The `secp256k1` and `ed25519` features can also be enabled on their own for
 the raw `crypto` helpers and the matching `PubKey` variant. Formats and
