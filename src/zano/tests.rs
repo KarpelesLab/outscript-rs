@@ -10,6 +10,10 @@
 //! zanolib's `zanocrypto/*_test.go` — themselves lines of the reference
 //! implementation's `tests/crypto/tests.txt`. The whole tables (1940
 //! vectors) pass too; they are not committed for their size.
+//!
+//! `testdata/cxx_vectors.txt`, `testdata/cxx_sign_vectors.txt` and
+//! `testdata/cxx/` come from Zano's C++ itself, through
+//! `testdata/zano_harness.cpp` (see the `cxx` module).
 
 use super::*;
 use crate::cryptonote::{EdwardsPoint, Scalar, hash_to_ec, scalar_from_bytes};
@@ -18,6 +22,8 @@ use crate::cryptonote::{EdwardsPoint, Scalar, hash_to_ec, scalar_from_bytes};
 mod assets;
 #[cfg(feature = "alloc")]
 mod chain;
+#[cfg(feature = "alloc")]
+mod cxx;
 #[cfg(feature = "alloc")]
 mod full;
 #[cfg(feature = "alloc")]

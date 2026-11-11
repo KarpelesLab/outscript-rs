@@ -1,0 +1,65 @@
+How zano_harness.cpp was built and run (Linux, gcc 15, 2026-11).
+
+The harness is one translation unit linked with the static libraries of
+Zano's own tree; nothing of the daemon or of the wallet needs building.
+
+1. Sources
+
+   git clone --depth 1 https://github.com/hyle-team/zano      (d1f2d9655d1aebf05d4ed281f2c691f9f9078bd1, 2.2.3.608)
+   git submodule update --init --depth 1 contrib/miniupnp contrib/jwt-cpp contrib/bitcoin-secp256k1
+
+   Boost 1.84.0 (the tree does not build with Boost 1.90: boost::asio::io_service is gone),
+   static, in a private prefix:
+   ./bootstrap.sh --with-libraries=system,filesystem,locale,thread,timer,date_time,chrono,regex,serialization,atomic,program_options,log --prefix=$BOOST
+   ./b2 link=static cxxflags=-fPIC variant=release install
+
+2. Changes to the tree, for this machine only (none touches the code under test)
+
+   CMakeLists.txt:      set(OPENSSL_USE_STATIC_LIBS FALSE)   (no static OpenSSL here)
+                        drop "-fuse-ld=gold"                  (no gold linker here)
+   src/CMakeLists.txt:  BOOST_STACKTRACE_USE_NOOP instead of BOOST_STACKTRACE_USE_BACKTRACE (no libbacktrace here)
+
+3. Libraries
+
+   cmake -DCMAKE_BUILD_TYPE=Release -DDISABLE_TOR=ON -DDISABLE_MDBX=TRUE -DBoost_USE_STATIC_LIBS=ON \
+         -DBOOST_ROOT=$BOOST -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
+   make currency_core crypto common zlibstatic ethash lmdb
+
+4. The harness ($Z the tree, $B its build directory)
+
+   c++ -std=gnu++17 -O1 -fpermissive -ftemplate-depth-1024 -w -D_GNU_SOURCE -DNDEBUG \
+     -DBOOST_NO_CXX98_FUNCTION_BASE -DBOOST_STACKTRACE_USE_NOOP -DDISABLE_TOR -DSTATICLIB -DUSE_OPEN_SSL_FOR_ECDSA \
+     -I$Z/src -I$Z/contrib/eos_portable_archive -I$Z/contrib -I$Z/contrib/epee/include -I$Z/contrib/jwt-cpp/include \
+     -I$B/version -I$B/contrib/zlib -isystem $BOOST/include -isystem $Z/contrib/ethereum/libethash \
+     -flto=2 zano_harness.cpp -o zano_harness \
+     $B/src/libcurrency_core.a $B/src/libcrypto.a $B/src/libcommon.a $B/contrib/zlib/libz.a \
+     $B/contrib/ethereum/libethash/libethash.a $B/contrib/db/liblmdb/liblmdb.a \
+     $BOOST/lib/libboost_filesystem.a $BOOST/lib/libboost_locale.a $BOOST/lib/libboost_thread.a \
+     $BOOST/lib/libboost_timer.a $BOOST/lib/libboost_date_time.a $BOOST/lib/libboost_chrono.a \
+     $BOOST/lib/libboost_regex.a $BOOST/lib/libboost_serialization.a $BOOST/lib/libboost_atomic.a \
+     $BOOST/lib/libboost_program_options.a $BOOST/lib/libboost_log.a \
+     -lssl -lcrypto -ldl -licudata -licui18n -licuuc -lrt -lpthread
+
+5. The fixtures ($T this directory, $D a scratch directory)
+
+   ./zano_harness vectors > $T/cxx_vectors.txt
+
+   OUTSCRIPT_ZANO_CXX_DIR=$D cargo test --features zano --lib zano::tests::cxx::export -- --include-ignored
+   writes, for each scenario of src/zano/tests/cxx.rs, <name>.unsigned.bin (the unsigned
+   transaction outscript makes), <name>.rust_signed.bin (what outscript signs from it),
+   <name>.keys (view and spend secret keys of the sender, then of the recipient) and two
+   blobs the harness must refuse (<name>.bad_outs.bin, <name>.bad_fee.bin: it does).
+
+   Then, for each <name> (v4_assets v4_mixed v4_bare v3_mixed v2_native), with the keys of <name>.keys:
+
+   ./zano_harness sign  $view $spend $D/<name>.unsigned.bin $T/cxx/<name>.signed.bin
+   ./zano_harness check $view $spend $D/<name>.rust_signed.bin $rview $rspend   -> lines "<name> rust ..."
+   ./zano_harness check $view $spend $T/cxx/<name>.signed.bin  $rview $rspend   -> lines "<name> cxx ..."
+
+   whose lines starting with check, outs, items, ACCEPTED or REJECTED make cxx_sign_vectors.txt.
+   `construct_tx` draws its own randomness, so signing again gives other blobs (and other
+   "cxx" lines); the "rust" lines do not change as long as outscript signs the same bytes.
+
+The structures of the older wallet layouts in zano_harness.cpp are copied from
+src/currency_core/currency_format_utils_transactions.h and currency_format_utils.h of the tags
+2.1.0.382 (the same up to 2.1.7.424) and 2.1.19.477 (the same from 2.1.8.428 on).
