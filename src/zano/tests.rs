@@ -21,6 +21,8 @@ use crate::cryptonote::{EdwardsPoint, Scalar, hash_to_ec, scalar_from_bytes};
 #[cfg(feature = "alloc")]
 mod assets;
 #[cfg(feature = "alloc")]
+mod blocks;
+#[cfg(feature = "alloc")]
 mod chain;
 #[cfg(feature = "alloc")]
 mod cxx;

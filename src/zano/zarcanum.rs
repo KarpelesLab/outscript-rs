@@ -51,12 +51,13 @@ pub struct StakeContext {
     /// second half of the stake modifier).
     pub last_pos_kernel_id: [u8; 32],
     /// The proof-of-stake difficulty the block has to meet
-    /// (`pos_basic_difficulty`).
+    /// (`pos_basic_difficulty`; the `difficulty` the daemon reports for the
+    /// block). For a stake before hard fork 4, zero leaves the kernel
+    /// unchecked: only the signature of the stake is verified then.
     pub pos_difficulty: u128,
     /// The outputs the stake input refers to, in ring order. Their global
     /// indices are not used. Empty for a stake before hard fork 4, whose
-    /// ring goes with the other inputs' (and whose kernel is not checked
-    /// against the difficulty).
+    /// ring goes with the other inputs'.
     pub ring: Vec<RingMember>,
 }
 
@@ -71,7 +72,31 @@ impl StakeContext {
         kernel[72..].copy_from_slice(key_image);
         cn_fast_hash(&kernel)
     }
+
+    /// Whether the kernel of a stake of `amount` in the open — what blocks
+    /// staked before hard fork 4 — meets the difficulty
+    /// (`validate_pos_block`): the [kernel hash](Self::kernel_hash) passes
+    /// [`check_hash`](super::check_hash) for `pos_difficulty / amount`.
+    /// `false` for a zero amount.
+    ///
+    /// The kernel hash of a block is the `last_pos_kernel_id` of the next
+    /// proof-of-stake block; the first one of the main network had
+    /// [`POS_STARTER_KERNEL_HASH`].
+    pub fn check_bare_kernel(&self, key_image: &[u8; 32], amount: u64) -> bool {
+        amount != 0
+            && super::block::check_hash(
+                &self.kernel_hash(key_image),
+                self.pos_difficulty / u128::from(amount),
+            )
+    }
 }
+
+/// `POS_STARTER_KERNEL_HASH`: what stands for the kernel hash of the last
+/// proof-of-stake block in the stake modifier of the first one.
+pub const POS_STARTER_KERNEL_HASH: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x38, 0x2a, 0x8d, 0x8f, 0x94, 0x58,
+    0x8c, 0xe9, 0x3a, 0x13, 0x51, 0x92, 0x4f, 0x6c, 0xcb, 0x9e, 0x07, 0xdd, 0x28, 0x7c, 0x6e, 0x4b,
+];
 
 /// `floor(l / (2^64 * difficulty))`, as little-endian limbs
 /// (`zarcanum_precalculate_l_div_z_D`); `None` for a zero difficulty.

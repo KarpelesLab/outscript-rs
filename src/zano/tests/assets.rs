@@ -15,7 +15,7 @@ use crate::prelude::*;
 
 /// An output of `amount` of `asset_id` to `wallet`, as the sender with the
 /// transaction key `tx_secret` builds it at `index`.
-fn pay(
+pub(super) fn pay(
     wallet: &Wallet,
     tx_secret: &Scalar,
     index: u64,
@@ -45,7 +45,7 @@ fn pay(
 
 /// A ring around `real` at global index `real_index`: decoys that are
 /// points and nothing more.
-fn ring_around(real: RingMember, size: u64) -> Vec<RingMember> {
+pub(super) fn ring_around(real: RingMember, size: u64) -> Vec<RingMember> {
     (0..size)
         .map(|i| {
             if i == real.global_index % size {

@@ -237,7 +237,10 @@ impl Transaction {
     ///   asset operation
     ///   ([`verify_asset_operation`](Self::verify_asset_operation));
     /// - for the first transaction of a proof-of-stake block, the stake
-    ///   proof.
+    ///   proof: the Zarcanum proof from hard fork 4 on; before, the
+    ///   signature of the stake over the block id and, if the
+    ///   [`StakeContext`] has a difficulty, the kernel of the stake against
+    ///   it.
     ///
     /// What is *not* checked is what only the chain knows: that the rings
     /// are the outputs the inputs refer to, that the key images are unspent,
@@ -329,7 +332,15 @@ impl Transaction {
                     tx_id
                 };
                 let keys: Vec<[u8; 32]> = ring.iter().map(|m| m.stealth_address).collect();
-                verify_ring_signature(message, &keys, &input.k_image, sig)
+                let signed = verify_ring_signature(message, &keys, &input.k_image, sig);
+                // The kernel of the stake against the difficulty, if the
+                // context has one.
+                if let Some(stake) = stake.filter(|s| is_stake && signed && s.pos_difficulty != 0)
+                    && !stake.check_bare_kernel(&input.k_image, input.amount)
+                {
+                    return Err(VerifyError::Stake);
+                }
+                signed
             }
             (Variant::ZcInput(input), Variant::ZcSig(sig)) => {
                 if ring.len() != input.key_offsets.len() {

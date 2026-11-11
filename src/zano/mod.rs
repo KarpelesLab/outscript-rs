@@ -45,9 +45,16 @@
 //! - **Assets**: asset operations (`AssetDescriptorOperation`), the
 //!   derivation of an asset id (`AssetDescriptorBase::asset_id`), and
 //!   `Transaction::verify_asset_operation`.
+//! - **Blocks**: `Block` and `BlockHeader` as they are serialized, the
+//!   block id, the tree hash of the transactions (`tree_hash`), the reward
+//!   a block of a given size may create (`block_reward`), and the check of
+//!   a hash against a difficulty (`check_hash`).
 //! - **Wire formats**: `Transaction` and its `Variant`s for versions 0 to
 //!   4, the wallet blobs, ChaCha8 and ChaCha20 ([`chacha8`], [`chacha20`])
 //!   and epee portable storage (`epee`).
+//! - **Daemon replies**: the decoys `getrandom_outs3` gives
+//!   (`parse_random_outs_reply`), whose binary strings a JSON library does
+//!   not read.
 //!
 //! The network client (`zanorpc`) and threshold signing (`zanompc`) of
 //! zanolib are not ported; `InputSigner` is the seam the latter plugs
@@ -170,11 +177,15 @@ mod asset;
 #[cfg(feature = "alloc")]
 mod bge;
 #[cfg(feature = "alloc")]
+mod block;
+#[cfg(feature = "alloc")]
 mod bpp;
 mod chacha8;
 #[cfg(feature = "alloc")]
 mod clsag;
 mod crypto;
+#[cfg(feature = "alloc")]
+mod daemon;
 #[cfg(feature = "alloc")]
 pub mod epee;
 #[cfg(feature = "alloc")]
@@ -231,9 +242,20 @@ pub use asset::verify_eth_signature;
 #[cfg(feature = "alloc")]
 pub use bge::{BGE_MAX_RING_SIZE, generate_bge_proof, verify_bge_proof};
 #[cfg(feature = "alloc")]
+pub use block::{
+    BLOCK_FLAG_POS, BLOCK_GRANTED_FULL_REWARD_ZONE, BLOCK_MAJOR_VERSION_MAX, BLOCK_REWARD, Block,
+    BlockHeader, PREMINE_AMOUNT, REWARD_BLOCKS_WINDOW, block_reward, check_hash, median_block_size,
+    tree_hash,
+};
+#[cfg(feature = "alloc")]
 pub use bpp::{BPP_MAX_VALUES, generate_bpp, verify_bpp};
 #[cfg(feature = "alloc")]
 pub use clsag::{ClsagGgxInput, generate_clsag_ggx, verify_clsag_ggx};
+#[cfg(feature = "alloc")]
+pub use daemon::{
+    RANDOM_OUT_FLAG_COINBASE, RANDOM_OUT_FLAG_NOT_ALLOWED, RANDOM_OUT_FLAG_POS_COINBASE, RandomOut,
+    RandomOuts, decode_random_outs, json_binary_string, parse_random_outs_reply,
+};
 #[cfg(feature = "alloc")]
 pub use ftp::{
     FinalizeTxParam, FinalizedTx, FtpFormat, KeyImageIndex,
@@ -282,7 +304,9 @@ pub use verify::{VerifyContext, VerifyError};
 #[cfg(feature = "alloc")]
 pub use view::ViewWalletData;
 #[cfg(feature = "alloc")]
-pub use zarcanum::{StakeContext, verify_bppe, verify_clsag_ggxxg, verify_zarcanum_proof};
+pub use zarcanum::{
+    POS_STARTER_KERNEL_HASH, StakeContext, verify_bppe, verify_clsag_ggxxg, verify_zarcanum_proof,
+};
 
 /// Errors specific to Zano.
 ///
