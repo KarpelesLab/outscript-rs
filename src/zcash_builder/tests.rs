@@ -1619,3 +1619,7 @@ fn full_transaction() {
     let nullifier = ow.note.nullifier(&ow.fvk).to_bytes();
     assert!(actions.actions().any(|a| a.nullifier == nullifier));
 }
+
+#[cfg(feature = "std")]
+#[path = "funding_tests.rs"]
+mod funding;

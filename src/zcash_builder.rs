@@ -51,7 +51,12 @@
 //!   ([`zcashtx::branch`](crate::zcashtx::branch)), an expiry height and a lock
 //!   time. A transaction made for one upgrade is invalid under another.
 //! - **Transparent inputs**: the outpoint, the amount and scriptPubKey of
-//!   the output it spends (a P2PKH output), and its private key.
+//!   the output it spends, and what signs it: the private key of a P2PKH
+//!   or P2PK output, private keys of a multisignature (bare, or the
+//!   redeem script of a P2SH output), a function that makes the scriptSig
+//!   of any other script from the signature digest, or nothing yet, for
+//!   an input that is signed elsewhere (see below). Each input has its
+//!   own sighash type, `SIGHASH_ALL` unless chosen.
 //! - **Sapling spends** (`add_sapling_spend`): the expanded spending key,
 //!   the note (as found when scanning), its Merkle path in the Sapling
 //!   note commitment tree and the root of that tree, the *anchor*, which
@@ -79,11 +84,52 @@
 //!   is derived. All must come fresh from a cryptographically secure
 //!   generator: reusing or predicting them reveals values, links spends
 //!   or leaks keys.
-//! - **The fee**. The builder adds no change output: the fee is the value
-//!   that goes in and does not come out, [`Builder::fee`]. To avoid paying
-//!   an unintended one, [`Builder::build`] is told the fee and fails if it
-//!   is not exactly that. [`Builder::conventional_fee`] gives the fee
-//!   ZIP-317 asks of the transaction as it stands.
+//! - **The fee**. The fee is the value that goes in and does not come
+//!   out, [`Builder::fee`]. To avoid paying an unintended one,
+//!   [`Builder::build`] is told the fee and fails if it is not exactly
+//!   that; it adds no output of its own. [`Builder::conventional_fee`]
+//!   gives the fee ZIP-317 asks of the transaction as it stands. The
+//!   builder can also decide the fee and add the change output itself:
+//!   see below.
+//!
+//! # Change
+//!
+//! [`Builder::fund`] makes the transaction balance: given a fee rule
+//! ([`FeeRule::Zip317`], the conventional fee of the transaction as it
+//! will be, or a fixed fee) and where the change goes ([`Change`]), it
+//! adds the change output and returns the fee to state to
+//! [`Builder::build`] ([`Builder::fund_and_build`] does both). The change
+//! goes to a transparent script, or to the sender's *internal* shielded
+//! address (ZIP 32, ZIP 316): an address derived from the same keys as
+//! the ones the sender gives out, that is never given to anyone, so that
+//! the viewing keys the sender shares with others do not read its change.
+//! In the Orchard and Ironwood pools the builder derives that address
+//! from the key it is given; for Sapling the caller gives the address
+//! (`sapling::zip32::ExtendedFullViewingKey::internal`).
+//!
+//! # Signing elsewhere
+//!
+//! A transparent input can be left to a signer that is not this program
+//! (a hardware wallet, the co-signers of a multisignature):
+//! [`Builder::add_transparent_input_external`], then
+//! [`Builder::build_pending`], which proves and signs the shielded parts
+//! and returns a [`PendingTransaction`]. It gives the digest each such
+//! input must sign, takes the signatures, verifies each against its key
+//! and the output spent, and finishes the transaction. (The shielded
+//! spends can be signed elsewhere too, bundle by bundle: see
+//! `sapling::builder` and `orchard::builder`.)
+//!
+//! # Coinbase transactions
+//!
+//! [`Builder::new_coinbase`] starts the coinbase transaction of a block:
+//! the input that spends nothing, with the height of the block in its
+//! script, the expiry height consensus requires, and outputs only,
+//! transparent or shielded (made, as consensus requires, with the
+//! all-zero outgoing viewing key, in bundles that disable spends and are
+//! not padded). [`Builder::build_coinbase`] is told the value the outputs
+//! must total. What that value is, and which outputs a block must have
+//! (the funding streams), [`zcashtx::subsidy`](crate::zcashtx::subsidy)
+//! computes for the main network.
 //!
 //! # Value pools
 //!
@@ -99,13 +145,35 @@
 //!
 //! The Orchard proof is made for the circuit version of the consensus
 //! branch (`orchard_circuit_version`). From NU6.3 (ZIP 258, ZIP 2006) the
-//! Orchard pool only empties: a note can only be created in it at the
-//! address of a note spent in the same bundle, which the Orchard builder
-//! enforces (see `orchard::builder`), and its value balance cannot be
-//! negative ([`Error::OrchardPoolClosed`]). Shielded payments go to the
+//! Orchard pool only empties: its value balance cannot be negative
+//! ([`Error::OrchardPoolClosed`]), and a note can only be created in it
+//! at an address of the wallet that makes the transaction. The Orchard
+//! bundle is then built as ZIP 326 specifies and the reference wallet
+//! does (see `orchard::builder`): each note spent has an action of its
+//! own, each note kept (`add_orchard_change`: change at the internal
+//! address) another, so that a bundle has as many actions as spends and
+//! outputs together, which the fee counts. Shielded payments go to the
 //! Ironwood pool, whose bundles have no such restriction; the same
-//! unified addresses and keys serve both pools. An Ironwood bundle is
-//! padded to at least two actions, as an Orchard one.
+//! unified addresses and keys serve both pools.
+//!
+//! An Orchard or Ironwood bundle is padded to at least two actions,
+//! unless `set_orchard_bundle_type` or `set_ironwood_bundle_type` says
+//! otherwise (`orchard::builder::BundleType::UNPADDED`: a bundle of a
+//! single action is valid, and tells the shape of the transaction).
+//!
+//! # What is not here
+//!
+//! - Keys derived with `use_qsk` (ZIP 2005, ZIP 326): the reference
+//!   implementation (`orchard` 0.16.0, `zcash_keys` 0.17.0) does not have
+//!   them, so there is nothing to check an implementation against; the
+//!   keys and addresses of this crate are those every wallet has today
+//!   (`use_qsk = false`), which the Ironwood pool accepts.
+//! - A script interpreter: the transparent inputs the builder signs are
+//!   of the standard forms above, and any other script is the caller's
+//!   (`InputSigner::Custom`).
+//! - The selection of the notes and coins to spend, and the rules about
+//!   blocks (what a coinbase transaction must pay is computed, for the
+//!   main network, but not enforced).
 
 use core::marker::PhantomData;
 
@@ -113,7 +181,10 @@ use crate::crypto::secp256k1::SecpPrivateKey;
 use crate::hash::hash160;
 use crate::prelude::*;
 use crate::zcashtx::{
-    MAX_SCRIPT_SIG_LEN, SIGHASH_ALL, TxVersion, ZcashTx, ZcashTxIn, ZcashTxOut, zip317,
+    InputSignature, InputSigner, InputSpend, MAX_INPUT_SIGNATURE_LEN, MAX_SCRIPT_SIG_LEN,
+    MAX_SCRIPT_SIZE, Multisig, SIGHASH_ALL, ScriptKind, TxVersion, ZcashTx, ZcashTxIn, ZcashTxOut,
+    coinbase_script_sig_to_slice, is_valid_sighash_type, p2pk_script_sig_to_slice, p2pkh_script,
+    p2pkh_script_sig_to_slice, zip317,
 };
 
 #[cfg(feature = "zcash-orchard-prover")]
@@ -172,8 +243,20 @@ pub enum Error {
     IronwoodNeedsV6,
     /// The Orchard bundle takes more value in than it spends, which
     /// consensus forbids from NU6.3 (ZIP 258): what is to be shielded
-    /// goes to the Ironwood pool.
+    /// goes to the Ironwood pool. Also an Orchard output in a coinbase
+    /// transaction from NU6.3, which can have no Orchard action.
     OrchardPoolClosed,
+    /// A coinbase transaction spends nothing and is built with
+    /// [`Builder::build_coinbase`]; any other transaction is not.
+    Coinbase,
+    /// The transaction has an output to a TEX address (ZIP 320), which
+    /// must be paid from transparent funds only, and shielded spends.
+    TransparentSourceOnly,
+    /// The transparent input of this index is signed elsewhere, and its
+    /// signatures were not given.
+    MissingTransparentSignature(usize),
+    /// The unified address has no transparent receiver.
+    NoTransparentReceiver,
 }
 
 impl core::fmt::Display for Error {
@@ -203,6 +286,14 @@ impl core::fmt::Display for Error {
             Error::OrchardPoolClosed => {
                 f.write_str("no value can enter the Orchard pool from NU6.3")
             }
+            Error::Coinbase => f.write_str("not possible in, or only in, a coinbase transaction"),
+            Error::TransparentSourceOnly => {
+                f.write_str("an output to a TEX address needs transparent funds only")
+            }
+            Error::MissingTransparentSignature(index) => {
+                write!(f, "transparent input {index} is not signed")
+            }
+            Error::NoTransparentReceiver => f.write_str("no transparent receiver"),
         }
     }
 }
@@ -299,14 +390,95 @@ impl<'a> Provers<'a> {
 
 /// A transparent input and what signs it.
 struct TransparentInput<'k> {
-    key: &'k SecpPrivateKey,
+    /// What makes the scriptSig, or `None` for signatures made elsewhere.
+    signer: Option<InputSigner<'k>>,
+    /// The sighash type of the signatures.
+    hash_type: u8,
     txid: [u8; 32],
     vout: u32,
     sequence: u32,
     amount: u64,
     script: Vec<u8>,
-    /// The length of the public key the scriptSig will reveal.
-    pubkey_len: usize,
+    /// The most bytes the scriptSig can take, which the fee counts.
+    script_sig_len: usize,
+}
+
+impl TransparentInput<'_> {
+    /// The serialized size of the input, once signed, at most.
+    fn size(&self) -> usize {
+        36 + crate::BtcVarInt(self.script_sig_len as u64).len() + self.script_sig_len + 4
+    }
+}
+
+/// How the fee of a transaction is decided when the builder funds it
+/// ([`Builder::fund`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeeRule {
+    /// The conventional fee of ZIP 317 for the transaction as it will be,
+    /// change included.
+    Zip317,
+    /// This fee, in zatoshis, whatever the transaction is.
+    Fixed(u64),
+}
+
+/// Where the value a transaction neither sends nor pays as its fee goes:
+/// the change, for [`Builder::fund`].
+#[derive(Clone, Copy)]
+pub enum Change<'a> {
+    /// To a transparent output with this scriptPubKey.
+    Transparent(&'a [u8]),
+    /// To a Sapling output at `to`, an address of the sender: ordinarily
+    /// the default address of the *internal* full viewing key of the
+    /// account (ZIP 32:
+    /// `sapling::zip32::ExtendedFullViewingKey::internal`), which is never
+    /// given to anyone, with the internal outgoing viewing key. `random`
+    /// is as for [`Builder::add_sapling_output`]. A Sapling anchor, if the
+    /// transaction has Sapling spends, must be set before.
+    #[cfg(feature = "zcash-sapling-prover")]
+    Sapling {
+        /// The outgoing viewing key that will recover the change.
+        ovk: Option<&'a crate::sapling::keys::OutgoingViewingKey>,
+        /// The address of the sender the change goes to.
+        to: &'a crate::sapling::keys::PaymentAddress,
+        /// Fresh random bytes.
+        random: &'a [u8; crate::sapling::builder::OUTPUT_RANDOM_SIZE],
+    },
+    /// To the Orchard pool, at the internal address of this spending key
+    /// (ZIP 32: `fvk.address_at(0, Scope::Internal)`), recoverable with
+    /// its internal outgoing viewing key: see
+    /// [`Builder::add_orchard_change`]. From NU6.3 only value that the
+    /// transaction spends from the Orchard pool can stay in it.
+    #[cfg(feature = "zcash-orchard-prover")]
+    Orchard(&'a crate::orchard::keys::SpendingKey),
+    /// To the Ironwood pool (a version 6 transaction), at the internal
+    /// address of this full viewing key, recoverable with its internal
+    /// outgoing viewing key: see [`Builder::add_ironwood_change`].
+    #[cfg(feature = "zcash-orchard-prover")]
+    Ironwood(&'a crate::orchard::keys::FullViewingKey),
+}
+
+impl core::fmt::Debug for Change<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Change::Transparent(_) => "Transparent",
+            #[cfg(feature = "zcash-sapling-prover")]
+            Change::Sapling { .. } => "Sapling",
+            #[cfg(feature = "zcash-orchard-prover")]
+            Change::Orchard(_) => "Orchard",
+            #[cfg(feature = "zcash-orchard-prover")]
+            Change::Ironwood(_) => "Ironwood",
+        })
+    }
+}
+
+/// What [`Builder::fund`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Funding {
+    /// The fee the transaction pays, in zatoshis: what to state to
+    /// [`Builder::build`].
+    pub fee: u64,
+    /// The value of the change output added, in zatoshis; 0 when none was.
+    pub change: u64,
 }
 
 /// The Sapling parts.
@@ -326,17 +498,54 @@ struct OrchardParts {
     asks: Vec<crate::orchard::keys::SpendAuthorizingKey>,
     spends: usize,
     outputs: usize,
+    /// How the bundle is padded, when the caller chose.
+    bundle_type: Option<crate::orchard::builder::BundleType>,
 }
 
 #[cfg(feature = "zcash-orchard-prover")]
 impl OrchardParts {
-    /// The number of actions the bundle will have: none without parts,
-    /// otherwise what the Orchard builder pads to.
-    fn actions(&self) -> usize {
-        if self.spends + self.outputs == 0 {
-            0
-        } else {
-            self.spends.max(self.outputs).max(2)
+    fn new(version: Option<CircuitVersion>) -> Self {
+        OrchardParts {
+            version,
+            anchor: None,
+            builder: None,
+            asks: Vec::new(),
+            spends: 0,
+            outputs: 0,
+            bundle_type: None,
+        }
+    }
+
+    /// The number of actions the bundle will have, with `extra` more
+    /// outputs of the wallet itself: none without parts, otherwise what
+    /// the Orchard builder makes of them (see `orchard::builder`: as many
+    /// as spends or outputs, whichever is more, or their sum in a bundle
+    /// without cross-address transfers, and two at least unless the bundle
+    /// type says otherwise). `ironwood` and `coinbase` tell the bundle a
+    /// first part would start.
+    fn actions(&self, extra: usize, ironwood: bool, coinbase: bool) -> usize {
+        use crate::orchard::builder::BundleType;
+        match &self.builder {
+            Some(builder) => builder
+                .num_actions_with(extra)
+                // a bundle that cannot be built: the build will say
+                .unwrap_or(self.spends + self.outputs + extra),
+            None if extra == 0 => 0,
+            None => {
+                let restricted = !ironwood
+                    && self
+                        .version
+                        .is_some_and(|v| v.supports_cross_address_restriction());
+                let bundle_type = match (coinbase, self.bundle_type) {
+                    (true, _) => BundleType::Coinbase,
+                    (false, Some(bundle_type)) => bundle_type,
+                    (false, None) => BundleType::DEFAULT,
+                };
+                let flags = crate::orchard::bundle::Flags::from_parts(!coinbase, true);
+                bundle_type
+                    .num_actions(restricted, flags, 0, extra)
+                    .unwrap_or(extra)
+            }
         }
     }
 }
@@ -394,6 +603,12 @@ const SEED_IRONWOOD_BUILD: u8 = 4;
 #[cfg(feature = "zcash-orchard-prover")]
 const SEED_IRONWOOD_SIGN: u8 = 5;
 
+/// The all-zero outgoing viewing key the shielded outputs of a coinbase
+/// transaction are made with, so that anyone can decrypt them (ZIP 213).
+#[cfg(feature = "zcash-sapling-prover")]
+const COINBASE_SAPLING_OVK: crate::sapling::keys::OutgoingViewingKey =
+    crate::sapling::keys::OutgoingViewingKey([0; 32]);
+
 /// A built transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
@@ -419,6 +634,12 @@ pub struct Builder<'k> {
     lock_time: u32,
     inputs: Vec<TransparentInput<'k>>,
     outputs: Vec<(u64, Vec<u8>)>,
+    /// The script of the input of a coinbase transaction.
+    coinbase: Option<Vec<u8>>,
+    /// The sequence number of that input.
+    coinbase_sequence: u32,
+    /// An output goes to a TEX address.
+    transparent_source_only: bool,
     #[cfg(feature = "zcash-sapling-prover")]
     sapling: SaplingParts,
     #[cfg(feature = "zcash-orchard-prover")]
@@ -464,27 +685,73 @@ impl<'k> Builder<'k> {
             lock_time,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            coinbase: None,
+            coinbase_sequence: u32::MAX,
+            transparent_source_only: false,
             #[cfg(feature = "zcash-sapling-prover")]
             sapling: SaplingParts::default(),
             #[cfg(feature = "zcash-orchard-prover")]
-            orchard: OrchardParts {
-                version: orchard_circuit_version(consensus_branch_id),
-                anchor: None,
-                builder: None,
-                asks: Vec::new(),
-                spends: 0,
-                outputs: 0,
-            },
+            orchard: OrchardParts::new(orchard_circuit_version(consensus_branch_id)),
             #[cfg(feature = "zcash-orchard-prover")]
-            ironwood: OrchardParts {
-                version: Some(CircuitVersion::PostNu6_3),
-                anchor: None,
-                builder: None,
-                asks: Vec::new(),
-                spends: 0,
-                outputs: 0,
-            },
+            ironwood: OrchardParts::new(Some(CircuitVersion::PostNu6_3)),
         }
+    }
+
+    /// A builder of the coinbase transaction of the block at `height`,
+    /// mined under the network upgrade of `consensus_branch_id`.
+    ///
+    /// The transaction has the one input a coinbase transaction has (a
+    /// null outpoint, the final sequence number), whose script is the
+    /// height followed by `extra`, the miner's own bytes
+    /// ([`coinbase_script_sig_to_slice`]: [`Error::Tx`] with `InvalidData`
+    /// for height 0, `TooLarge` for a script over 100 bytes); its expiry
+    /// height is the height of the block, as consensus requires from NU5,
+    /// and its lock time 0. It takes outputs only
+    /// ([`Error::Coinbase`] for anything spent), and is built by
+    /// [`build_coinbase`](Self::build_coinbase).
+    ///
+    /// **What the outputs must be is not checked.** Consensus requires
+    /// their total to be exactly the block subsidy plus the miner's share
+    /// of the fees of the block, minus what goes to the lockbox, and
+    /// requires an output for each funding stream:
+    /// [`zcashtx::subsidy`](crate::zcashtx::subsidy) computes the subsidy
+    /// and the funding streams of the main network.
+    ///
+    /// The shielded outputs of a coinbase transaction (ZIP 213) are made
+    /// as consensus requires, whatever outgoing viewing key the caller
+    /// gives: with the all-zero outgoing viewing key, so that anyone can
+    /// decrypt them; in bundles that disable spends and are not padded
+    /// (`enableSpendsOrchard = 0`, and in a version 6 transaction
+    /// `enableSpendsIronwood = 0`). From NU6.3 a coinbase transaction can
+    /// have no Orchard action ([`Error::OrchardPoolClosed`]): its Orchard
+    /// protocol outputs go to the Ironwood pool.
+    pub fn new_coinbase(
+        consensus_branch_id: u32,
+        height: u32,
+        extra: &[u8],
+    ) -> Result<Self, Error> {
+        let mut script = [0u8; crate::zcashtx::MAX_COINBASE_SCRIPT_LEN];
+        let n = coinbase_script_sig_to_slice(height, extra, &mut script)?;
+        let mut builder = Self::new(consensus_branch_id, height, 0);
+        builder.coinbase = Some(script[..n].to_vec());
+        Ok(builder)
+    }
+
+    /// Whether this builds a coinbase transaction.
+    pub fn is_coinbase(&self) -> bool {
+        self.coinbase.is_some()
+    }
+
+    /// Sets the sequence number of the input of a coinbase transaction,
+    /// `0xffffffff` otherwise: consensus gives it no meaning, and some
+    /// miners use it as four more bytes of nonce. [`Error::Coinbase`] for
+    /// a transaction that is not a coinbase one.
+    pub fn set_coinbase_sequence(&mut self, sequence: u32) -> Result<(), Error> {
+        if !self.is_coinbase() {
+            return Err(Error::Coinbase);
+        }
+        self.coinbase_sequence = sequence;
+        Ok(())
     }
 
     /// The version of the transaction being built.
@@ -505,7 +772,11 @@ impl<'k> Builder<'k> {
 
     /// Adds a transparent input: output `vout` of the transaction `txid`
     /// (in display byte order), which is `prevout`, a P2PKH output of
-    /// `key`. `sequence` is usually `0xffffffff`.
+    /// `key` (or a P2PK one), signed with [`SIGHASH_ALL`]. `sequence` is
+    /// usually `0xffffffff`.
+    ///
+    /// See [`add_transparent_input_with`](Self::add_transparent_input_with)
+    /// for other scripts and sighash types.
     pub fn add_transparent_input(
         &mut self,
         key: &'k SecpPrivateKey,
@@ -514,29 +785,184 @@ impl<'k> Builder<'k> {
         sequence: u32,
         prevout: ZcashTxOut<'_>,
     ) -> Result<(), Error> {
+        self.add_transparent_input_with(
+            InputSpend::new(InputSigner::Key(key)),
+            txid,
+            vout,
+            sequence,
+            prevout,
+        )
+    }
+
+    /// Adds a transparent input (output `vout` of the transaction `txid`,
+    /// in display byte order, which is `prevout`) signed as `spend` says:
+    ///
+    /// - [`InputSigner::Key`]: a P2PKH output of the key, or a P2PK one
+    ///   ([`UnsupportedScript`](crate::Error::UnsupportedScript) for
+    ///   another script,
+    ///   [`KeyNotInvolved`](crate::Error::KeyNotInvolved) for another
+    ///   key);
+    /// - [`InputSigner::Multisig`]: a P2SH output whose redeem script is
+    ///   a multisignature script, or a bare multisignature output, with
+    ///   enough of its private keys
+    ///   ([`MissingSignatures`](crate::Error::MissingSignatures)
+    ///   otherwise);
+    /// - [`InputSigner::Custom`]: any script, the function being given
+    ///   the signature digest of the input when the transaction is built;
+    /// - [`InputSigner::ScriptSig`]: a scriptSig that needs no signature
+    ///   of this transaction (it is verified, when of a known form, once
+    ///   the transaction is built).
+    ///
+    /// `spend.hash_type` is the sighash type of the signatures: any of the
+    /// six ([`UnsupportedSighash`](crate::Error::UnsupportedSighash)
+    /// otherwise). With `SIGHASH_SINGLE` the transaction must have an
+    /// output at the index of the input, which is checked when signing.
+    /// Note that only [`SIGHASH_ALL`] signatures commit to the whole
+    /// transaction: with another type, whoever sees the transaction can
+    /// change what the signature does not cover.
+    pub fn add_transparent_input_with(
+        &mut self,
+        spend: InputSpend<'k>,
+        txid: [u8; 32],
+        vout: u32,
+        sequence: u32,
+        prevout: ZcashTxOut<'_>,
+    ) -> Result<(), Error> {
+        let script_sig_len = match spend.signer {
+            InputSigner::Key(key) => {
+                let public = key.public_key();
+                let (compressed, uncompressed) = (
+                    public.serialize_compressed(),
+                    public.serialize_uncompressed(),
+                );
+                match ScriptKind::of(prevout.script) {
+                    ScriptKind::P2pkh(hash) if hash160(&compressed) == *hash => {
+                        MAX_SCRIPT_SIG_LEN - 65 + 33
+                    }
+                    ScriptKind::P2pkh(hash) if hash160(&uncompressed) == *hash => {
+                        MAX_SCRIPT_SIG_LEN
+                    }
+                    ScriptKind::P2pk(key) if key == compressed || key == uncompressed => {
+                        1 + MAX_INPUT_SIGNATURE_LEN
+                    }
+                    ScriptKind::P2pkh(_) | ScriptKind::P2pk(_) => {
+                        return Err(crate::Error::KeyNotInvolved.into());
+                    }
+                    _ => return Err(crate::Error::UnsupportedScript.into()),
+                }
+            }
+            InputSigner::Multisig {
+                redeem_script,
+                keys,
+            } => {
+                let multisig = match (ScriptKind::of(prevout.script), redeem_script) {
+                    (ScriptKind::P2sh(hash), Some(script)) => {
+                        if hash160(script) != *hash {
+                            return Err(crate::Error::RedeemScriptMismatch.into());
+                        }
+                        Multisig::parse(script)?
+                    }
+                    (ScriptKind::P2sh(_), None) => {
+                        return Err(crate::Error::MissingRedeemScript.into());
+                    }
+                    (ScriptKind::Multisig(multisig), None) => multisig,
+                    (ScriptKind::Multisig(_), Some(_)) => {
+                        return Err(crate::Error::RedeemScriptMismatch.into());
+                    }
+                    _ => return Err(crate::Error::UnsupportedScript.into()),
+                };
+                let ours = multisig
+                    .keys()
+                    .filter(|public| {
+                        keys.iter().any(|key| {
+                            let key = key.public_key();
+                            *public == key.serialize_compressed()
+                                || *public == key.serialize_uncompressed()
+                        })
+                    })
+                    .count();
+                if ours < multisig.required() {
+                    return Err(crate::Error::MissingSignatures.into());
+                }
+                multisig.script_sig_len_bound(redeem_script.map(<[u8]>::len))
+            }
+            InputSigner::ScriptSig(script_sig) => script_sig.len(),
+            InputSigner::Custom { max_len, .. } => max_len,
+        };
+        self.push_input(
+            Some(spend.signer),
+            spend.hash_type,
+            script_sig_len,
+            txid,
+            vout,
+            sequence,
+            prevout,
+        )
+    }
+
+    /// Adds a transparent input (output `vout` of the transaction `txid`,
+    /// in display byte order, which is `prevout`) that is signed
+    /// elsewhere: by a hardware wallet, or by the co-signers of a
+    /// multisignature. [`build_pending`](Self::build_pending) then gives
+    /// the digest to sign for it, and takes the signatures.
+    ///
+    /// `hash_type` is the sighash type the signatures will be made for,
+    /// and `script_sig_len` the most bytes the scriptSig will take, which
+    /// the fee counts: [`MAX_SCRIPT_SIG_LEN`] for a P2PKH output (107
+    /// bytes at most, 1 + 73 + 1 + 33, if its key is compressed),
+    /// [`Multisig::script_sig_len_bound`] for a multisignature.
+    pub fn add_transparent_input_external(
+        &mut self,
+        script_sig_len: usize,
+        hash_type: u8,
+        txid: [u8; 32],
+        vout: u32,
+        sequence: u32,
+        prevout: ZcashTxOut<'_>,
+    ) -> Result<(), Error> {
+        self.push_input(
+            None,
+            hash_type,
+            script_sig_len,
+            txid,
+            vout,
+            sequence,
+            prevout,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_input(
+        &mut self,
+        signer: Option<InputSigner<'k>>,
+        hash_type: u8,
+        script_sig_len: usize,
+        txid: [u8; 32],
+        vout: u32,
+        sequence: u32,
+        prevout: ZcashTxOut<'_>,
+    ) -> Result<(), Error> {
+        if self.is_coinbase() {
+            return Err(Error::Coinbase);
+        }
         if prevout.amount > MAX_MONEY {
             return Err(Error::ValueOutOfRange);
         }
-        let pk_hash: &[u8] = match prevout.script {
-            [0x76, 0xa9, 0x14, hash @ .., 0x88, 0xac] if hash.len() == 20 => hash,
-            _ => return Err(crate::Error::UnsupportedScript.into()),
-        };
-        let public = key.public_key();
-        let pubkey_len = if hash160(&public.serialize_compressed()) == pk_hash {
-            33
-        } else if hash160(&public.serialize_uncompressed()) == pk_hash {
-            65
-        } else {
-            return Err(crate::Error::KeyNotInvolved.into());
-        };
+        if !is_valid_sighash_type(hash_type) {
+            return Err(crate::Error::UnsupportedSighash.into());
+        }
+        if script_sig_len > MAX_SCRIPT_SIZE {
+            return Err(crate::Error::TooLarge.into());
+        }
         self.inputs.push(TransparentInput {
-            key,
+            signer,
+            hash_type,
             txid,
             vout,
             sequence,
             amount: prevout.amount,
             script: prevout.script.to_vec(),
-            pubkey_len,
+            script_sig_len,
         });
         Ok(())
     }
@@ -552,6 +978,44 @@ impl<'k> Builder<'k> {
         Ok(())
     }
 
+    /// Adds a transparent output of `amount` zatoshis to a TEX address
+    /// (ZIP 320, as [`decode_tex_address`](crate::zcash::decode_tex_address)
+    /// decodes it): to the P2PKH script of the public key hash `hash`.
+    ///
+    /// ZIP 320 requires such a transaction to spend only transparent
+    /// outputs: [`build`](Self::build) fails with
+    /// [`Error::TransparentSourceOnly`] if it has a shielded spend. (To pay
+    /// a TEX address from shielded funds, a first transaction sends them
+    /// to a transparent address of the sender, and a second one, from
+    /// there, to the TEX address.) The ZIP also says the transaction
+    /// should have only transparent outputs, which is left to the caller.
+    pub fn add_tex_output(&mut self, amount: u64, hash: &[u8; 20]) -> Result<(), Error> {
+        self.add_transparent_output(amount, &p2pkh_script(hash))?;
+        self.transparent_source_only = true;
+        Ok(())
+    }
+
+    /// Adds a transparent output of `amount` zatoshis to the transparent
+    /// receiver of a unified address (its P2PKH or P2SH receiver, of which
+    /// an address has at most one): [`Error::NoTransparentReceiver`] if it
+    /// has none. A sender that can pay a shielded receiver of the address
+    /// should prefer it (ZIP 316): after NU6.3 the Orchard receiver is
+    /// paid in the Ironwood pool (`add_ironwood_output`).
+    #[cfg(feature = "zcash-orchard")]
+    pub fn add_unified_transparent_output(
+        &mut self,
+        amount: u64,
+        address: &crate::orchard::unified::UnifiedAddress,
+    ) -> Result<(), Error> {
+        match (address.p2pkh, address.p2sh) {
+            (Some(hash), None) => self.add_transparent_output(amount, &p2pkh_script(&hash)),
+            (None, Some(hash)) => {
+                self.add_transparent_output(amount, &crate::zcashtx::p2sh_script(&hash))
+            }
+            _ => Err(Error::NoTransparentReceiver),
+        }
+    }
+
     /// The balance of the transparent pool: its inputs minus its outputs.
     pub fn transparent_balance(&self) -> i64 {
         // each amount is at most MAX_MONEY, far from overflowing an i128
@@ -560,17 +1024,28 @@ impl<'k> Builder<'k> {
         (inputs - outputs).clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
 
-    /// The fee the transaction pays as it stands, in zatoshis: the sum of
-    /// the balances of the pools, which is what goes in (transparent
-    /// inputs, shielded spends) minus what comes out (transparent and
-    /// shielded outputs). [`Error::InsufficientFunds`] if more comes out
-    /// than goes in.
-    pub fn fee(&self) -> Result<u64, Error> {
+    /// The sum of the balances of the pools: what goes in minus what
+    /// comes out.
+    fn balance(&self) -> Result<i128, Error> {
         let balance = self.transparent_balance() as i128;
         #[cfg(feature = "zcash-sapling-prover")]
         let balance = balance + self.sapling_balance() as i128;
         #[cfg(feature = "zcash-orchard-prover")]
         let balance = balance + self.orchard_balance()? as i128 + self.ironwood_balance()? as i128;
+        Ok(balance)
+    }
+
+    /// The fee the transaction pays as it stands, in zatoshis: the sum of
+    /// the balances of the pools, which is what goes in (transparent
+    /// inputs, shielded spends) minus what comes out (transparent and
+    /// shielded outputs). [`Error::InsufficientFunds`] if more comes out
+    /// than goes in, [`Error::Coinbase`] for a coinbase transaction, which
+    /// pays none (see [`created_value`](Self::created_value)).
+    pub fn fee(&self) -> Result<u64, Error> {
+        if self.is_coinbase() {
+            return Err(Error::Coinbase);
+        }
+        let balance = self.balance()?;
         if balance < 0 {
             return Err(Error::InsufficientFunds);
         }
@@ -580,30 +1055,76 @@ impl<'k> Builder<'k> {
         Ok(balance as u64)
     }
 
+    /// The value a coinbase transaction creates as it stands, in
+    /// zatoshis: the total of its transparent and shielded outputs.
+    /// [`Error::Coinbase`] for a transaction that is not a coinbase one.
+    pub fn created_value(&self) -> Result<u64, Error> {
+        if !self.is_coinbase() {
+            return Err(Error::Coinbase);
+        }
+        let created = -self.balance()?;
+        if !(0..=MAX_MONEY as i128).contains(&created) {
+            return Err(Error::ValueOutOfRange);
+        }
+        Ok(created as u64)
+    }
+
     /// The number of ZIP-317 logical actions of the transaction as it
     /// stands. Transparent inputs count by the largest size they can have
     /// once signed, and the Orchard and Ironwood bundles by the actions
-    /// they will have: each as many as it has spends or outputs,
-    /// whichever is more, and at least two.
+    /// they will have (see `orchard::builder`: in a bundle with
+    /// cross-address transfers as many as it has spends or outputs,
+    /// whichever is more; in the Orchard pool from NU6.3 as many as it
+    /// has spends and outputs together; and at least two, unless the
+    /// bundle type was chosen).
     pub fn logical_actions(&self) -> u64 {
-        // outpoint, scriptSig length, scriptSig, sequence
-        let input_size =
-            |i: &TransparentInput<'_>| 36 + 1 + (MAX_SCRIPT_SIG_LEN - 65 + i.pubkey_len) + 4;
-        let tx_in: usize = self.inputs.iter().map(input_size).sum();
-        let tx_out: usize = self
+        self.logical_actions_with(None)
+    }
+
+    /// The logical actions of the transaction with one more output, the
+    /// change.
+    fn logical_actions_with(&self, change: Option<&Change<'_>>) -> u64 {
+        let coinbase_input = self
+            .coinbase
+            .as_ref()
+            .map_or(0, |script| 36 + 1 + script.len() + 4);
+        let tx_in: usize = self
+            .inputs
+            .iter()
+            .map(TransparentInput::size)
+            .sum::<usize>()
+            + coinbase_input;
+        let output_size =
+            |script: &[u8]| 8 + crate::BtcVarInt(script.len() as u64).len() + script.len();
+        let mut tx_out: usize = self
             .outputs
             .iter()
-            .map(|(_, script)| 8 + crate::BtcVarInt(script.len() as u64).len() + script.len())
+            .map(|(_, script)| output_size(script))
             .sum();
+        if let Some(Change::Transparent(script)) = change {
+            tx_out += output_size(script);
+        }
         #[cfg(feature = "zcash-sapling-prover")]
-        let (sapling_spends, sapling_outputs) = match &self.sapling.builder {
-            Some(builder) => (builder.n_spends() as u64, builder.n_outputs() as u64),
-            None => (0, 0),
+        let (sapling_spends, sapling_outputs) = {
+            let extra = matches!(change, Some(Change::Sapling { .. })) as u64;
+            match &self.sapling.builder {
+                Some(builder) => (
+                    builder.n_spends() as u64,
+                    builder.n_outputs() as u64 + extra,
+                ),
+                None => (0, extra),
+            }
         };
         #[cfg(not(feature = "zcash-sapling-prover"))]
         let (sapling_spends, sapling_outputs) = (0, 0);
         #[cfg(feature = "zcash-orchard-prover")]
-        let orchard_actions = (self.orchard.actions() + self.ironwood.actions()) as u64;
+        let orchard_actions = {
+            let coinbase = self.is_coinbase();
+            let orchard = matches!(change, Some(Change::Orchard(_))) as usize;
+            let ironwood = matches!(change, Some(Change::Ironwood(_))) as usize;
+            (self.orchard.actions(orchard, false, coinbase)
+                + self.ironwood.actions(ironwood, true, coinbase)) as u64
+        };
         #[cfg(not(feature = "zcash-orchard-prover"))]
         let orchard_actions = 0;
         zip317::logical_actions(
@@ -617,9 +1138,96 @@ impl<'k> Builder<'k> {
 
     /// The ZIP-317 conventional fee of the transaction as it stands, in
     /// zatoshis: see [`logical_actions`](Self::logical_actions). Adding a
-    /// part (a change output, for one) may raise it.
+    /// part (a change output, for one) may raise it: [`fund`](Self::fund)
+    /// accounts for that.
     pub fn conventional_fee(&self) -> u64 {
         zip317::conventional_fee(self.logical_actions())
+    }
+
+    /// Makes the transaction balance: decides its fee by `rule` and adds
+    /// an output to `change` for what its inputs leave once its outputs
+    /// and that fee are paid. Returns the fee, which is then what
+    /// [`build`](Self::build) or [`build_pending`](Self::build_pending)
+    /// must be told, and the value of the change. Call it last, once
+    /// every input and output is added.
+    ///
+    /// With [`FeeRule::Zip317`] the fee is the conventional fee of the
+    /// transaction *with* its change output, which may be more than
+    /// [`conventional_fee`](Self::conventional_fee) says before: the
+    /// output can add a logical action (two in an Orchard or Ironwood
+    /// bundle it starts, one in an Orchard bundle of NU6.3 on, where
+    /// spends and outputs do not share actions). The fee depends on the
+    /// number and sizes of the parts and not on the amounts, so it is
+    /// settled at once, without iterating.
+    ///
+    /// No output is added when nothing is left, nor when what is left
+    /// would not pay for the action a change output adds: it then goes to
+    /// the fee, which is that much above the rule (by less than the cost
+    /// of the output; [`Funding::change`] is 0 and [`Funding::fee`] says
+    /// what is paid). [`Error::InsufficientFunds`] if the inputs do not
+    /// cover the outputs and the fee of the transaction without change.
+    ///
+    /// Change in the Orchard pool from NU6.3 can only be value the
+    /// transaction spends from that pool ([`Error::OrchardPoolClosed`]
+    /// otherwise): a transaction that shields keeps its change in the
+    /// Ironwood pool. [`Error::Coinbase`] for a coinbase transaction.
+    pub fn fund(&mut self, rule: FeeRule, change: Change<'_>) -> Result<Funding, Error> {
+        let balance = self.fee()?;
+        let fee_of = |actions: u64| match rule {
+            FeeRule::Zip317 => zip317::conventional_fee(actions),
+            FeeRule::Fixed(fee) => fee,
+        };
+        let without = fee_of(self.logical_actions());
+        if balance < without {
+            return Err(Error::InsufficientFunds);
+        }
+        let with = fee_of(self.logical_actions_with(Some(&change)));
+        if balance <= with {
+            // nothing left, or less than the change output would cost
+            return Ok(Funding {
+                fee: balance,
+                change: 0,
+            });
+        }
+        let value = balance - with;
+        match change {
+            Change::Transparent(script) => self.add_transparent_output(value, script)?,
+            #[cfg(feature = "zcash-sapling-prover")]
+            Change::Sapling { ovk, to, random } => {
+                self.add_sapling_output(ovk, to, value, None, random)?;
+            }
+            #[cfg(feature = "zcash-orchard-prover")]
+            Change::Orchard(sk) => {
+                if self.orchard_closed() && self.orchard_balance()? < value as i64 {
+                    return Err(Error::OrchardPoolClosed);
+                }
+                self.add_orchard_change(sk, value, crate::orchard::builder::NO_MEMO)?;
+            }
+            #[cfg(feature = "zcash-orchard-prover")]
+            Change::Ironwood(fvk) => {
+                self.add_ironwood_change(fvk, value, crate::orchard::builder::NO_MEMO)?;
+            }
+        }
+        debug_assert_eq!(self.fee(), Ok(with));
+        Ok(Funding {
+            fee: with,
+            change: value,
+        })
+    }
+
+    /// Funds the transaction ([`fund`](Self::fund)) and builds it
+    /// ([`build`](Self::build)): the transaction, and what was decided of
+    /// its fee and change.
+    pub fn fund_and_build(
+        mut self,
+        provers: &Provers<'_>,
+        rule: FeeRule,
+        change: Change<'_>,
+        random: &[u8; 64],
+    ) -> Result<(Transaction, Funding), Error> {
+        let funding = self.fund(rule, change)?;
+        let tx = self.build(provers, funding.fee, random)?;
+        Ok((tx, funding))
     }
 
     /// Whether nothing was added.
@@ -638,20 +1246,29 @@ impl<'k> Builder<'k> {
     }
 
     /// Checks the version of the transaction against its branch and parts,
-    /// and the rules of NU6.3 on the Orchard pool.
+    /// the rules of NU6.3 on the Orchard pool, and that of TEX addresses.
     fn check_version(&self) -> Result<(), Error> {
         if self.version.valid_in_branch(self.consensus_branch_id) == Some(false) {
             return Err(Error::VersionNotActive);
         }
+        #[allow(unused_mut)]
+        let mut shielded_spends = 0;
+        #[cfg(feature = "zcash-sapling-prover")]
+        {
+            shielded_spends += self.sapling.builder.as_ref().map_or(0, |b| b.n_spends());
+        }
         #[cfg(feature = "zcash-orchard-prover")]
         {
+            shielded_spends += self.orchard.spends + self.ironwood.spends;
             if self.ironwood.builder.is_some() && self.version != TxVersion::V6 {
                 return Err(Error::IronwoodNeedsV6);
             }
-            let closed = matches!(self.consensus_branch_id, branch::NU6_3 | branch::NU7);
-            if closed && self.orchard_balance()? < 0 {
+            if self.orchard_closed() && self.orchard_balance()? < 0 {
                 return Err(Error::OrchardPoolClosed);
             }
+        }
+        if self.transparent_source_only && shielded_spends > 0 {
+            return Err(Error::TransparentSourceOnly);
         }
         Ok(())
     }
@@ -667,12 +1284,71 @@ impl<'k> Builder<'k> {
     ///
     /// Proving takes about a second per Sapling spend and seconds per
     /// Orchard action.
+    ///
+    /// A transaction with a transparent input signed elsewhere
+    /// ([`add_transparent_input_external`](Self::add_transparent_input_external))
+    /// is built in two steps instead:
+    /// [`build_pending`](Self::build_pending). A coinbase transaction is
+    /// built by [`build_coinbase`](Self::build_coinbase)
+    /// ([`Error::Coinbase`] here).
     pub fn build(
         self,
         provers: &Provers<'_>,
         fee: u64,
         random: &[u8; 64],
     ) -> Result<Transaction, Error> {
+        self.build_pending(provers, fee, random)?.finish()
+    }
+
+    /// Builds the coinbase transaction (of a builder made by
+    /// [`new_coinbase`](Self::new_coinbase): [`Error::Coinbase`]
+    /// otherwise): checks that its outputs are worth exactly `created`
+    /// zatoshis in total ([`Error::FeeMismatch`] otherwise, `actual` being
+    /// their total), proves the shielded bundles with `provers` and
+    /// serializes the result. `random` is as for [`build`](Self::build).
+    ///
+    /// `created` is what the block allows its coinbase transaction to
+    /// create: the block subsidy and the miner's share of the fees, minus
+    /// what consensus sends to the lockbox. Stating it guards against a
+    /// mistake in the outputs; whether it is the right value, and whether
+    /// the funding stream outputs are there, only the block tells.
+    pub fn build_coinbase(
+        self,
+        provers: &Provers<'_>,
+        created: u64,
+        random: &[u8; 64],
+    ) -> Result<Transaction, Error> {
+        let actual = self.created_value()?;
+        if actual != created {
+            return Err(Error::FeeMismatch {
+                stated: created,
+                actual,
+            });
+        }
+        if self.outputs.is_empty() && self.is_empty() {
+            return Err(Error::Empty);
+        }
+        self.check_version()?;
+        self.assemble(provers, random)?.finish()
+    }
+
+    /// Builds the transaction as [`build`](Self::build) does, up to the
+    /// signatures of its transparent inputs: the shielded bundles are
+    /// proven and signed, and the result gives, for each transparent
+    /// input, the digest to sign
+    /// ([`PendingTransaction::input_sighash`]), takes signatures made
+    /// elsewhere, verifies them, and finishes the transaction
+    /// ([`PendingTransaction::finish`]), signing with the keys the builder
+    /// was given the inputs that have some.
+    pub fn build_pending(
+        self,
+        provers: &Provers<'_>,
+        fee: u64,
+        random: &[u8; 64],
+    ) -> Result<PendingTransaction<'k>, Error> {
+        if self.is_coinbase() {
+            return Err(Error::Coinbase);
+        }
         if self.is_empty() {
             return Err(Error::Empty);
         }
@@ -684,6 +1360,15 @@ impl<'k> Builder<'k> {
                 actual,
             });
         }
+        self.assemble(provers, random)
+    }
+
+    /// Proves and signs the shielded bundles.
+    fn assemble(
+        self,
+        provers: &Provers<'_>,
+        random: &[u8; 64],
+    ) -> Result<PendingTransaction<'k>, Error> {
         #[cfg(any(feature = "zcash-sapling-prover", feature = "zcash-orchard-prover"))]
         let seed = Seed(*random);
         #[cfg(any(feature = "zcash-sapling-prover", feature = "zcash-orchard-prover"))]
@@ -697,6 +1382,9 @@ impl<'k> Builder<'k> {
             lock_time,
             inputs,
             outputs,
+            coinbase,
+            coinbase_sequence,
+            transparent_source_only: _,
             #[cfg(feature = "zcash-sapling-prover")]
             sapling,
             #[cfg(feature = "zcash-orchard-prover")]
@@ -749,56 +1437,37 @@ impl<'k> Builder<'k> {
             None => None,
         };
 
-        let tx_inputs: Vec<ZcashTxIn<'_>> = inputs
-            .iter()
-            .map(|input| ZcashTxIn {
-                txid: input.txid,
-                vout: input.vout,
-                script_sig: &[],
-                sequence: input.sequence,
-            })
-            .collect();
-        let prevouts: Vec<ZcashTxOut<'_>> = inputs
-            .iter()
-            .map(|input| ZcashTxOut {
-                amount: input.amount,
-                script: &input.script,
-            })
-            .collect();
-        let tx_outputs: Vec<ZcashTxOut<'_>> = outputs
-            .iter()
-            .map(|(amount, script)| ZcashTxOut {
-                amount: *amount,
-                script,
-            })
-            .collect();
-        let unsigned = ZcashTx {
+        let mut pending = PendingTransaction {
             version,
             consensus_branch_id,
-            lock_time,
             expiry_height,
-            inputs: &tx_inputs,
-            outputs: &tx_outputs,
-            sapling: &sapling_bytes,
-            orchard: &orchard_bytes,
-            ironwood: &ironwood_bytes,
+            lock_time,
+            script_sigs: inputs.iter().map(|_| None).collect(),
+            inputs,
+            outputs,
+            coinbase,
+            coinbase_sequence,
+            sapling: sapling_bytes,
+            orchard: orchard_bytes,
+            ironwood: ironwood_bytes,
+            txid: [0; 32],
+            shielded_sighash: [0; 32],
         };
         // The id and the signature hash of the shielded parts, once: no
         // signature changes them.
-        let txid = unsigned.txid()?;
-        let shielded_sighash = unsigned.sighash(None, SIGHASH_ALL, &prevouts)?;
+        let (txid, shielded_sighash) = pending.with_tx(|tx, prevouts| {
+            Ok::<_, Error>((tx.txid()?, tx.sighash(None, SIGHASH_ALL, prevouts)?))
+        })?;
+        pending.txid = txid;
+        pending.shielded_sighash = shielded_sighash;
 
-        #[allow(unused_mut)]
-        let (mut sapling_signed, mut orchard_signed) = (Vec::new(), Vec::new());
-        #[allow(unused_mut)]
-        let mut ironwood_signed = Vec::new();
         #[cfg(feature = "zcash-sapling-prover")]
         if let Some(bundle) = sapling {
             let mut random = vec![0u8; bundle.signature_random_len()];
             seed.fill(SEED_SAPLING_SIGN, &mut random);
             let signed = bundle.sign(&shielded_sighash, &random);
             random.zeroize();
-            sapling_signed = signed?
+            pending.sapling = signed?
                 .serialize()
                 .map_err(crate::sapling::builder::Error::Sapling)?;
         }
@@ -808,7 +1477,7 @@ impl<'k> Builder<'k> {
             seed.fill(SEED_ORCHARD_SIGN, &mut random);
             let signed = bundle.apply_signatures(&shielded_sighash, &orchard.asks, &random);
             random.zeroize();
-            orchard_signed = signed?.to_bytes();
+            pending.orchard = signed?.to_bytes();
         }
         #[cfg(feature = "zcash-orchard-prover")]
         if let Some(bundle) = ironwood_bundle {
@@ -816,23 +1485,266 @@ impl<'k> Builder<'k> {
             seed.fill(SEED_IRONWOOD_SIGN, &mut random);
             let signed = bundle.apply_signatures(&shielded_sighash, &ironwood.asks, &random);
             random.zeroize();
-            ironwood_signed = signed?.to_bytes();
+            pending.ironwood = signed?.to_bytes();
         }
+        Ok(pending)
+    }
+}
 
-        // The transparent inputs sign their own digests, which commit to
-        // the shielded bundles too.
-        let signed = ZcashTx {
-            sapling: &sapling_signed,
-            orchard: &orchard_signed,
-            ironwood: &ironwood_signed,
-            ..unsigned
+/// A transaction whose shielded parts are proven and signed, and whose
+/// transparent inputs are not signed yet: what
+/// [`Builder::build_pending`] makes, for the inputs that are signed
+/// elsewhere.
+///
+/// For each such input ([`unsigned_inputs`](Self::unsigned_inputs)) the
+/// signer is given [`input_sighash`](Self::input_sighash) and returns a
+/// DER signature, which becomes an
+/// [`InputSignature`] and is applied:
+/// [`apply_signature`](Self::apply_signature) for a P2PKH or P2PK output,
+/// [`apply_multisig_signatures`](Self::apply_multisig_signatures) for a
+/// multisignature (with the signatures of enough co-signers, in any
+/// order), [`apply_script_sig`](Self::apply_script_sig) for anything else.
+/// Every signature is verified when applied.
+/// [`finish`](Self::finish) then signs the inputs the builder has keys
+/// for, and serializes the transaction.
+pub struct PendingTransaction<'k> {
+    version: TxVersion,
+    consensus_branch_id: u32,
+    expiry_height: u32,
+    lock_time: u32,
+    inputs: Vec<TransparentInput<'k>>,
+    /// The scriptSigs applied so far.
+    script_sigs: Vec<Option<Vec<u8>>>,
+    outputs: Vec<(u64, Vec<u8>)>,
+    coinbase: Option<Vec<u8>>,
+    coinbase_sequence: u32,
+    sapling: Vec<u8>,
+    orchard: Vec<u8>,
+    ironwood: Vec<u8>,
+    txid: [u8; 32],
+    shielded_sighash: [u8; 32],
+}
+
+impl core::fmt::Debug for PendingTransaction<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PendingTransaction")
+            .field("txid", &self.txid)
+            .field("transparent_inputs", &self.inputs.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingTransaction<'_> {
+    /// Runs `f` on the transaction, its transparent inputs without
+    /// scriptSigs, and the outputs they spend.
+    fn with_tx<R>(&self, f: impl FnOnce(&ZcashTx<'_>, &[ZcashTxOut<'_>]) -> R) -> R {
+        let tx_inputs: Vec<ZcashTxIn<'_>> = match &self.coinbase {
+            Some(script) => vec![ZcashTxIn {
+                sequence: self.coinbase_sequence,
+                ..ZcashTxIn::coinbase(script)
+            }],
+            None => self
+                .inputs
+                .iter()
+                .map(|input| ZcashTxIn {
+                    txid: input.txid,
+                    vout: input.vout,
+                    script_sig: &[],
+                    sequence: input.sequence,
+                })
+                .collect(),
         };
-        let keys: Vec<&SecpPrivateKey> = inputs.iter().map(|input| input.key).collect();
-        let raw = signed.sign(&keys, &prevouts)?;
+        let prevouts: Vec<ZcashTxOut<'_>> = self
+            .inputs
+            .iter()
+            .map(|input| ZcashTxOut {
+                amount: input.amount,
+                script: &input.script,
+            })
+            .collect();
+        let tx_outputs: Vec<ZcashTxOut<'_>> = self
+            .outputs
+            .iter()
+            .map(|(amount, script)| ZcashTxOut {
+                amount: *amount,
+                script,
+            })
+            .collect();
+        let tx = ZcashTx {
+            version: self.version,
+            consensus_branch_id: self.consensus_branch_id,
+            lock_time: self.lock_time,
+            expiry_height: self.expiry_height,
+            inputs: &tx_inputs,
+            outputs: &tx_outputs,
+            sapling: &self.sapling,
+            orchard: &self.orchard,
+            ironwood: &self.ironwood,
+        };
+        f(&tx, &prevouts)
+    }
+
+    /// The id of the transaction, in display (big-endian) byte order: no
+    /// signature changes it.
+    pub fn txid(&self) -> [u8; 32] {
+        self.txid
+    }
+
+    /// The signature hash the shielded spends and the binding signatures
+    /// signed.
+    pub fn shielded_sighash(&self) -> [u8; 32] {
+        self.shielded_sighash
+    }
+
+    /// The number of transparent inputs.
+    pub fn input_count(&self) -> usize {
+        self.inputs.len()
+    }
+
+    /// The indices of the transparent inputs that are signed elsewhere
+    /// and have no scriptSig yet.
+    pub fn unsigned_inputs(&self) -> impl Iterator<Item = usize> + '_ {
+        self.inputs
+            .iter()
+            .zip(&self.script_sigs)
+            .enumerate()
+            .filter(|(_, (input, script_sig))| input.signer.is_none() && script_sig.is_none())
+            .map(|(index, _)| index)
+    }
+
+    /// The sighash type transparent input `index` was added with: the
+    /// type [`input_sighash`](Self::input_sighash) is for.
+    pub fn input_hash_type(&self, index: usize) -> Result<u8, Error> {
+        self.inputs
+            .get(index)
+            .map(|input| input.hash_type)
+            .ok_or(Error::Tx(crate::Error::InputIndex))
+    }
+
+    /// The signature digest of transparent input `index`, for the sighash
+    /// type it was added with: what its signer signs.
+    pub fn input_sighash(&self, index: usize) -> Result<[u8; 32], Error> {
+        let hash_type = self.input_hash_type(index)?;
+        self.input_sighash_for(index, hash_type)
+    }
+
+    /// The signature digest of transparent input `index` for another
+    /// sighash type than the one it was added with (a co-signer of a
+    /// multisignature may use its own).
+    pub fn input_sighash_for(&self, index: usize, hash_type: u8) -> Result<[u8; 32], Error> {
+        Ok(self.with_tx(|tx, prevouts| tx.sighash(Some(index), hash_type, prevouts))?)
+    }
+
+    /// Stores the scriptSig that `make` writes for input `index`.
+    fn apply(
+        &mut self,
+        index: usize,
+        make: impl FnOnce(&ZcashTx<'_>, &[ZcashTxOut<'_>], &mut [u8]) -> Result<usize, crate::Error>,
+    ) -> Result<(), Error> {
+        if index >= self.inputs.len() {
+            return Err(crate::Error::InputIndex.into());
+        }
+        let mut script_sig = vec![0u8; MAX_SCRIPT_SIZE];
+        let n = self.with_tx(|tx, prevouts| make(tx, prevouts, &mut script_sig))?;
+        script_sig.truncate(n);
+        self.script_sigs[index] = Some(script_sig);
+        Ok(())
+    }
+
+    /// Gives transparent input `index`, which spends a P2PKH or a P2PK
+    /// output, its signature, made elsewhere by the key whose public key
+    /// (in SEC1 encoding, compressed or not, as the output has it) is
+    /// `public_key`.
+    ///
+    /// The signature is verified against the digest of the input for the
+    /// sighash type it states
+    /// ([`SignatureVerification`](crate::Error::SignatureVerification)
+    /// otherwise), and the key against the output
+    /// ([`KeyNotInvolved`](crate::Error::KeyNotInvolved));
+    /// [`UnsupportedScript`](crate::Error::UnsupportedScript) for an
+    /// output of another kind.
+    pub fn apply_signature(
+        &mut self,
+        index: usize,
+        public_key: &[u8],
+        signature: &InputSignature,
+    ) -> Result<(), Error> {
+        self.apply(index, |tx, prevouts, out| {
+            let script = prevouts.get(index).ok_or(crate::Error::InputIndex)?.script;
+            match ScriptKind::of(script) {
+                ScriptKind::P2pkh(hash) if hash160(public_key) == *hash => {
+                    tx.verify_input_signature(index, public_key, signature, prevouts)?;
+                    p2pkh_script_sig_to_slice(signature, public_key, out)
+                }
+                ScriptKind::P2pk(key) if key == public_key => {
+                    tx.verify_input_signature(index, public_key, signature, prevouts)?;
+                    p2pk_script_sig_to_slice(signature, out)
+                }
+                ScriptKind::P2pkh(_) | ScriptKind::P2pk(_) => Err(crate::Error::KeyNotInvolved),
+                _ => Err(crate::Error::UnsupportedScript),
+            }
+        })
+    }
+
+    /// Gives transparent input `index`, which spends a multisignature
+    /// output, the signatures of its co-signers: see
+    /// [`ZcashTx::multisig_script_sig_to_slice`], which verifies each of
+    /// them, puts them in the order of their keys and makes the scriptSig.
+    /// `redeem_script` is the redeem script of a P2SH output, `None` for
+    /// a bare multisignature.
+    pub fn apply_multisig_signatures(
+        &mut self,
+        index: usize,
+        redeem_script: Option<&[u8]>,
+        signatures: &[InputSignature],
+    ) -> Result<(), Error> {
+        self.apply(index, |tx, prevouts, out| {
+            tx.multisig_script_sig_to_slice(index, redeem_script, signatures, prevouts, out)
+        })
+    }
+
+    /// Gives transparent input `index` its whole scriptSig, for a script
+    /// the other functions do not make. It is verified if it is of a form
+    /// [`ZcashTx::verify_input`] knows, and used as it is otherwise.
+    pub fn apply_script_sig(&mut self, index: usize, script_sig: &[u8]) -> Result<(), Error> {
+        self.apply(index, |tx, prevouts, out| {
+            let spend = InputSpend::new(InputSigner::ScriptSig(script_sig));
+            tx.script_sig_to_slice(index, &spend, prevouts, out)
+        })
+    }
+
+    /// Signs the transparent inputs the builder has keys for and
+    /// serializes the transaction.
+    /// [`Error::MissingTransparentSignature`] if an input signed elsewhere
+    /// was given no signature.
+    pub fn finish(self) -> Result<Transaction, Error> {
+        if let Some(index) = self.unsigned_inputs().next() {
+            return Err(Error::MissingTransparentSignature(index));
+        }
+        let raw = self.with_tx(|tx, prevouts| {
+            if self.coinbase.is_some() {
+                return Ok(tx.serialize());
+            }
+            let spends: Vec<InputSpend<'_>> = self
+                .inputs
+                .iter()
+                .zip(&self.script_sigs)
+                .map(|(input, script_sig)| {
+                    let signer = match (script_sig, input.signer) {
+                        (Some(script_sig), _) => InputSigner::ScriptSig(script_sig),
+                        (None, Some(signer)) => signer,
+                        // checked above
+                        (None, None) => InputSigner::ScriptSig(&[]),
+                    };
+                    InputSpend::new(signer).with_hash_type(input.hash_type)
+                })
+                .collect();
+            tx.sign_with(&spends, prevouts)
+        })?;
         Ok(Transaction {
             raw,
-            txid,
-            shielded_sighash,
+            txid: self.txid,
+            shielded_sighash: self.shielded_sighash,
         })
     }
 }
@@ -878,6 +1790,9 @@ impl Builder<'_> {
         path: &crate::sapling::tree::MerklePath,
         random: &[u8; crate::sapling::builder::SPEND_RANDOM_SIZE],
     ) -> Result<(), Error> {
+        if self.is_coinbase() {
+            return Err(Error::Coinbase);
+        }
         let anchor = self.sapling.anchor.ok_or(Error::MissingAnchor)?;
         // only an added part starts the pool
         let mut fresh = None;
@@ -896,6 +1811,10 @@ impl Builder<'_> {
     /// a memo (the empty memo when `None`), and returns the note it
     /// creates. With an outgoing viewing key, its holder can later decrypt
     /// the output. `random` must be fresh random bytes.
+    ///
+    /// In a coinbase transaction the output is made with the all-zero
+    /// outgoing viewing key whatever `ovk` is, as consensus requires
+    /// (ZIP 213), so that anyone can decrypt it.
     pub fn add_sapling_output(
         &mut self,
         ovk: Option<&crate::sapling::keys::OutgoingViewingKey>,
@@ -905,6 +1824,11 @@ impl Builder<'_> {
         random: &[u8; crate::sapling::builder::OUTPUT_RANDOM_SIZE],
     ) -> Result<crate::sapling::note::Note, Error> {
         let anchor = self.sapling.anchor.unwrap_or([0; 32]);
+        let ovk = if self.is_coinbase() {
+            Some(&COINBASE_SAPLING_OVK)
+        } else {
+            ovk
+        };
         let mut fresh = None;
         let builder = match self.sapling.builder.as_mut() {
             Some(builder) => builder,
@@ -964,15 +1888,69 @@ impl Builder<'_> {
         }
     }
 
+    /// Whether the consensus branch is one from NU6.3 on, under which no
+    /// value enters the Orchard pool.
+    fn orchard_closed(&self) -> bool {
+        matches!(self.consensus_branch_id, branch::NU6_3 | branch::NU7)
+    }
+
+    /// The outgoing viewing key an Orchard or Ironwood output is made
+    /// with: the all-zero one in a coinbase transaction.
+    fn orchard_ovk(
+        &self,
+        ovk: Option<crate::orchard::keys::OutgoingViewingKey>,
+    ) -> Option<crate::orchard::keys::OutgoingViewingKey> {
+        if self.is_coinbase() {
+            Some(crate::orchard::keys::OutgoingViewingKey::from_bytes(
+                [0; 32],
+            ))
+        } else {
+            ovk
+        }
+    }
+
     /// A new Orchard builder, for the first part of the pool.
     fn new_orchard_builder(&self) -> Result<crate::orchard::builder::Builder, Error> {
+        use crate::orchard::builder::{Builder, BundleType};
+        use crate::orchard::bundle::Flags;
         let version = self.orchard.version.ok_or(Error::UnknownCircuitVersion)?;
+        if self.is_coinbase() && self.orchard_closed() {
+            return Err(Error::OrchardPoolClosed);
+        }
         let anchor = self.orchard.anchor.ok_or(Error::MissingAnchor)?;
-        Ok(crate::orchard::builder::Builder::new(
-            version,
-            crate::orchard::bundle::Flags::ENABLED,
-            anchor,
-        ))
+        let mut builder = if self.is_coinbase() {
+            let mut builder = Builder::new(version, Flags::from_parts(false, true), anchor);
+            builder.set_bundle_type(BundleType::Coinbase);
+            builder
+        } else {
+            Builder::new(version, Flags::ENABLED, anchor)
+        };
+        if let (false, Some(bundle_type)) = (self.is_coinbase(), self.orchard.bundle_type) {
+            builder.set_bundle_type(bundle_type);
+        }
+        Ok(builder)
+    }
+
+    /// Chooses how the Orchard bundle is padded, instead of to two
+    /// actions at least: `orchard::builder::BundleType::UNPADDED` for a
+    /// bundle of exactly the actions its spends and outputs need (one for
+    /// a single spend), which tells the shape of the transaction by its
+    /// number of actions and is meant for transactions whose shape is
+    /// public anyway (the migration of a pool, which the value balances
+    /// show). [`Error::Coinbase`] in a coinbase transaction, whose
+    /// bundles are never padded.
+    pub fn set_orchard_bundle_type(
+        &mut self,
+        bundle_type: crate::orchard::builder::BundleType,
+    ) -> Result<(), Error> {
+        if self.is_coinbase() || bundle_type == crate::orchard::builder::BundleType::Coinbase {
+            return Err(Error::Coinbase);
+        }
+        self.orchard.bundle_type = Some(bundle_type);
+        if let Some(builder) = self.orchard.builder.as_mut() {
+            builder.set_bundle_type(bundle_type);
+        }
+        Ok(())
     }
 
     /// Adds the spend of the Orchard `note`, owned by the spending key
@@ -989,6 +1967,9 @@ impl Builder<'_> {
         note: crate::orchard::note::Note,
         path: crate::orchard::tree::MerklePath,
     ) -> Result<(), Error> {
+        if self.is_coinbase() {
+            return Err(Error::Coinbase);
+        }
         if note.value() > MAX_MONEY {
             return Err(Error::ValueOutOfRange);
         }
@@ -1011,12 +1992,19 @@ impl Builder<'_> {
     /// memo ([`NO_MEMO`](crate::orchard::builder::NO_MEMO) for none). With
     /// an outgoing viewing key, its holder can later recover the note.
     ///
-    /// From NU6.3 every output must go to the address of a note the
-    /// transaction spends, which is checked when building
+    /// From NU6.3 a note can only be created in the Orchard pool at an
+    /// address of the wallet: an output to an address of a key that
+    /// spends in the transaction is taken as change
+    /// ([`add_orchard_change`](Self::add_orchard_change)), any other is
+    /// refused when building
     /// ([`CrossAddressDisabled`](crate::orchard::builder::BuildError::CrossAddressDisabled)),
     /// and the bundle cannot take value in
     /// ([`Error::OrchardPoolClosed`]): payments go to the Ironwood pool
     /// ([`add_ironwood_output`](Self::add_ironwood_output)).
+    ///
+    /// In a coinbase transaction (before NU6.3: none can have an Orchard
+    /// action after) the output is made with the all-zero outgoing
+    /// viewing key whatever `ovk` is.
     pub fn add_orchard_output(
         &mut self,
         ovk: Option<crate::orchard::keys::OutgoingViewingKey>,
@@ -1027,6 +2015,7 @@ impl Builder<'_> {
         if value > MAX_MONEY {
             return Err(Error::ValueOutOfRange);
         }
+        let ovk = self.orchard_ovk(ovk);
         let mut fresh = None;
         let builder = match self.orchard.builder.as_mut() {
             Some(builder) => builder,
@@ -1036,6 +2025,56 @@ impl Builder<'_> {
         if fresh.is_some() {
             self.orchard.builder = fresh;
         }
+        self.orchard.outputs += 1;
+        Ok(())
+    }
+
+    /// Adds a note the sender keeps in the Orchard pool, change
+    /// ordinarily: `value` zatoshis at the internal address of the
+    /// spending key `sk` (ZIP 32: `fvk.address_at(0, Scope::Internal)`,
+    /// an address that is never given to anyone), which its internal
+    /// incoming viewing key reads and its internal outgoing viewing key
+    /// recovers, with a memo
+    /// ([`NO_MEMO`](crate::orchard::builder::NO_MEMO) for none).
+    ///
+    /// From NU6.3 this is the only way to keep value in the Orchard pool,
+    /// as ZIP 326 has it: the note is created by an action of its own,
+    /// that spends a note of value zero made up at the same address,
+    /// which is why the spending key is needed (the builder keeps its
+    /// spend authorizing key to sign that action). The value must come
+    /// from Orchard notes the transaction spends
+    /// ([`Error::OrchardPoolClosed`] when building otherwise).
+    /// [`Error::Coinbase`] in a coinbase transaction.
+    pub fn add_orchard_change(
+        &mut self,
+        sk: &crate::orchard::keys::SpendingKey,
+        value: u64,
+        memo: [u8; crate::orchard::note_encryption::MEMO_SIZE],
+    ) -> Result<(), Error> {
+        use crate::orchard::keys::Scope;
+        if self.is_coinbase() {
+            return Err(Error::Coinbase);
+        }
+        if value > MAX_MONEY {
+            return Err(Error::ValueOutOfRange);
+        }
+        let fvk = sk.to_fvk();
+        let mut fresh = None;
+        let builder = match self.orchard.builder.as_mut() {
+            Some(builder) => builder,
+            None => fresh.insert(self.new_orchard_builder()?),
+        };
+        builder.add_change_output(
+            &fvk,
+            Some(fvk.to_ovk(Scope::Internal)),
+            fvk.address_at(0u32, Scope::Internal),
+            value,
+            memo,
+        )?;
+        if fresh.is_some() {
+            self.orchard.builder = fresh;
+        }
+        self.orchard.asks.push(sk.to_ask());
         self.orchard.outputs += 1;
         Ok(())
     }
@@ -1067,11 +2106,37 @@ impl Builder<'_> {
 
     /// A new Ironwood builder, for the first part of the pool.
     fn new_ironwood_builder(&self) -> Result<crate::orchard::builder::Builder, Error> {
+        use crate::orchard::builder::{Builder, BundleType};
+        use crate::orchard::bundle::Flags;
         let anchor = self.ironwood.anchor.ok_or(Error::MissingAnchor)?;
-        Ok(crate::orchard::builder::Builder::new_ironwood(
-            crate::orchard::bundle::Flags::IRONWOOD_ENABLED,
-            anchor,
-        ))
+        if self.is_coinbase() {
+            // enableSpendsIronwood = 0; the outputs go to any address
+            let flags = Flags::from_parts(false, true).with_cross_address(true);
+            let mut builder = Builder::new_ironwood(flags, anchor);
+            builder.set_bundle_type(BundleType::Coinbase);
+            return Ok(builder);
+        }
+        let mut builder = Builder::new_ironwood(Flags::IRONWOOD_ENABLED, anchor);
+        if let Some(bundle_type) = self.ironwood.bundle_type {
+            builder.set_bundle_type(bundle_type);
+        }
+        Ok(builder)
+    }
+
+    /// Chooses how the Ironwood bundle is padded: see
+    /// [`set_orchard_bundle_type`](Self::set_orchard_bundle_type).
+    pub fn set_ironwood_bundle_type(
+        &mut self,
+        bundle_type: crate::orchard::builder::BundleType,
+    ) -> Result<(), Error> {
+        if self.is_coinbase() || bundle_type == crate::orchard::builder::BundleType::Coinbase {
+            return Err(Error::Coinbase);
+        }
+        self.ironwood.bundle_type = Some(bundle_type);
+        if let Some(builder) = self.ironwood.builder.as_mut() {
+            builder.set_bundle_type(bundle_type);
+        }
+        Ok(())
     }
 
     /// Adds the spend of the Ironwood `note` (a note found in an Ironwood
@@ -1090,6 +2155,9 @@ impl Builder<'_> {
         note: crate::orchard::note::Note,
         path: crate::orchard::tree::MerklePath,
     ) -> Result<(), Error> {
+        if self.is_coinbase() {
+            return Err(Error::Coinbase);
+        }
         if note.value() > MAX_MONEY {
             return Err(Error::ValueOutOfRange);
         }
@@ -1117,6 +2185,9 @@ impl Builder<'_> {
     /// Fails without an anchor ([`Error::MissingAnchor`]). The
     /// transaction must be a version 6 one, which
     /// [`build`](Self::build) checks.
+    ///
+    /// In a coinbase transaction the output is made with the all-zero
+    /// outgoing viewing key whatever `ovk` is, as consensus requires.
     pub fn add_ironwood_output(
         &mut self,
         ovk: Option<crate::orchard::keys::OutgoingViewingKey>,
@@ -1127,6 +2198,7 @@ impl Builder<'_> {
         if value > MAX_MONEY {
             return Err(Error::ValueOutOfRange);
         }
+        let ovk = self.orchard_ovk(ovk);
         let mut fresh = None;
         let builder = match self.ironwood.builder.as_mut() {
             Some(builder) => builder,
@@ -1139,7 +2211,48 @@ impl Builder<'_> {
         self.ironwood.outputs += 1;
         Ok(())
     }
+
+    /// Adds a note the sender keeps in the Ironwood pool, change
+    /// ordinarily: `value` zatoshis at the internal address of the full
+    /// viewing key `fvk` (ZIP 32: `fvk.address_at(0, Scope::Internal)`),
+    /// which its internal incoming viewing key reads and its internal
+    /// outgoing viewing key recovers, with a memo
+    /// ([`NO_MEMO`](crate::orchard::builder::NO_MEMO) for none).
+    /// [`Error::Coinbase`] in a coinbase transaction.
+    pub fn add_ironwood_change(
+        &mut self,
+        fvk: &crate::orchard::keys::FullViewingKey,
+        value: u64,
+        memo: [u8; crate::orchard::note_encryption::MEMO_SIZE],
+    ) -> Result<(), Error> {
+        use crate::orchard::keys::Scope;
+        if self.is_coinbase() {
+            return Err(Error::Coinbase);
+        }
+        if value > MAX_MONEY {
+            return Err(Error::ValueOutOfRange);
+        }
+        let mut fresh = None;
+        let builder = match self.ironwood.builder.as_mut() {
+            Some(builder) => builder,
+            None => fresh.insert(self.new_ironwood_builder()?),
+        };
+        builder.add_change_output(
+            fvk,
+            Some(fvk.to_ovk(Scope::Internal)),
+            fvk.address_at(0u32, Scope::Internal),
+            value,
+            memo,
+        )?;
+        if fresh.is_some() {
+            self.ironwood.builder = fresh;
+        }
+        self.ironwood.outputs += 1;
+        Ok(())
+    }
 }
 
+#[cfg(all(test, feature = "std"))]
+mod coinbase_tests;
 #[cfg(test)]
 mod tests;
