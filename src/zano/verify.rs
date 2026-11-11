@@ -20,7 +20,7 @@ use super::tx::{
     TRANSACTION_VERSION_POST_HF6, TRANSACTION_VERSION_PRE_HF4, TX_FLAG_SIGNATURE_MODE_SEPARATE,
     Transaction, Variant, ZcAssetSurjectionProof, ZcBalanceProof, ZcOutsRangeProof,
 };
-use super::tx_ext::{ASSET_DESCRIPTOR_OPERATION_PUBLIC_BURN, AssetDescriptorBase};
+use super::tx_ext::{ASSET_DESCRIPTOR_OPERATION_PUBLIC_BURN, AssetDescriptorBase, NlsagSig};
 use super::zarcanum::{StakeContext, verify_zarcanum_proof};
 
 /// Why a transaction does not verify.
@@ -32,9 +32,8 @@ pub enum VerifyError {
     /// point or a scalar does not decode.
     Malformed,
     /// The transaction uses something this module does not verify: a
-    /// multisig or gateway input, a gateway output, the separate signature
-    /// mode, a hidden asset supply, an asset owned by an Ethereum key
-    /// without the `secp256k1` feature.
+    /// multisig or gateway input, a gateway output, a hidden asset supply,
+    /// an asset owned by an Ethereum key without the `secp256k1` feature.
     Unsupported,
     /// The inputs are not in the order hard fork 4 requires.
     InputsNotSorted,
@@ -220,17 +219,102 @@ impl Transaction {
     /// The stake input of a proof-of-stake block is not covered: see
     /// [`verify`](Self::verify). Variable-time.
     pub fn verify_input(&self, index: usize, ring: &[ClsagGgxInput]) -> bool {
-        self.flags() & TX_FLAG_SIGNATURE_MODE_SEPARATE == 0
-            && self
-                .check_input(index, ring, &self.prefix_hash(), None)
-                .is_ok()
+        self.check_input(index, ring, &self.prefix_hash(), None)
+            .is_ok()
+    }
+
+    /// What the signature of the input `index` signs
+    /// (`prepare_prefix_hash_for_sign`): the transaction id — but in a
+    /// transaction signed separately ([`TX_FLAG_SIGNATURE_MODE_SEPARATE`]:
+    /// several parties build it one after the other, as for a swap), where
+    /// every input but the last signs the id of the transaction as it was
+    /// when the input was added: the inputs up to it, and the outputs and
+    /// extra entries its [`SignedParts`](super::SignedParts) count.
+    ///
+    /// `None` if there is no such input, or if a separately signed
+    /// transaction is not made as it must: an input without its counts,
+    /// counts that decrease or exceed what there is, or a last input that
+    /// does not cover everything.
+    pub fn hash_for_input_signature(&self, index: usize) -> Option<[u8; 32]> {
+        self.signature_hash(index, &self.prefix_hash())
+    }
+
+    /// [`hash_for_input_signature`](Self::hash_for_input_signature), given
+    /// the transaction id.
+    fn signature_hash(&self, index: usize, tx_id: &[u8; 32]) -> Option<[u8; 32]> {
+        if index >= self.vin.len() {
+            return None;
+        }
+        if self.flags() & TX_FLAG_SIGNATURE_MODE_SEPARATE == 0 {
+            return Some(*tx_id);
+        }
+        let attachment_count = |items: &[Variant]| {
+            items.iter().find_map(|item| match item {
+                Variant::ExtraAttachmentInfo(info) => Some(info.cnt),
+                _ => None,
+            })
+        };
+        let (mut outs, mut extras) = (0u64, 0u64);
+        let mut attachments = attachment_count(&self.extra).unwrap_or(0);
+        for input in self.vin.iter().take(index + 1) {
+            let details = match input {
+                Variant::ToKey(input) => &input.etc_details,
+                Variant::ZcInput(input) => &input.etc_details,
+                Variant::InMultisig(input) => &input.etc_details,
+                _ => return None,
+            };
+            let parts = details.iter().find_map(|item| match item {
+                Variant::SignedParts(parts) => Some(parts),
+                _ => None,
+            })?;
+            if parts.n_outs < outs || parts.n_extras < extras {
+                return None;
+            }
+            (outs, extras) = (parts.n_outs, parts.n_extras);
+            if let Some(count) = attachment_count(details) {
+                if count < attachments {
+                    return None;
+                }
+                attachments = count;
+            }
+        }
+        let outs = usize::try_from(outs)
+            .ok()
+            .filter(|n| *n <= self.vout.len())?;
+        let extras = usize::try_from(extras)
+            .ok()
+            .filter(|n| *n <= self.extra.len())?;
+        let attachments = usize::try_from(attachments)
+            .ok()
+            .filter(|n| *n <= self.attachment.len())?;
+        if index + 1 == self.vin.len() {
+            // The last input signs the whole transaction.
+            return (outs == self.vout.len()
+                && extras == self.extra.len()
+                && attachments == self.attachment.len())
+            .then_some(*tx_id);
+        }
+        let cropped = Transaction {
+            version: self.version,
+            vin: self.vin[..=index].to_vec(),
+            extra: self.extra[..extras].to_vec(),
+            vout: self.vout[..outs].to_vec(),
+            hardfork_id: self.hardfork_id,
+            ..Default::default()
+        };
+        Some(cropped.prefix_hash())
     }
 
     /// Verifies everything about the transaction that does not need more
     /// of the chain than `context` holds:
     ///
-    /// - the order of the inputs (from version 2 on);
-    /// - the signature of every input, against the rings of `context`;
+    /// - the order of the inputs (from version 2 on, but in a transaction
+    ///   signed separately);
+    /// - the signature of every input, against the rings of `context` —
+    ///   each over what it signs
+    ///   ([`hash_for_input_signature`](Self::hash_for_input_signature)) in
+    ///   a transaction signed separately, whose last transparent input
+    ///   also carries the signature of the transaction key;
     /// - for versions 0 and 1, that the transparent amounts balance;
     /// - from version 2 on, the asset surjection, range and balance proofs
     ///   ([`verify_proofs`](Self::verify_proofs)), and the proofs of an
@@ -250,13 +334,19 @@ impl Transaction {
     /// Each proof is verified on its own; nothing is batched across
     /// transactions. Variable-time.
     pub fn verify(&self, context: &VerifyContext<'_>) -> Result<(), VerifyError> {
-        if self.flags() & TX_FLAG_SIGNATURE_MODE_SEPARATE != 0 {
-            return Err(VerifyError::Unsupported);
+        // Neither the first transaction of a block nor an asset operation
+        // is signed separately (`validate_tx_semantic`).
+        if self.flags() & TX_FLAG_SIGNATURE_MODE_SEPARATE != 0
+            && (self.is_coinbase() || self.asset_operation().is_some())
+        {
+            return Err(VerifyError::Malformed);
         }
         let tx_id = self.prefix_hash();
         let pre_hf4 = self.version <= TRANSACTION_VERSION_PRE_HF4;
 
-        if !pre_hf4 {
+        // (`validate_inputs_sorting`: each party of a separately signed
+        // transaction sorts its own inputs only.)
+        if !pre_hf4 && self.flags() & TX_FLAG_SIGNATURE_MODE_SEPARATE == 0 {
             let mut previous = None;
             for input in &self.vin {
                 let order = input_order(input).ok_or(VerifyError::Malformed)?;
@@ -320,6 +410,11 @@ impl Transaction {
             .get(index - skipped)
             .ok_or(VerifyError::Malformed)?;
         let is_stake = self.is_pos_coinbase() && index == 1;
+        // What the input signs: not the id for all but the last input of a
+        // separately signed transaction.
+        let signed_hash = self
+            .signature_hash(index, tx_id)
+            .ok_or(VerifyError::Malformed)?;
         let ok = match (input, sig) {
             (Variant::ToKey(input), Variant::Nlsag(sig)) => {
                 if ring.len() != input.key_offsets.len() {
@@ -329,10 +424,28 @@ impl Transaction {
                 let message = if is_stake {
                     &stake.ok_or(VerifyError::MissingStakeContext)?.block_id
                 } else {
-                    tx_id
+                    &signed_hash
                 };
                 let keys: Vec<[u8; 32]> = ring.iter().map(|m| m.stealth_address).collect();
-                let signed = verify_ring_signature(message, &keys, &input.k_image, sig);
+                // The last input of a separately signed transaction has one
+                // more signature: that of the transaction key, by whoever
+                // completed the transaction, over its id.
+                let extra_signature = self.flags() & TX_FLAG_SIGNATURE_MODE_SEPARATE != 0
+                    && index + 1 == self.vin.len();
+                let signed = if extra_signature {
+                    match (sig.s.split_last(), self.tx_pub_key()) {
+                        (Some((last, ring_sig)), Some(tx_pub_key)) => {
+                            let ring_sig = NlsagSig {
+                                s: ring_sig.to_vec(),
+                            };
+                            verify_ring_signature(message, &keys, &input.k_image, &ring_sig)
+                                && crate::cryptonote::check_signature(tx_id, &tx_pub_key, last)
+                        }
+                        _ => false,
+                    }
+                } else {
+                    verify_ring_signature(message, &keys, &input.k_image, sig)
+                };
                 // The kernel of the stake against the difficulty, if the
                 // context has one.
                 if let Some(stake) = stake.filter(|s| is_stake && signed && s.pos_difficulty != 0)
@@ -347,7 +460,7 @@ impl Transaction {
                     return Err(VerifyError::MissingRing(index));
                 }
                 verify_clsag_ggx(
-                    tx_id,
+                    &signed_hash,
                     ring,
                     &sig.pseudo_out_amount_commitment,
                     &sig.pseudo_out_blinded_asset_id,
@@ -407,7 +520,6 @@ impl Transaction {
     pub(crate) fn check_proofs(&self, block_reward: u64) -> Result<(), VerifyError> {
         if self.version <= TRANSACTION_VERSION_PRE_HF4
             || self.version > TRANSACTION_VERSION_POST_HF6
-            || self.flags() & TX_FLAG_SIGNATURE_MODE_SEPARATE != 0
         {
             return Err(VerifyError::Unsupported);
         }

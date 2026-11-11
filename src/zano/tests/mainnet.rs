@@ -153,7 +153,8 @@ const FIXTURES: &[Fixture] = &[
     fixture!(
         "v3_asset_emit_eth",
         "c3c440faf9564e71d9974c225f10a61260a05d6bb6de67d5001e9224dbdc0743",
-        3400126
+        3400126,
+        rings
     ),
     fixture!(
         "v3_asset_burn",
@@ -164,6 +165,30 @@ const FIXTURES: &[Fixture] = &[
         "v4_five_inputs",
         "43b5a6175c2c54e245c4d9fe55b2243829f0e286c1fedc36e09b92db2c96bedd",
         3850354,
+        rings
+    ),
+    fixture!(
+        "v2_encrypted",
+        "00a08d1daab5b77fac31b1701e22ffb3198a533dd88f23cb2caa1c56abf6e20c",
+        3076392,
+        rings
+    ),
+    fixture!(
+        "v3_encrypted",
+        "0977568a6708a101466c4154d8c9281152f3bf5e2e02e42adc69a998f9bf0c99",
+        3076405,
+        rings
+    ),
+    fixture!(
+        "v3_bare_input",
+        "7c62c8bcd12ff534f387ff33459098d16a8a2eb2b152fc02d6a91ec4dc946dcb",
+        3076423,
+        rings
+    ),
+    fixture!(
+        "v3_swap",
+        "410159a9cebe250407ef4053d233c5142ff791deb938afb16e8d782ede3da96b",
+        3400121,
         rings
     ),
 ];
@@ -733,6 +758,220 @@ fn asset_operations() {
         bad.verify_asset_operation(None),
         Err(VerifyError::AssetOperation)
     );
+}
+
+/// A transaction two parties signed one after the other (a swap,
+/// `TX_FLAG_SIGNATURE_MODE_SEPARATE`): the first input signs the
+/// transaction as it was when the first party was done.
+#[test]
+fn separately_signed() {
+    let (fixture, tx) = load("v3_swap");
+    assert_eq!(tx.flags(), TX_FLAG_SIGNATURE_MODE_SEPARATE);
+    assert_eq!((tx.vin.len(), tx.vout.len(), tx.extra.len()), (2, 4, 8));
+
+    let parts: Vec<SignedParts> = tx
+        .vin
+        .iter()
+        .map(|input| {
+            let Variant::ZcInput(input) = input else {
+                panic!()
+            };
+            let [Variant::SignedParts(parts)] = input.etc_details.as_slice() else {
+                panic!()
+            };
+            *parts
+        })
+        .collect();
+    // The first party made three outputs and seven extra entries — the
+    // fee among them —, the second the rest: an output and its hint.
+    assert_eq!((parts[0].n_outs, parts[0].n_extras), (3, 7));
+    assert_eq!((parts[1].n_outs, parts[1].n_extras), (4, 8));
+    assert_eq!(
+        names(&tx.extra),
+        [
+            "flags",
+            "pub_key",
+            "etc_tx_flags16",
+            "derivation_hint",
+            "derivation_hint",
+            "derivation_hint",
+            "zarcanum_tx_data_v1",
+            "derivation_hint"
+        ]
+    );
+
+    let id = tx.prefix_hash();
+    assert_eq!(tx.hash_for_input_signature(1), Some(id));
+    let first = tx.hash_for_input_signature(0).unwrap();
+    assert_ne!(first, id);
+    assert_eq!(tx.hash_for_input_signature(2), None);
+    // What the first input signs is the id of the transaction cut down to
+    // what there was.
+    let cut = Transaction {
+        version: tx.version,
+        vin: tx.vin[..1].to_vec(),
+        extra: tx.extra[..7].to_vec(),
+        vout: tx.vout[..3].to_vec(),
+        hardfork_id: tx.hardfork_id,
+        ..Default::default()
+    };
+    assert_eq!(cut.prefix_hash(), first);
+
+    assert_eq!(verify("v3_swap", 0, None), Ok(()));
+    let rings: Vec<Vec<ClsagGgxInput>> = rings_from_binary(fixture.rings)
+        .iter()
+        .map(|ring| ggx_ring(ring))
+        .collect();
+    assert!(tx.verify_input(0, &rings[0]) && tx.verify_input(1, &rings[1]));
+    let signature = |index: usize, message: &[u8; 32]| {
+        let (Variant::ZcInput(input), Variant::ZcSig(sig)) =
+            (&tx.vin[index], &tx.signatures[index])
+        else {
+            panic!()
+        };
+        verify_clsag_ggx(
+            message,
+            &rings[index],
+            &sig.pseudo_out_amount_commitment,
+            &sig.pseudo_out_blinded_asset_id,
+            &input.key_image,
+            &sig.clsag_ggx,
+        )
+    };
+    assert!(signature(0, &first) && !signature(0, &id));
+    assert!(signature(1, &id) && !signature(1, &first));
+    // Each party sorted its own inputs: the whole is not sorted, and need
+    // not be.
+    assert!(tx.vin[0].key_image() > tx.vin[1].key_image());
+
+    // The counts are part of what is signed, and must make sense.
+    let refs: Vec<&[ClsagGgxInput]> = rings.iter().map(Vec::as_slice).collect();
+    let context = VerifyContext::new(&refs);
+    let with_parts = |index: usize, change: &dyn Fn(&mut Vec<Variant>)| {
+        let mut other = tx.clone();
+        let Variant::ZcInput(input) = &mut other.vin[index] else {
+            panic!()
+        };
+        change(&mut input.etc_details);
+        other
+    };
+    let set = |n_outs: u64, n_extras: u64| {
+        move |details: &mut Vec<Variant>| {
+            *details = vec![Variant::SignedParts(SignedParts { n_outs, n_extras })];
+        }
+    };
+    for (index, n_outs, n_extras) in [(0, 5, 7), (0, 3, 9), (1, 2, 8), (1, 4, 6), (1, 3, 8)] {
+        let other = with_parts(index, &set(n_outs, n_extras));
+        assert_eq!(other.hash_for_input_signature(1), None);
+        assert_eq!(other.verify(&context), Err(VerifyError::Malformed));
+    }
+    let other = with_parts(0, &|details| details.clear());
+    assert_eq!(other.hash_for_input_signature(0), None);
+    assert_eq!(other.verify(&context), Err(VerifyError::Malformed));
+    // Other counts that make sense: another message, which nobody signed.
+    let other = with_parts(0, &set(2, 7));
+    assert!(other.hash_for_input_signature(0).is_some());
+    assert_eq!(other.verify(&context), Err(VerifyError::InputSignature(0)));
+
+    // Without the flag every input signs the id, and the inputs must be
+    // sorted.
+    let mut plain = tx.clone();
+    plain
+        .extra
+        .retain(|entry| !matches!(entry, Variant::Flags(_)));
+    assert_eq!(plain.hash_for_input_signature(0), Some(plain.prefix_hash()));
+    assert_eq!(plain.verify(&context), Err(VerifyError::InputsNotSorted));
+}
+
+/// Entries encrypted for the recipient, with the scheme of versions 2 and
+/// 3, and transparent inputs spent after hard fork 5.
+#[test]
+fn more_of_versions_2_and_3() {
+    let (_, tx) = load("v2_encrypted");
+    assert_eq!(tx.version, 2);
+    assert_eq!(
+        names(&tx.extra),
+        [
+            "receiver2",
+            "pub_key",
+            "etc_tx_flags16",
+            "checksum",
+            "derivation_hint",
+            "derivation_hint",
+            "zarcanum_tx_data_v1",
+            "extra_attach_info"
+        ]
+    );
+    assert_eq!(names(&tx.attachment), ["attachment"]);
+    assert_eq!(verify("v2_encrypted", 0, None), Ok(()));
+    // The attachment info of the extra counts and sizes the attachments.
+    let Some(Variant::ExtraAttachmentInfo(info)) = tx.extra.last() else {
+        panic!()
+    };
+    assert_eq!(info.cnt, 1);
+    // A stranger reads none of it.
+    let stranger = Wallet::generate(&mut super::stream(8), 0).unwrap();
+    let found = stranger.scan_tx(&tx).unwrap();
+    assert!(!found.found() && found.payment_id.is_none() && found.comments.is_empty());
+
+    let (_, tx) = load("v3_encrypted");
+    assert_eq!((tx.version, tx.hardfork_id), (3, HARDFORK_05));
+    assert_eq!(names(&tx.extra)[..2], ["payer2", "receiver2"]);
+    assert_eq!(names(&tx.attachment), ["attachment"]);
+    assert_eq!(verify("v3_encrypted", 0, None), Ok(()));
+    let found = stranger.scan_tx(&tx).unwrap();
+    assert!(!found.found() && found.payment_id.is_none());
+
+    // Four transparent outputs spent in rings of eleven, a year after hard
+    // fork 4: the outputs show the native asset id.
+    let (fixture, tx) = load("v3_bare_input");
+    assert_eq!(names(&tx.vin), ["key"; 4]);
+    assert_eq!(names(&tx.signatures), ["NLSAG_sig"; 4]);
+    let rings = rings_from_binary(fixture.rings);
+    assert_eq!(rings.len(), 4);
+    assert!(rings.iter().all(|ring| ring.len() == 11));
+    assert_eq!(verify("v3_bare_input", 0, None), Ok(()));
+    let Some(Variant::AssetSurjectionProof(surjection)) = tx.proofs.first() else {
+        panic!()
+    };
+    assert!(surjection.bge_proofs.is_empty());
+    let mut bad = tx.clone();
+    let Variant::ToKey(input) = &mut bad.vin[3] else {
+        panic!()
+    };
+    input.amount += 1;
+    assert!(!bad.verify_proofs());
+}
+
+/// The emission of an asset an Ethereum key owns, whole: its input, its
+/// proofs and the signature of the owner the daemon lists for the asset.
+#[cfg(feature = "secp256k1")]
+#[test]
+fn asset_emission_with_its_ring() {
+    let (fixture, tx) = load("v3_asset_emit_eth");
+    let mut key = [0u8; 33];
+    hex::decode_to_slice(
+        "03f3e70f95b08f6238acca21dab908a46cab1e4ce8a0761a2d11353218c9952702",
+        &mut key,
+    )
+    .unwrap();
+    let owner = AssetDescriptorBase {
+        owner_eth_pub_key: Some(key),
+        ..Default::default()
+    };
+    let rings: Vec<Vec<ClsagGgxInput>> = rings_from_binary(fixture.rings)
+        .iter()
+        .map(|ring| ggx_ring(ring))
+        .collect();
+    let refs: Vec<&[ClsagGgxInput]> = rings.iter().map(Vec::as_slice).collect();
+    let context = VerifyContext::new(&refs);
+    assert_eq!(
+        tx.verify(&context),
+        Err(VerifyError::MissingAssetDescriptor)
+    );
+    assert_eq!(tx.verify(&context.asset_descriptor(&owner)), Ok(()));
+    // Ten outputs: the asset emitted is a member of the surjection rings.
+    assert_eq!(tx.vout.len(), 10);
 }
 
 /// Parsing is total: any change to a transaction gives a transaction or an
